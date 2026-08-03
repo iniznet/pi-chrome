@@ -96,6 +96,23 @@ Safety properties:
 - Each Pi session gets its own automation target; user tabs/windows are not closed by cleanup.
 - `/chrome revoke` closes only calling session's automation target.
 
+### Trust model
+
+The loopback bridge on `127.0.0.1:17318` is **unauthenticated by design** — no
+shared secret, no pinning of the extension id. Any process on this machine, or
+any installed browser extension, can:
+
+- issue Chrome-control commands (navigate, click, type, evaluate JS) against
+your signed-in profile once a session is authorized, and
+- read console logs and captured `fetch`/`XMLHttpRequest` traffic from
+instrumented tabs.
+
+This is acceptable for a single-user local workstation. Do **not** run
+`pi-chrome` on shared or multi-user machines, alongside untrusted local
+processes, or with untrusted browser extensions installed — `pi-chrome` treats
+"local access to this machine" as equivalent to "local access to your
+browser."
+
 Security details: [`SECURITY.md`](./SECURITY.md). Architecture details: [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
 
 ---
