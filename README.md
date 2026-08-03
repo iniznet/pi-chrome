@@ -113,6 +113,18 @@ processes, or with untrusted browser extensions installed — `pi-chrome` treats
 "local access to this machine" as equivalent to "local access to your
 browser."
 
+### Instrumentation scope (privacy)
+
+While a session is authorized, the extension instruments pages at
+`document_start` to capture console messages and `fetch`/`XMLHttpRequest`
+traffic. This instrumentation applies to **every tab in the profile — not just
+the tab the agent drives** — and the network capture retains **full response
+bodies** (hundreds of MB per tab on long sessions) that agent tools
+(`chrome_list_network_requests` / `chrome_get_network_request`) can read. Do
+not browse sites you want kept out of the agent's log while the bridge is
+active, and expect memory growth on long sessions. Full bodies are intended to
+be trimmed to URL/status/headers in a future release.
+
 Security details: [`SECURITY.md`](./SECURITY.md). Architecture details: [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
 
 ---
