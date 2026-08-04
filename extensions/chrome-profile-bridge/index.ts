@@ -21,7 +21,9 @@ type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
 type ToolTextResult = {
 	content: Array<{ type: "text"; text: string }>;
-	details?: Record<string, unknown>;
+	// Required: the SDK's AgentToolResult demands `details`; every tool in this file
+	// always supplies it, so keep the local type aligned (S8 tsc gate).
+	details: Record<string, unknown>;
 };
 
 type BridgeCommand = {
@@ -36,6 +38,16 @@ type PendingCommand = {
 	reject: (error: Error) => void;
 	timer: NodeJS.Timeout;
 	deliveredAt?: number;
+	// Exactly-once state machine (S1.2): "pending" = served but not yet acked, "received" =
+	// acked by the extension but no result posted, "completed" = /result resolved/rejected it.
+	state: "pending" | "received" | "completed";
+	ackedAt?: number;
+};
+
+type OrphanedCommand = {
+	id: string;
+	action: string;
+	ackedAt: number;
 };
 
 type BridgeResult = {
@@ -44,6 +56,45 @@ type BridgeResult = {
 	result?: unknown;
 	error?: string;
 };
+
+type HistoryEntry = {
+	at: number;
+	action: string;
+	paramsSummary: string;
+	ok: boolean;
+	error?: string;
+	durationMs: number;
+	sessionKey?: string;
+	// Full wire params retained ONLY for `chrome history replay`; never rendered (S4).
+	params: Record<string, unknown>;
+};
+
+const CHROME_HISTORY_CAP = 200;
+// Per-instance ring buffer of every chrome_* action this bridge sent (S4). Trimmed to the cap.
+const chromeHistory: HistoryEntry[] = [];
+
+// Wire-only params authorizedBridgeSend injects; noise in the history summary.
+const HISTORY_PARAMS_SKIP = new Set(["sessionKey", "groupTitle", "sessionGroupTitle", "joinSessionGroup", "foreground"]);
+
+function summarizeParams(params: Record<string, unknown>): string {
+	const parts: string[] = [];
+	for (const [key, value] of Object.entries(params)) {
+		if (HISTORY_PARAMS_SKIP.has(key) || value === undefined) continue;
+		let rendered: string;
+		if (typeof value === "string") rendered = `"${compactLine(value, 40)}"`;
+		else if (typeof value === "object" && value !== null) {
+			const json = safeJson(value);
+			rendered = json.length > 48 ? `${json.slice(0, 47)}…` : json;
+		} else rendered = String(value);
+		parts.push(`${key}=${rendered}`);
+	}
+	return parts.join(" ") || "(no params)";
+}
+
+function recordHistory(entry: Omit<HistoryEntry, "at" | "durationMs">, startedAt: number): void {
+	chromeHistory.push({ ...entry, at: Date.now(), durationMs: Date.now() - startedAt });
+	if (chromeHistory.length > CHROME_HISTORY_CAP) chromeHistory.splice(0, chromeHistory.length - CHROME_HISTORY_CAP);
+}
 
 const PI_CHROME_PKG_PATH = resolve(__dirname, "..", "..", "package.json");
 function readPiChromeVersion(): string {
@@ -296,6 +347,98 @@ function sendJson(response: ServerResponse, status: number, body: unknown, extra
 	response.end(JSON.stringify(body));
 }
 
+// Client-mode command id minting: {pid}:{seq} with a module-level counter so the SAME id can
+// be reused when a sendViaOwner retry promotes to server and re-runs locally (S1.1/S1.6 — the
+// SW journal dedupes on that id).
+let clientCommandSeq = 0;
+function mintClientCommandId(): string {
+	clientCommandSeq += 1;
+	return `${process.pid}:${clientCommandSeq}`;
+}
+
+// ---- chrome_diff digest comparison (S3.1; host-side pure function, no bridge call) ----
+// The digest shape mirrors `digestFor()` in snapshot_injected.js.
+type DigestLabel = {
+	uid: string;
+	role?: string;
+	label?: string;
+	disabled?: boolean;
+	value?: string;
+	checked?: boolean;
+};
+
+type SnapshotDigest = {
+	url?: string;
+	title?: string;
+	textHash?: string;
+	focusedUid?: string | null;
+	modalUid?: string | null;
+	labels?: DigestLabel[];
+};
+
+function digestChanged(before: string | null | undefined, after: string | null | undefined): boolean {
+	return (before ?? "") !== (after ?? "");
+}
+
+function digestLabelFieldChanges(a: DigestLabel, b: DigestLabel): string[] {
+	const changes: string[] = [];
+	for (const field of ["role", "label", "disabled", "value", "checked"] as const) {
+		if (a[field] !== b[field]) changes.push(field);
+	}
+	return changes;
+}
+
+function diffDigests(before: SnapshotDigest, after: SnapshotDigest): { lines: string[]; diff: Record<string, unknown> } {
+	const lines: string[] = [];
+	const diff: Record<string, unknown> = {};
+	if (digestChanged(before.url, after.url)) {
+		lines.push(`URL changed: ${before.url ?? ""} -> ${after.url ?? ""}`);
+		diff.url = { before: before.url ?? "", after: after.url ?? "" };
+	}
+	if (digestChanged(before.title, after.title)) {
+		lines.push(`Title changed: ${before.title ?? ""} -> ${after.title ?? ""}`);
+		diff.title = { before: before.title ?? "", after: after.title ?? "" };
+	}
+	if (digestChanged(before.textHash, after.textHash)) {
+		lines.push("Text content changed");
+		diff.textHash = { before: before.textHash ?? "", after: after.textHash ?? "" };
+	}
+	if (digestChanged(before.focusedUid, after.focusedUid)) {
+		lines.push(`Focused element changed: ${before.focusedUid ?? "none"} -> ${after.focusedUid ?? "none"}`);
+		diff.focusedUid = { before: before.focusedUid ?? null, after: after.focusedUid ?? null };
+	}
+	if (digestChanged(before.modalUid, after.modalUid)) {
+		lines.push(`Modal changed: ${before.modalUid ?? "none"} -> ${after.modalUid ?? "none"}`);
+		diff.modalUid = { before: before.modalUid ?? null, after: after.modalUid ?? null };
+	}
+
+	const beforeLabels = new Map((before.labels ?? []).map((label) => [label.uid, label]));
+	const afterLabels = new Map((after.labels ?? []).map((label) => [label.uid, label]));
+	const added: DigestLabel[] = [];
+	const removed: DigestLabel[] = [];
+	const updated: Array<{ before: DigestLabel; after: DigestLabel; fields: string[] }> = [];
+	for (const label of after.labels ?? []) {
+		if (!beforeLabels.has(label.uid)) added.push(label);
+		else {
+			const previous = beforeLabels.get(label.uid) as DigestLabel;
+			const fields = digestLabelFieldChanges(previous, label);
+			if (fields.length > 0) updated.push({ before: previous, after: label, fields });
+		}
+	}
+	for (const label of before.labels ?? []) {
+		if (!afterLabels.has(label.uid)) removed.push(label);
+	}
+	for (const label of added) lines.push(`+ ${label.role ?? "element"} "${label.label ?? ""}" (${label.uid})`);
+	for (const label of removed) lines.push(`- ${label.role ?? "element"} "${label.label ?? ""}" (${label.uid})`);
+	for (const entry of updated) lines.push(`~ ${entry.after.role ?? "element"} "${entry.after.label ?? ""}" (${entry.after.uid})`);
+
+	if (lines.length === 0) lines.push("No changes detected between the two snapshots.");
+	diff.added = added;
+	diff.removed = removed;
+	diff.updated = updated.map((entry) => ({ before: entry.before, after: entry.after, fields: entry.fields }));
+	return { lines, diff };
+}
+
 class ChromeProfileBridge {
 	private server: Server | undefined;
 	private pending = new Map<string, PendingCommand>();
@@ -304,6 +447,11 @@ class ChromeProfileBridge {
 	private lastSeenAt: number | undefined;
 	private clientName: string | undefined;
 	private mode: "server" | "client" | undefined;
+	private seq = 0; // server-side monotonic command id counter (S1.1: pid:seq, no Date.now/Math.random)
+	private orphaned: OrphanedCommand[] = [];
+	// S5.1: extension liveness signals, keyed by the session key the SW sends (its default key
+	// when no pi session is bound). Pruned aggressively so it cannot grow unbounded.
+	private heartbeats = new Map<string, number>();
 
 	constructor(
 		private readonly host: string,
@@ -330,7 +478,22 @@ class ChromeProfileBridge {
 			clientName: this.clientName,
 			queuedCommands: this.queue.length,
 			pendingCommands: this.pending.size,
+			// S5.1: age of the newest extension heartbeat (undefined when none yet).
+			heartbeatAgeMs: this.heartbeatAgeMs(),
 		};
+	}
+
+	private heartbeatAgeMs(): number | undefined {
+		let newest = -Infinity;
+		for (const at of this.heartbeats.values()) if (at > newest) newest = at;
+		if (newest === -Infinity) return undefined;
+		this.pruneHeartbeats();
+		return Math.max(0, Date.now() - newest);
+	}
+
+	private pruneHeartbeats(): void {
+		const cutoff = Date.now() - 2 * 60_000;
+		for (const [key, at] of this.heartbeats) if (at < cutoff) this.heartbeats.delete(key);
 	}
 
 	async start(): Promise<void> {
@@ -371,8 +534,17 @@ class ChromeProfileBridge {
 	private async tryPromoteToServer(): Promise<boolean> {
 		if (this.mode !== "client") return this.mode === "server";
 		this.mode = undefined;
-		await this.bindServerOrClient();
-		return this.mode === "server";
+		// EADDRINUSE self-heal: another session may be grabbing the freed port at the same
+		// moment. Retry a couple of times with a short delay before giving up (audit S2).
+		for (let attempt = 0; attempt < 3; attempt++) {
+			await this.bindServerOrClient();
+			if (this.mode === "server") return true;
+			this.mode = undefined;
+			if (attempt < 2) await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
+		}
+		// Could not take over; stay in client mode so later sends keep retrying the owner path.
+		this.mode = "client";
+		return false;
 	}
 
 	stop(): void {
@@ -386,6 +558,7 @@ class ChromeProfileBridge {
 		}
 		this.pending.clear();
 		this.queue = [];
+		this.orphaned = [];
 		for (const waiter of this.waiters) waiter(undefined);
 		this.waiters = [];
 		this.server?.close();
@@ -398,8 +571,8 @@ class ChromeProfileBridge {
 		return this.sendLocal(action, params, timeoutMs, signal);
 	}
 
-	private sendLocal(action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> {
-		const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+	private sendLocal(action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal, suppliedId?: string): Promise<unknown> {
+		const id = suppliedId ?? `${process.pid}:${++this.seq}`;
 		const command = { id, action, params };
 		return new Promise((resolveCommand, rejectCommand) => {
 			if (signal?.aborted) {
@@ -421,6 +594,11 @@ class ChromeProfileBridge {
 				this.pending.delete(id);
 				this.queue = this.queue.filter((queued) => queued.id !== id);
 				cleanupAbort();
+				// Acknowledged but never resolved: the action MAY have executed, so surface it as
+				// an orphan notice on the next /next poll instead of dropping it silently (S1.2).
+				if (entry?.state === "received" && entry.ackedAt !== undefined) {
+					this.orphaned.push({ id, action, ackedAt: entry.ackedAt });
+				}
 				rejectCommand(new Error(this.timeoutMessage(entry, timeoutMs)));
 			}, timeoutMs);
 			this.pending.set(id, {
@@ -428,6 +606,7 @@ class ChromeProfileBridge {
 				resolve: (value) => { cleanupAbort(); resolveCommand(value); },
 				reject: (err) => { cleanupAbort(); rejectCommand(err); },
 				timer,
+				state: "pending",
 			});
 			if (signal) signal.addEventListener("abort", onAbort, { once: true });
 			this.enqueue(command);
@@ -438,13 +617,21 @@ class ChromeProfileBridge {
 	// distinct failure modes are: extension never polled (not installed / not running),
 	// extension polled but never picked up this command, and extension picked up the command
 	// but never posted a result back (long-running action or a failed /result post).
+	// 4-way timeout classification (S1.5) so the agent knows whether the command may have
+	// executed: never polled, polled but never picked up, picked up but never acked, or
+	// acked but never returned a result (the dangerous case — the action MAY have run).
 	private timeoutMessage(entry: PendingCommand | undefined, timeoutMs: number): string {
 		const pollAgeMs = this.lastSeenAt === undefined ? undefined : Date.now() - this.lastSeenAt;
-		if (entry?.deliveredAt) {
-			return `Timed out after ${timeoutMs}ms: the Chrome extension received the command but never returned a result. The action may be long-running, or the result post failed. Run /chrome doctor; if it persists, reload 'Pi Chrome Connector' at chrome://extensions.`;
-		}
 		if (pollAgeMs === undefined || pollAgeMs > 60_000) {
 			return `Timed out after ${timeoutMs}ms: the Chrome extension is not polling (last seen ${pollAgeMs === undefined ? "never" : Math.round(pollAgeMs / 1000) + "s ago"}). Run /chrome onboard, then load the bundled browser-extension folder in your normal Chrome profile and keep that Chrome window open.`;
+		}
+		if (entry) {
+			if (entry.state === "received" || entry.ackedAt !== undefined) {
+				return `Timed out after ${timeoutMs}ms: the Chrome extension received AND acknowledged the command but never returned a result. The action MAY have executed - verify page state before retrying.`;
+			}
+			if (entry.deliveredAt !== undefined) {
+				return `Timed out after ${timeoutMs}ms: the Chrome extension polled but never acknowledged the command before the deadline. Retry; a duplicate will not re-run (dedupe id ${entry.command.id}).`;
+			}
 		}
 		return `Timed out after ${timeoutMs}ms: the Chrome extension is polling (last seen ${Math.round(pollAgeMs / 1000)}s ago) but did not pick up this command in time. Retry; if it persists, reload 'Pi Chrome Connector' at chrome://extensions.`;
 	}
@@ -457,11 +644,14 @@ class ChromeProfileBridge {
 			if (signal.aborted) controller.abort();
 			else signal.addEventListener("abort", forwardAbort, { once: true });
 		}
+		// Mint the command id ONCE per sendViaOwner call and reuse it if we promote to server,
+		// so the SW journal dedupes the retried execution (S1.1/S1.6).
+		const id = mintClientCommandId();
 		try {
 			const response = await fetch(`${this.url}/command`, {
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ action, params, timeoutMs }),
+				body: JSON.stringify({ id, action, params, timeoutMs }),
 				signal: controller.signal,
 			});
 			const payload = (await response.json().catch(() => ({}))) as { ok?: boolean; result?: unknown; error?: string };
@@ -482,7 +672,7 @@ class ChromeProfileBridge {
 			// stuck as a client pointed at a dead owner.
 			if (this.isOwnerUnreachable(error)) {
 				const promoted = await this.tryPromoteToServer().catch(() => false);
-				if (promoted) return this.sendLocal(action, params, timeoutMs, signal);
+				if (promoted) return this.sendLocal(action, params, timeoutMs, signal, id);
 				throw new Error(
 					"The Pi session that owned the Chrome bridge is unreachable and this session could not take over the bridge port. Restart this Pi session, or run /chrome doctor.",
 				);
@@ -537,13 +727,16 @@ class ChromeProfileBridge {
 				action?: string;
 				params?: Record<string, unknown>;
 				timeoutMs?: number;
+				id?: string;
 			};
 			if (!body.action) {
 				sendJson(response, 400, { ok: false, error: "Missing command action" });
 				return;
 			}
 			try {
-				const result = await this.sendLocal(body.action, body.params ?? {}, body.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+				// Accept an optional client-minted id (S1.1) so a promoted sendViaOwner retry reuses
+				// the same id and the SW journal dedupes it; otherwise mint server-side.
+				const result = await this.sendLocal(body.action, body.params ?? {}, body.timeoutMs ?? DEFAULT_TIMEOUT_MS, undefined, body.id);
 				sendJson(response, 200, { ok: true, result });
 			} catch (error) {
 				sendJson(response, 504, { ok: false, error: (error as Error).message });
@@ -557,13 +750,41 @@ class ChromeProfileBridge {
 			}
 			this.lastSeenAt = Date.now();
 			this.clientName = url.searchParams.get("name") ?? undefined;
+			// Serve ONE orphan notice before any command: an acked-but-resultless command may have
+			// executed, so surface it to the extension (which logs it and keeps polling). The
+			// command itself is never re-served (S1.2).
+			if (this.orphaned.length > 0) {
+				const orphan = this.orphaned.shift() as OrphanedCommand;
+				const currentVersion = readPiChromeVersion();
+				sendJson(
+					response,
+					200,
+					{
+						type: "orphan",
+						orphan: {
+							...orphan,
+							note: "delivered and acknowledged but never returned a result - the action MAY have executed. Verify state before repeating.",
+						},
+						expectedExtensionVersion: currentVersion,
+					},
+					{ ...corsHeaders, "x-pi-chrome-version": currentVersion },
+				);
+				return;
+			}
 			let aborted = false;
 			let activeWaiter: ((command: BridgeCommand | undefined) => void) | undefined;
 			request.once("close", () => {
 				aborted = true;
 				if (activeWaiter) this.waiters = this.waiters.filter((entry) => entry !== activeWaiter);
 			});
-			let command = this.queue.shift();
+			// Serve ONLY commands still in "pending" state — a requeued command that has since been
+			// acked ("received") must never be re-served (S1.2).
+			let command: BridgeCommand | undefined;
+			const servableIndex = this.queue.findIndex((queued) => {
+				const entry = this.pending.get(queued.id);
+				return entry === undefined || entry.state === "pending";
+			});
+			if (servableIndex >= 0) command = this.queue.splice(servableIndex, 1)[0];
 			if (!command) {
 				command = await this.waitForCommand(25_000, (waiter) => {
 					activeWaiter = waiter;
@@ -593,6 +814,23 @@ class ChromeProfileBridge {
 			);
 			return;
 		}
+		if (request.method === "POST" && url.pathname === "/ack") {
+			if (!isBrowserOriginAllowed(request)) {
+				sendJson(response, 403, { ok: false, error: "browser origin not allowed" });
+				return;
+			}
+			this.lastSeenAt = Date.now();
+			const body = JSON.parse(await readRequestBody(request)) as { id?: string };
+			const pending = body.id !== undefined ? this.pending.get(body.id) : undefined;
+			if (pending && pending.state === "pending") {
+				pending.state = "received";
+				pending.ackedAt = Date.now();
+			}
+			// Idempotent by design (S1.3): an unknown id or a duplicate ack is a no-op success —
+			// the SW retries acks, and a late ack after timeout must never surface as an error.
+			sendJson(response, 200, { ok: true }, corsHeaders);
+			return;
+		}
 		if (request.method === "POST" && url.pathname === "/result") {
 			if (!isBrowserOriginAllowed(request)) {
 				sendJson(response, 403, { ok: false, error: "browser origin not allowed" });
@@ -602,13 +840,29 @@ class ChromeProfileBridge {
 			const result = JSON.parse(await readRequestBody(request)) as BridgeResult;
 			const pending = this.pending.get(result.id);
 			if (!pending) {
-				sendJson(response, 404, { ok: false, error: "unknown command id" }, corsHeaders);
+				// Late result after timeout/owner-switch: ack silently so the SW never retries it.
+				// accepted:false signals nothing was resolved (S1.3 — NOT a 404).
+				sendJson(response, 200, { ok: true, accepted: false }, corsHeaders);
 				return;
 			}
 			clearTimeout(pending.timer);
+			pending.state = "completed";
 			this.pending.delete(result.id);
 			if (result.ok) pending.resolve(result.result);
 			else pending.reject(new Error(result.error ?? "Chrome extension command failed"));
+			sendJson(response, 200, { ok: true }, corsHeaders);
+			return;
+		}
+		if (request.method === "POST" && url.pathname === "/heartbeat") {
+			if (!isBrowserOriginAllowed(request)) {
+				sendJson(response, 403, { ok: false, error: "browser origin not allowed" });
+				return;
+			}
+			this.lastSeenAt = Date.now();
+			// S5.1: the SW posts {sessionKey} every 30s; track liveness and prune stale keys.
+			const body = JSON.parse(await readRequestBody(request)) as { sessionKey?: string };
+			if (body.sessionKey) this.heartbeats.set(body.sessionKey, Date.now());
+			this.pruneHeartbeats();
 			sendJson(response, 200, { ok: true }, corsHeaders);
 			return;
 		}
@@ -635,13 +889,16 @@ class ChromeProfileBridge {
 	}
 }
 
-const tabActionValues = ["list", "new", "activate", "close", "group", "ungroup", "version"] as const;
+const tabActionValues = ["list", "new", "activate", "close", "group", "ungroup", "version", "save"] as const;
 const imageFormatValues = ["png", "jpeg"] as const;
 const waitForValues = ["selector", "expression"] as const;
 const CHROME_TOOL_NAMES = [
 	"chrome_launch",
 	"chrome_tab",
 	"chrome_snapshot",
+	"chrome_diff",
+	"chrome_find",
+	"chrome_inspect",
 	"chrome_navigate",
 	"chrome_evaluate",
 	"chrome_click",
@@ -670,7 +927,7 @@ export default function (pi: ExtensionAPI): void {
 	const currentRoot = extensionRoot();
 	const globalState = globalThis as typeof globalThis & {
 		[PI_CHROME_GLOBAL_KEY]?: { version: string; root: string; token?: symbol };
-		[PI_CHROME_AUTH_KEY]?: { until: number | "indefinite" };
+		[PI_CHROME_AUTH_KEY]?: { until: number | "indefinite"; sessionKey?: string };
 	};
 	const alreadyLoaded = globalState[PI_CHROME_GLOBAL_KEY];
 	if (alreadyLoaded?.token || (alreadyLoaded && alreadyLoaded.root !== currentRoot)) {
@@ -687,18 +944,21 @@ export default function (pi: ExtensionAPI): void {
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
 	let backgroundDefault = true;
 	let chromeAuthorizedUntil: number | "indefinite" | undefined;
+	// Session key the persisted grant belongs to; used to refuse a stale-session inheritance (S5.2).
+	let persistedAuthSessionKey: string | undefined;
 	// Restore an authorization that survived a /reload. Drop it if it already expired.
 	const persistedAuth = globalState[PI_CHROME_AUTH_KEY];
 	if (persistedAuth) {
 		if (persistedAuth.until === "indefinite" || persistedAuth.until > Date.now()) {
 			chromeAuthorizedUntil = persistedAuth.until;
+			persistedAuthSessionKey = persistedAuth.sessionKey;
 		} else {
 			delete globalState[PI_CHROME_AUTH_KEY];
 		}
 	}
 	const persistAuth = (): void => {
 		if (chromeAuthorizedUntil === undefined) delete globalState[PI_CHROME_AUTH_KEY];
-		else globalState[PI_CHROME_AUTH_KEY] = { until: chromeAuthorizedUntil };
+		else globalState[PI_CHROME_AUTH_KEY] = { until: chromeAuthorizedUntil, sessionKey: sessionKeyFor(sessionCtx) };
 	};
 	let chromeToolsRegistered = false;
 	let chromeToolsUsable = false;
@@ -892,7 +1152,18 @@ export default function (pi: ExtensionAPI): void {
 		if (shouldJoinGroup) {
 			wireParams = { ...wireParams, sessionGroupTitle: sessionTitle, joinSessionGroup: true };
 		}
-		return bridge.send(action, wireParams, timeoutMs, signal);
+		// Per-session action history (S4): record every wire send on settle, trimmed to the ring cap.
+		const startedAt = Date.now();
+		return bridge.send(action, wireParams, timeoutMs, signal).then(
+			(result) => {
+				recordHistory({ action, paramsSummary: summarizeParams(wireParams), ok: true, sessionKey, params: wireParams }, startedAt);
+				return result;
+			},
+			(error) => {
+				recordHistory({ action, paramsSummary: summarizeParams(wireParams), ok: false, error: (error as Error).message, sessionKey, params: wireParams }, startedAt);
+				throw error;
+			},
+		);
 	};
 
 	// Translate the public `background` parameter (default on = silent/background) into the
@@ -912,6 +1183,15 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		sessionCtx = ctx;
 		await bridge.start();
+		// A grant persisted on globalThis is scoped to the session that created it. If a DIFFERENT
+		// session is starting (anything but a /reload of the same session), discard the persisted
+		// grant so a stale session never inherits control (audit 9). /reload keeps it: sessionKeyFor
+		// is stable across reloads, and this handler still holds the same session id.
+		if (persistedAuthSessionKey !== undefined && persistedAuthSessionKey !== sessionKeyFor(ctx) && _event?.reason !== "reload") {
+			delete globalState[PI_CHROME_AUTH_KEY];
+			persistedAuthSessionKey = undefined;
+			chromeAuthorizedUntil = undefined;
+		}
 		// Reestablish in-memory state after a /reload restored chromeAuthorizedUntil from globalThis.
 		if (chromeControlAuthorized()) {
 			activateChromeTools();
@@ -935,7 +1215,15 @@ export default function (pi: ExtensionAPI): void {
 		// (Owner-session quit may not deliver in time since stop() closes the bridge server;
 		// that only ever leaves a clearly pi-chrome window for the user to close — never a user
 		// tab — and /chrome revoke remains the reliable, bridge-alive cleanup path.)
-		if (event?.reason !== "reload") cleanupAutomationTargetBestEffort();
+		if (event?.reason !== "reload") {
+			cleanupAutomationTargetBestEffort();
+			// A real session end must not leak control to the next session in this process: drop
+			// the persisted grant (and in-memory grant) alongside the automation target. /reload
+			// keeps both — the same session continues and sessionKeyFor stays unchanged.
+			delete globalState[PI_CHROME_AUTH_KEY];
+			persistedAuthSessionKey = undefined;
+			chromeAuthorizedUntil = undefined;
+		}
 		bridge.stop();
 		if (globalState[PI_CHROME_GLOBAL_KEY]?.token === instanceToken) {
 			delete globalState[PI_CHROME_GLOBAL_KEY];
@@ -1153,6 +1441,49 @@ Usage rules:
 		ctx.ui.notify(await statusSummary(), "info");
 	};
 
+	// Per-session chrome_* action log + replay (S4). Newest-first; `history replay <idx>`
+	// re-sends the exact action+params of that entry via the bridge.
+	const historyHandler = async (ctx: ExtensionContext, args: string): Promise<void> => {
+		const tokens = (args || "").trim().split(/\s+/).filter(Boolean);
+		if (tokens[0] === "replay") {
+			const idx = Number(tokens[1]);
+			if (!Number.isInteger(idx) || idx < 0) {
+				ctx.ui.notify("Usage: /chrome history replay <idx> — <idx> is the # index from /chrome history.", "warning");
+				return;
+			}
+			const entry = chromeHistory[chromeHistory.length - 1 - idx];
+			if (!entry) {
+				ctx.ui.notify(`No chrome action at history index #${idx}.`, "warning");
+				return;
+			}
+			ctx.ui.notify(`Replaying #${idx} ${entry.action} ${entry.paramsSummary}…`, "info");
+			try {
+				const result = await bridge.send(entry.action, entry.params, DEFAULT_TIMEOUT_MS);
+				const text = result === undefined ? "undefined" : typeof result === "string" ? result : safeJson(result);
+				ctx.ui.notify(`#${idx} ${entry.action} ok — ${truncateText(text)}`, "info");
+			} catch (error) {
+				ctx.ui.notify(`#${idx} ${entry.action} failed to replay: ${(error as Error).message}`, "warning");
+			}
+			return;
+		}
+		if (chromeHistory.length === 0) {
+			ctx.ui.notify("No chrome_* actions recorded yet in this session.", "info");
+			return;
+		}
+		const requested = Number(tokens[0]);
+		const n = Math.min(Math.max(Number.isFinite(requested) ? requested : 10, 1), 50);
+		const lines: string[] = [];
+		const start = Math.max(0, chromeHistory.length - n);
+		for (let i = chromeHistory.length - 1; i >= start; i--) {
+			const entry = chromeHistory[i];
+			const idx = chromeHistory.length - 1 - i;
+			const time = new Date(entry.at).toTimeString().slice(0, 8);
+			lines.push(`#${idx} ${time} ${entry.action} ${entry.ok ? "ok" : "error"} ${entry.durationMs}ms ${entry.paramsSummary}`);
+		}
+		lines.push("Replay: /chrome history replay <idx>");
+		ctx.ui.notify(lines.join("\n"), "info");
+	};
+
 	const openAuthorizeMenu = async (ctx: ExtensionContext): Promise<void> => {
 		while (true) {
 			const choice = await ctx.ui.select("Authorize Chrome control", [
@@ -1195,6 +1526,7 @@ Usage rules:
 				"Lock Chrome control",
 				"Doctor / troubleshoot",
 				"Background / watch mode…",
+				"Action history / replay",
 				"Install / onboard extension",
 			]);
 			if (!choice) return;
@@ -1203,6 +1535,7 @@ Usage rules:
 				case "Lock Chrome control": return revokeHandler(ctx);
 				case "Doctor / troubleshoot": return doctorHandler(ctx);
 				case "Background / watch mode…": await openBackgroundMenu(ctx); continue;
+				case "Action history / replay": return historyHandler(ctx, "");
 				case "Install / onboard extension": return onboardHandler(ctx);
 			}
 		}
@@ -1210,7 +1543,7 @@ Usage rules:
 
 	pi.registerCommand("chrome", {
 		description:
-			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome status   — one-line snapshot of connection, auth, and background setting.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — whether pi-chrome runs without focusing Chrome.\nRun with no arguments for an interactive picker that shows current state.",
+			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome status   — one-line snapshot of connection, auth, and background setting.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome history [n|replay <idx>] — per-session chrome_* action log (default 10, max 50) and replay.\n  /chrome background [on|off|status|toggle] — whether pi-chrome runs without focusing Chrome.\nRun with no arguments for an interactive picker that shows current state.",
 		getArgumentCompletions: (prefix) => {
 			const raw = prefix;
 			const trimmedRight = raw.replace(/\s+$/, "");
@@ -1232,7 +1565,13 @@ Usage rules:
 					{ fullValue: "status", label: "status", description: "One-line summary: connection, auth, and background setting." },
 					{ fullValue: "doctor", label: "doctor", description: "Full health check. Tells you if Chrome is connected and what's wrong if it isn't." },
 					{ fullValue: "onboard", label: "onboard", description: "Install the Chrome companion extension (first-time setup)." },
+					{ fullValue: "history", label: "history", description: "Per-session chrome_* action log; replay an entry with 'history replay <idx>'." },
 					{ fullValue: "background", label: "background", description: "Run pi-chrome in the background without focusing Chrome?" },
+				];
+			} else if (path[0] === "history" && path.length === 1) {
+				candidates = [
+					{ fullValue: "history 10", label: "10", description: "Show the 10 most recent chrome_* actions." },
+					{ fullValue: "history replay", label: "replay", description: "Re-send a past action, e.g. 'history replay 0' for the newest." },
 				];
 			} else if (path[0] === "authorize" && path.length === 1) {
 				candidates = [
@@ -1267,6 +1606,7 @@ Usage rules:
 				case "status": return statusHandler(ctx);
 				case "doctor": return doctorHandler(ctx);
 				case "onboard": return onboardHandler(ctx);
+				case "history": return historyHandler(ctx, subArgs);
 				case "background":
 					return backgroundHandler(ctx, subArgs);
 				case "settings": {
@@ -1277,7 +1617,7 @@ Usage rules:
 					return;
 				}
 				default:
-					ctx.ui.notify(`Unknown subcommand '${head}'. Try: /chrome authorize | revoke | status | doctor | onboard | background.`, "warning");
+					ctx.ui.notify(`Unknown subcommand '${head}'. Try: /chrome authorize | revoke | status | doctor | onboard | history | background.`, "warning");
 			}
 		},
 	});
@@ -1326,7 +1666,7 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_tab",
 		label: "Chrome Tab",
-		description: "List, create, activate, close, group, ungroup, or inspect tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab.",
+		description: "List, create, activate, close, group, ungroup, inspect, or save named handles for tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab. action=save registers a named handle (name) for the resolved tab so a subagent can find or close its own tabs later; action=list returns the named-handle registry.",
 		promptSnippet: "List/open/activate/close/group existing Chrome tabs through the companion extension.",
 		parameters: Type.Object({
 			action: StringEnum(tabActionValues),
@@ -1337,6 +1677,8 @@ Usage rules:
 			group: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Pi-created tabs always join this session's own tab group." })),
 			groupTitle: Type.Optional(Type.String({ description: "Deprecated for action=new/group; ignored so one Pi session uses one tab group ('Pi Session: <name-or-id>')." })),
 			groupColor: Type.Optional(Type.String({ description: "Tab group color for action=group/new: grey, blue, red, yellow, green, pink, purple, cyan, or orange. Defaults to blue." })),
+			name: Type.Optional(Type.String({ description: "Handle name for action=save: the named-handle registry entry for the resolved tab." })),
+			sessionKey: Type.Optional(Type.String({ description: "Wire-only passthrough (not part of the public API surface): session owner key tagging save/list registry entries. Injected automatically from the host session when omitted." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
@@ -1914,6 +2256,50 @@ Usage rules:
 			const paths = params.paths.map((p) => resolve(cwd, p));
 			const result = await authorizedBridgeSend("page.upload", withBackground({ ...params, paths }), DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: `Uploaded ${paths.length} file(s) to ${params.uid ?? params.selector}` }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_diff",
+		label: "Chrome Diff",
+		description:
+			"Compare two Chrome snapshot digests (the `digest` shape from chrome_snapshot) and report what changed between them: URL/title/text content, focused/modal element, and added/removed/updated controls. Runs entirely on the Pi side - no bridge call. Use it to confirm an action changed the page as expected before continuing.",
+		promptSnippet: "Compare two Chrome snapshot digests and report what changed between them.",
+		parameters: Type.Object({
+			before: Type.Object({
+				url: Type.Optional(Type.String()),
+				title: Type.Optional(Type.String()),
+				textHash: Type.Optional(Type.String()),
+				focusedUid: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+				modalUid: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+				labels: Type.Optional(Type.Array(Type.Object({
+					uid: Type.String(),
+					role: Type.Optional(Type.String()),
+					label: Type.Optional(Type.String()),
+					disabled: Type.Optional(Type.Boolean()),
+					value: Type.Optional(Type.String()),
+					checked: Type.Optional(Type.Boolean()),
+				}))),
+			}),
+			after: Type.Object({
+				url: Type.Optional(Type.String()),
+				title: Type.Optional(Type.String()),
+				textHash: Type.Optional(Type.String()),
+				focusedUid: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+				modalUid: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+				labels: Type.Optional(Type.Array(Type.Object({
+					uid: Type.String(),
+					role: Type.Optional(Type.String()),
+					label: Type.Optional(Type.String()),
+					disabled: Type.Optional(Type.Boolean()),
+					value: Type.Optional(Type.String()),
+					checked: Type.Optional(Type.Boolean()),
+				}))),
+			}),
+		}),
+		async execute(_id, params): Promise<ToolTextResult> {
+			const { lines, diff } = diffDigests(params.before as SnapshotDigest, params.after as SnapshotDigest);
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { diff } };
 		},
 	});
 	}
