@@ -8,6 +8,13 @@ const COMMAND_TIMEOUT_MS = 25_000;
 const CDP_COMMAND_TIMEOUT_MS = 5_000;
 const SCRIPTING_TIMEOUT_MS = 8_000;
 const ATTACH_TIMEOUT_MS = 3_000;
+const JOURNAL_STORAGE_KEY = "piChromeExecutedCommands";
+const JOURNAL_MAX_ENTRIES = 200;
+const JOURNAL_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const TAB_REGISTRY_STORAGE_KEY = "piChromeTabRegistry";
+const SNAPSHOT_DOM_NODE_BUDGET = 8000;
+const SNAPSHOT_DOM_TIME_BUDGET_MS = 250;
+const SNAPSHOT_MAX_MERGED_ELEMENTS = 400;
 let polling = false;
 
 // =================== pi-chrome automation target ownership ===================
@@ -68,6 +75,41 @@ async function persistAutomationTargets() {
       obj[key] = { windowId: typeof value.windowId === "number" ? value.windowId : null, tabId: value.tabId };
     }
     await chrome.storage?.session?.set?.({ [AUTOMATION_STORAGE_KEY]: obj });
+  } catch {
+    // Ignore: persistence is an optimization, not a correctness requirement.
+  }
+}
+
+// =================== named tab registry (tab.save / tab.list) ===================
+// Subagents and workflows can bind names to tabs ("handles") so a label->tabId binding survives
+// worker restarts and each Pi session can enumerate/clean up exactly its own handles. Ownership
+// is session-scoped like automation targets: a name may only be re-bound by the session that
+// created it, and automation.cleanup drops that session's handles too. Mirrored to
+// chrome.storage.session so MV3 worker suspension does not lose the registry.
+const tabRegistry = new Map(); // name -> RegistryEntry {name, tabId, windowId?, url?, title?, ownerSessionKey, savedAt}
+let registryHydrated = false;
+
+async function hydrateTabRegistry() {
+  if (registryHydrated) return;
+  registryHydrated = true;
+  try {
+    const stored = await chrome.storage?.session?.get?.(TAB_REGISTRY_STORAGE_KEY);
+    const saved = stored && stored[TAB_REGISTRY_STORAGE_KEY];
+    if (saved && typeof saved === "object") {
+      for (const [name, entry] of Object.entries(saved)) {
+        if (entry && typeof entry.tabId === "number") tabRegistry.set(name, { ...entry, name });
+      }
+    }
+  } catch {
+    // Ignore: treat as "no persisted state".
+  }
+}
+
+async function persistTabRegistry() {
+  try {
+    const obj = {};
+    for (const [name, entry] of tabRegistry) obj[name] = { ...entry };
+    await chrome.storage?.session?.set?.({ [TAB_REGISTRY_STORAGE_KEY]: obj });
   } catch {
     // Ignore: persistence is an optimization, not a correctness requirement.
   }
@@ -460,7 +502,10 @@ async function cdpEval(tabId, expression, opts) {
     expression,
     returnByValue: true,
     awaitPromise: true,
-    userGesture: true,
+    // Arbitrary bridge-driven eval must NOT synthesize user activation (audit: a local attacker
+    // or injected script could otherwise click/confirm on the user's behalf). Only the explicit
+    // CDP input paths (click/type/fill/upload) enable userGesture.
+    userGesture: false,
     ...(opts || {}),
   });
 }
@@ -483,8 +528,13 @@ function cdpIsSyntaxError(details) {
 
 // Resolve target -> {x, y, rect} in viewport coords by running tiny script in tab.
 async function resolveTargetInTab(tabId, params) {
+  // A uid from a merged sub-frame snapshot carries an "el-f<frameId>-<n>" prefix; resolve the
+  // target inside the owning frame so selectors/uid lookups run against the right document.
+  const frameUid = params.uid ? parseFrameUid(params.uid) : null;
+  const frameId = frameUid ? frameUid.frameId : 0;
+  const localUid = frameUid ? frameUid.localUid : (params.uid ?? null);
   const results = await executeScriptTimed({
-    target: { tabId, frameIds: [0] },
+    target: { tabId, frameIds: [frameId] },
     world: "MAIN",
     func: (selector, uid, x, y) => {
       const state = window.__PI_CHROME_STATE__;
@@ -503,8 +553,8 @@ async function resolveTargetInTab(tabId, params) {
       if (typeof x === "number" && typeof y === "number") return { x, y, rect: null, tag: null, found: true };
       return { found: false };
     },
-    args: [params.selector ?? null, params.uid ?? null, params.x ?? null, params.y ?? null],
-  }, `resolve input target in tab ${tabId}`);
+    args: [params.selector ?? null, localUid, params.x ?? null, params.y ?? null],
+  }, `resolve input target in tab ${tabId} frame ${frameId}`);
   const v = results?.[0]?.result;
   if (v?.staleUid) throw new Error(v.reason || "snapshot uid is stale; refresh chrome_snapshot");
   if (!v || !v.found) throw new Error("Could not resolve target element for Chrome input");
@@ -635,8 +685,12 @@ async function cdpTypeChar(tabId, ch) {
 }
 
 async function domClickFallback(tabId, params, cause) {
+  // Route to the owning frame for sub-frame uids, same as resolveTargetInTab.
+  const frameUid = params.uid ? parseFrameUid(params.uid) : null;
+  const frameId = frameUid ? frameUid.frameId : 0;
+  const localUid = frameUid ? frameUid.localUid : (params.uid ?? null);
   const results = await executeScriptTimed({
-    target: { tabId, frameIds: [0] },
+    target: { tabId, frameIds: [frameId] },
     world: "MAIN",
     func: (selector, uid, x, y) => {
       const state = window.__PI_CHROME_STATE__;
@@ -656,8 +710,8 @@ async function domClickFallback(tabId, params, cause) {
       el.click();
       return { tag: el.tagName, url: location.href };
     },
-    args: [params.selector ?? null, params.uid ?? null, params.x ?? null, params.y ?? null],
-  }, `DOM click fallback in tab ${tabId}`);
+    args: [params.selector ?? null, localUid, params.x ?? null, params.y ?? null],
+  }, `DOM click fallback in tab ${tabId} frame ${frameId}`);
   const v = results?.[0]?.result;
   if (v?.staleUid) throw new Error(v.reason || "snapshot uid is stale; refresh chrome_snapshot");
   return { input: "dom-fallback", reason: String(cause?.message || cause).slice(0, 500), tag: v?.tag };
@@ -676,10 +730,14 @@ async function chromeInputClick(params) {
     await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse" });
     // Reset :focus-visible if the click landed on a focusable element. CDP-driven pointer
     // focus can leave :focus-visible=true in Chromium, which trips heuristics that expect
-    // Reset focus styling after pointer click when possible.
+    // Reset focus styling after pointer click when possible. Runs in the owning frame so
+    // sub-frame uids (el-f<frameId>-…) reset their own document's focus.
     if (params.selector || params.uid) {
+      const frameUid = params.uid ? parseFrameUid(params.uid) : null;
+      const focusFrameId = frameUid ? frameUid.frameId : 0;
+      const focusLocalUid = frameUid ? frameUid.localUid : (params.uid ?? null);
       await executeScriptTimed({
-        target: { tabId: tab.id, frameIds: [0] },
+        target: { tabId: tab.id, frameIds: [focusFrameId] },
         world: "MAIN",
         func: (sel, uid) => {
           const state = window.__PI_CHROME_STATE__;
@@ -690,8 +748,8 @@ async function chromeInputClick(params) {
             try { el.blur(); el.focus({ preventScroll: true, focusVisible: false }); } catch {}
           }
         },
-        args: [params.selector ?? null, params.uid ?? null],
-      }, `reset focus style in tab ${tab.id}`).catch(() => undefined);
+        args: [params.selector ?? null, focusLocalUid],
+      }, `reset focus style in tab ${tab.id} frame ${focusFrameId}`).catch(() => undefined);
     }
     return { input: "chrome", x: point.x, y: point.y, tag: resolved.tag };
   } catch (error) {
@@ -949,7 +1007,7 @@ async function chromeInputUpload(params) {
     el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
     return el;
   })()`;
-  const evaluated = await cdp(tab.id, "Runtime.evaluate", { expression, objectGroup: "pi-chrome-upload", includeCommandLineAPI: false, returnByValue: false });
+  const evaluated = await cdp(tab.id, "Runtime.evaluate", { expression, objectGroup: "pi-chrome-upload", includeCommandLineAPI: false, returnByValue: false, userGesture: true });
   if (evaluated.exceptionDetails) throw new Error(evaluated.exceptionDetails.text || "Could not resolve file input");
   const objectId = evaluated.result?.objectId;
   if (!objectId) throw new Error("Could not resolve file input object");
@@ -977,15 +1035,22 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.action.setBadgeBackgroundColor({ color: "#4f46e5" });
   armKeepaliveAlarm();
   void pollLoop();
+  void sendHeartbeat();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   armKeepaliveAlarm();
   void pollLoop();
+  void sendHeartbeat();
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "pi-bridge-keepalive") void pollLoop();
+  if (alarm.name === "pi-bridge-keepalive") {
+    void pollLoop();
+    // Liveness signal for the session-scoped grant: one beat per 30s keepalive alarm, so the
+    // bridge can expire grants for sessions whose extension died mid-workflow.
+    void sendHeartbeat();
+  }
 });
 
 chrome.action.onClicked.addListener(() => {
@@ -998,6 +1063,18 @@ armKeepaliveAlarm();
 setInterval(() => {
   void pollLoop();
 }, 1000);
+
+async function sendHeartbeat() {
+  try {
+    await fetch(`${BRIDGE_URL}/heartbeat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionKey: DEFAULT_SESSION_KEY }),
+    });
+  } catch {
+    // Best-effort liveness signaling; a down bridge is handled by pollLoop's backoff.
+  }
+}
 
 async function pollLoop() {
   if (polling) return;
@@ -1016,7 +1093,14 @@ async function pollLoop() {
         return;
       }
       const payload = await response.json();
-      if (payload.type === "command") await handleCommand(payload.command);
+      if (payload.type === "command") {
+        await handleCommand(payload.command);
+      } else if (payload.type === "orphan") {
+        // The bridge served a delivered-but-unacked-result command that it gave up on. Never
+        // re-execute; surface the warning and keep polling (the client decides whether to verify
+        // page state and retry with a NEW id).
+        console.warn(`[pi-chrome] orphan: ${payload.orphan.id} may have executed`);
+      }
     }
   } catch (error) {
     await sleep(POLL_ERROR_BACKOFF_MS);
@@ -1025,7 +1109,67 @@ async function pollLoop() {
   }
 }
 
+// =================== exactly-once executed-command journal ===================
+// A delivered command that the SW acknowledged but whose result never reached the bridge (owner
+// death between /next and /result) looks identical to a never-executed command. The journal
+// remembers executed ids so a client retry with the SAME id is answered from the journal instead
+// of re-running the side effect. Persisted in chrome.storage.session: survives SW restarts (MV3
+// suspends workers at any time) and is cleared on browser restart.
+async function loadJournal() {
+  try {
+    const stored = await chrome.storage?.session?.get?.(JOURNAL_STORAGE_KEY);
+    const saved = stored && stored[JOURNAL_STORAGE_KEY];
+    return saved && typeof saved === "object" ? saved : {};
+  } catch {
+    return {};
+  }
+}
+
+async function persistJournal(journal) {
+  try {
+    await chrome.storage?.session?.set?.({ [JOURNAL_STORAGE_KEY]: journal });
+  } catch {
+    // Ignore: losing the journal only risks a rare duplicate re-run, never a missed action.
+  }
+}
+
+// Drop entries older than the TTL and cap the map. Called on every handleCommand so the journal
+// never grows unbounded.
+function sweepJournal(journal, now) {
+  const ttlBoundary = now - JOURNAL_TTL_MS;
+  for (const id of Object.keys(journal)) {
+    const entry = journal[id];
+    if (!entry || typeof entry.completedAt !== "number" || entry.completedAt < ttlBoundary) delete journal[id];
+  }
+  const ids = Object.keys(journal);
+  if (ids.length > JOURNAL_MAX_ENTRIES) {
+    ids
+      .sort((a, b) => (journal[a].completedAt || 0) - (journal[b].completedAt || 0))
+      .slice(0, ids.length - JOURNAL_MAX_ENTRIES)
+      .forEach((id) => delete journal[id]);
+  }
+}
+
 async function handleCommand(command) {
+  const id = command?.id;
+  if (typeof id !== "string" || !id) {
+    await postResult({ id: id ?? "", ok: false, error: "command missing id" });
+    return;
+  }
+  const journal = await loadJournal();
+  sweepJournal(journal, Date.now());
+  const prior = journal[id];
+  if (prior) {
+    // Already executed (client retried with the same stable id after an owner-death timeout). Do
+    // NOT re-run; replay the recorded result so the client sees the outcome it missed.
+    await persistJournal(journal);
+    await postResult({ id, ok: true, result: prior.result, deduplicated: true });
+    return;
+  }
+  // Mark the command received BEFORE executing so the bridge's orphan sweep can tell "executed
+  // but result lost" from "never picked up". Best-effort: execution proceeds even if the ack
+  // fails (the /ack endpoint is idempotent).
+  await postAck(id);
   try {
     const result = await withTimeout(
       dispatch(command.action, command.params ?? {}),
@@ -1033,18 +1177,58 @@ async function handleCommand(command) {
       command.action || "Chrome command",
       () => detachAll(),
     );
-    await postResult({ id: command.id, ok: true, result });
+    journal[id] = { result, completedAt: Date.now() };
+    await persistJournal(journal);
+    await postResult({ id, ok: true, result });
   } catch (error) {
-    await postResult({ id: command.id, ok: false, error: error?.message ?? String(error) });
+    // Never journal failures: a retried failed command must execute again.
+    await postResult({ id, ok: false, error: error?.message ?? String(error) });
   }
 }
 
+// Best-effort delivery-ack with one retry. The server treats duplicate/unknown acks as no-ops, so
+// retrying cannot corrupt state — at worst the command is never marked "received" and a timeout
+// reports it as "may have executed" (the safe, conservative outcome).
+async function postAck(id) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await fetch(`${BRIDGE_URL}/ack`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id }),
+      });
+      if (response.ok) return;
+    } catch {
+      // Fall through to the retry (network error).
+    }
+    if (attempt === 0) await sleep(250);
+  }
+  console.warn(`[pi-chrome] ack for command ${id} failed after retry; server may treat it as never-received`);
+}
+
+// Result delivery with backoff retry. A lost /result is what turns a landed action into a phantom
+// timeout (and a double side effect on client retry), so this must be more reliable than a single
+// fire-and-forget POST. Retries are limited to transient failures: network errors, HTTP >= 500,
+// or any non-ok fetch. A 4xx means the bridge rejected the payload — retrying cannot fix it.
 async function postResult(result) {
-  await fetch(`${BRIDGE_URL}/result`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(result),
-  });
+  const RETRY_DELAYS_MS = [500, 1500, 3000];
+  let lastError = null;
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      const response = await fetch(`${BRIDGE_URL}/result`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(result),
+      });
+      if (response.ok) return;
+      lastError = new Error(`HTTP ${response.status}`);
+      if (response.status >= 400 && response.status < 500) break;
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < RETRY_DELAYS_MS.length) await sleep(RETRY_DELAYS_MS[attempt]);
+  }
+  console.warn(`[pi-chrome] postResult failed for command ${result.id} after ${RETRY_DELAYS_MS.length} retries: ${lastError?.message ?? "unknown error"}`);
 }
 
 function isVersionOlder(a, b) {
@@ -1129,9 +1313,40 @@ async function dispatch(action, params) {
         bridgeUrl: BRIDGE_URL,
         userAgent: navigator.userAgent,
       };
+    case "tab.save": {
+      // Bind a name to a tab for this session (named handle). Re-binding the same name in the
+      // same session overwrites the handle; a different session may not take the name over.
+      if (!params.name) throw new Error("chrome_tab save requires a name");
+      await hydrateTabRegistry();
+      const sessionKey = sessionKeyOf(params);
+      const existing = tabRegistry.get(params.name);
+      if (existing && existing.ownerSessionKey !== sessionKey) {
+        throw new Error(`handle ${params.name} already owned by another session`);
+      }
+      const tab = await getTabByParams(params);
+      const entry = {
+        name: params.name,
+        tabId: tab.id,
+        windowId: tab.windowId,
+        url: tab.url || "",
+        title: tab.title || "",
+        ownerSessionKey: sessionKey,
+        savedAt: Date.now(),
+      };
+      tabRegistry.set(params.name, entry);
+      await persistTabRegistry();
+      return { ok: true, handle: { ...entry } };
+    }
     case "tab.list": {
-      const tabs = await chrome.tabs.query({});
-      return Promise.all(tabs.map(formatTab));
+      // Named handles registry (S2.1). When a sessionKey is given, only that session's handles
+      // are returned; with none, all handles across sessions are listed.
+      await hydrateTabRegistry();
+      const owner = params && typeof params.sessionKey === "string" && params.sessionKey ? params.sessionKey : null;
+      const handles = [];
+      for (const entry of tabRegistry.values()) {
+        if (owner === null || entry.ownerSessionKey === owner) handles.push({ ...entry });
+      }
+      return { handles };
     }
     case "tab.new": {
       // Every Pi-opened tab must join a tab group. There is intentionally no opt-out: an ungrouped
@@ -1256,9 +1471,21 @@ async function dispatch(action, params) {
       return { windowId: t?.windowId ?? null, tabId: t?.tabId ?? null };
     }
     case "automation.cleanup":
-      // Close only THIS session's pi-chrome-owned window/tab. Never touches user tabs/windows or
-      // another Pi session's target.
-      return cleanupAutomationTarget(sessionKeyOf(params));
+      // Close only THIS session's pi-chrome-owned window/tab AND drop that session's named
+      // handles. Never touches user tabs/windows or another Pi session's target/handles.
+      {
+        const sessionKey = sessionKeyOf(params);
+        const removedHandles = [];
+        await hydrateTabRegistry();
+        for (const [name, entry] of tabRegistry) {
+          if (entry.ownerSessionKey === sessionKey) {
+            tabRegistry.delete(name);
+            removedHandles.push(name);
+          }
+        }
+        if (removedHandles.length) await persistTabRegistry();
+        return { ...(await cleanupAutomationTarget(sessionKey)), removedHandles };
+      }
     default:
       throw new Error(`Unknown action: ${action}`);
   }
@@ -1317,9 +1544,19 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
       );
     }
   } else if (params.urlIncludes) {
-    tab = tabs.find((candidate) => (candidate.url || "").includes(params.urlIncludes));
+    // Multiple matches must NOT resolve silently to the first tab (audit: Array.find could drive
+    // the wrong tab). Error with the candidate list so the caller re-targets explicitly.
+    const matching = tabs.filter((candidate) => (candidate.url || "").includes(params.urlIncludes));
+    if (matching.length > 1) {
+      throw ambiguityError(matching.length, `urlIncludes "${params.urlIncludes}"`, matching);
+    }
+    tab = matching[0];
   } else if (params.titleIncludes) {
-    tab = tabs.find((candidate) => (candidate.title || "").includes(params.titleIncludes));
+    const matching = tabs.filter((candidate) => (candidate.title || "").includes(params.titleIncludes));
+    if (matching.length > 1) {
+      throw ambiguityError(matching.length, `titleIncludes "${params.titleIncludes}"`, matching);
+    }
+    tab = matching[0];
   } else {
     // No explicit target: use this session's dedicated automation target instead of hijacking the
     // user's active tab. This keeps human browsing and Pi automation separated — navigating here
@@ -1348,6 +1585,16 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
     await joinSessionGroup(tab, params.sessionGroupTitle);
   }
   return tab;
+}
+
+// A target predicate that matched several tabs is ambiguous — acting on the first match would
+// silently drive the wrong tab. Surface the candidate list so the caller can disambiguate.
+function ambiguityError(count, predicate, candidates) {
+  const listed = candidates
+    .slice(0, 20)
+    .map((candidate) => `  ${candidate.id}${candidate.active ? " *" : ""}\t${(candidate.title || "(untitled)").slice(0, 60)}\t${candidate.url || ""}`)
+    .join("\n");
+  return new Error(`${count} tabs match ${predicate}; pass targetId or a more specific urlIncludes:\n${listed || "  (none)"}`);
 }
 
 // Add an ungrouped tab to the session's tab group (reusing it by title, else creating it).
@@ -1398,24 +1645,33 @@ async function executeInTab(params, func, args) {
   // Phase 1: define the helpers and the action function as page globals via CDP
   // Runtime.evaluate. This bypasses page CSP (no `eval`/`new Function`), which is the
   // root cause of snapshot/click/etc silently failing on `script-src 'self'` sites.
-  // Each helper is a named function declaration, assigned to window.<name> so the action
-  // (which references helpers by bare name) resolves them as globals at call time.
-  const assignments = HELPER_FUNCS.map((helper) => `window.${helper.name}=${helper.toString()}`).join(";\n");
-  const actionAssign = `window.__piAction=(${func.toString()})`;
-  const defineRes = await cdpEval(tab.id, `(()=>{${assignments};\n${actionAssign};})()`);
+  // Each helper is a named function declaration assigned to the page. The three helpers with
+  // generic/clobbering names (rand, typeCharacter, __piAction) live under one
+  // window.__piChromeHelpers namespace instead of polluting page globals (audit: window.rand /
+  // window.typeCharacter / window.__piAction could clobber site globals). All other helpers stay
+  // as window.<name> so their bare-name cross-references keep resolving at call time.
+  const NAMESPACED_HELPERS = new Set(["rand", "typeCharacter"]);
+  const assignments = HELPER_FUNCS.map((helper) => (
+    NAMESPACED_HELPERS.has(helper.name)
+      ? `window.__piChromeHelpers[${JSON.stringify(helper.name)}]=${helper.toString()}`
+      : `window.${helper.name}=${helper.toString()}`
+  )).join(";\n");
+  const actionAssign = `window.__piChromeHelpers.__piAction=(${func.toString()})`;
+  const defineRes = await cdpEval(tab.id, `(()=>{window.__piChromeHelpers=window.__piChromeHelpers||{};\n${assignments};\n${actionAssign};})()`);
   if (defineRes.exceptionDetails) {
     throw new Error(`Failed to inject Chrome page helpers: ${cdpExceptionText(defineRes.exceptionDetails) || "unknown error"}`);
   }
 
   // Phase 2: run the action via chrome.scripting.executeScript. The `func:` form is
   // injected by Chrome itself (not `new Function`), so it is CSP-safe, and it lets Chrome
-  // serialize the invocation args. The wrapper references window.__piAction defined above.
+  // serialize the invocation args. The wrapper references window.__piChromeHelpers.__piAction
+  // defined above.
   const results = await executeScriptTimed({
     target: { tabId: tab.id },
     world: "MAIN",
     func: async (invocationArgs) => {
       try {
-        return { ok: true, value: await window.__piAction(...invocationArgs) };
+        return { ok: true, value: await window.__piChromeHelpers.__piAction(...invocationArgs) };
       } catch (error) {
         return { ok: false, error: error?.stack || error?.message || String(error) };
       }
@@ -1505,9 +1761,111 @@ async function withOptionalSnapshot(params, actionFn) {
 // chrome.scripting.executeScript({ files }). That file is free of eval/new Function, so it works
 // on strict-CSP pages, and it installs globalThis.__piChromeSnapshotPage / __piChromeInspectTarget.
 // It shares window.__PI_CHROME_STATE__ (same el- uid scheme) with the CDP-injected input helpers.
+//
+// Inject+invoke race: injection and invocation are separate executeScript calls, so a navigation
+// between them leaves the invoke step with no global installed. On a "did not install" error we
+// re-inject ONCE before failing (the navigation may have moved on again).
+//
+// Cross-origin iframes: the top frame is snapshotted as today; every sub-frame enumerated via
+// chrome.webNavigation.getAllFrames is then snapshotted best-effort in its own context and its
+// elements are merged in with a "frame:<frameId>" context marker. Sub-frame uids are renamed on
+// the wire ("el-<n>" -> "el-f<frameId>-<n>") so act tools can route back to the owning frame.
+
+// Sub-frame uid scheme: "el-f<frameId>-<seq>"; top-frame uids stay "el-<seq>". Returns the owning
+// frame id (0 = top frame) plus the uid rewritten for lookup inside that frame's own state.
+function parseFrameUid(uid) {
+  if (typeof uid !== "string") return null;
+  const match = /^el-f(\d+)-(.+)$/.exec(uid);
+  if (!match) return null;
+  return { frameId: Number(match[1]), localUid: `el-${match[2]}` };
+}
+
+async function injectSnapshotFile(tabId, frameId) {
+  await executeScriptTimed({
+    target: { tabId, frameIds: [frameId] },
+    world: "MAIN",
+    files: ["snapshot_injected.js"],
+  }, `inject snapshot script in tab ${tabId} frame ${frameId}`);
+}
+
+// Invoke the installed snapshot page function inside one frame, re-injecting the file once when
+// the tab navigated between injection and invocation (missing global).
+async function runSnapshotPageInFrame(tab, frameId, args) {
+  const invoke = async () => {
+    const results = await executeScriptTimed({
+      target: { tabId: tab.id, frameIds: [frameId] },
+      world: "MAIN",
+      func: async (invocationArgs) => {
+        try {
+          const snapshotPage = globalThis.__piChromeSnapshotPage;
+          if (typeof snapshotPage !== "function") throw new Error("snapshot_injected.js did not install __piChromeSnapshotPage");
+          return { ok: true, value: await snapshotPage(...invocationArgs) };
+        } catch (error) {
+          return { ok: false, error: error?.stack || error?.message || String(error) };
+        }
+      },
+      args: [args],
+    }, `run snapshot script in tab ${tab.id} frame ${frameId}`);
+    return unpackFrameInvoke(results, "Chrome snapshot script failed");
+  };
+  let outcome = await invoke();
+  if (outcome.missingGlobal) {
+    await injectSnapshotFile(tab.id, frameId).catch(() => undefined);
+    outcome = await invoke();
+  }
+  if (outcome.error) throw new Error(outcome.error);
+  return outcome.value;
+}
+
+// Invoke the installed inspect target function inside one frame (same re-inject-once policy).
+async function runInspectPageInFrame(tab, frameId, args) {
+  const invoke = async () => {
+    const results = await executeScriptTimed({
+      target: { tabId: tab.id, frameIds: [frameId] },
+      world: "MAIN",
+      func: async (invocationArgs) => {
+        try {
+          const inspectTarget = globalThis.__piChromeInspectTarget;
+          if (typeof inspectTarget !== "function") throw new Error("snapshot_injected.js did not install __piChromeInspectTarget");
+          return { ok: true, value: await inspectTarget(...invocationArgs) };
+        } catch (error) {
+          return { ok: false, error: error?.stack || error?.message || String(error) };
+        }
+      },
+      args: [args],
+    }, `run inspect script in tab ${tab.id} frame ${frameId}`);
+    return unpackFrameInvoke(results, "Chrome inspect script failed");
+  };
+  let outcome = await invoke();
+  if (outcome.missingGlobal) {
+    await injectSnapshotFile(tab.id, frameId).catch(() => undefined);
+    outcome = await invoke();
+  }
+  if (outcome.error) throw new Error(outcome.error);
+  return outcome.value;
+}
+
+// Normalize an executeScript result envelope into { value } | { error } | { missingGlobal }.
+function unpackFrameInvoke(results, fallbackError) {
+  const first = results?.[0];
+  if (first?.error) {
+    const message = typeof first.error === "string" ? first.error : (first.error.message || JSON.stringify(first.error));
+    return { missingGlobal: /did not install/.test(message), error: message };
+  }
+  const envelope = first?.result;
+  if (envelope && typeof envelope === "object" && envelope.ok === false) {
+    const message = envelope.error || fallbackError;
+    return { missingGlobal: /did not install/.test(message), error: message };
+  }
+  return { value: envelope?.value };
+}
+
 async function snapshotInTab(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
+  // Trailing budget args are the service-worker-side hookup for the snippet's single budgeted
+  // TreeWalker pass (node + wall-clock budgets); the snippet ignores them until it grows
+  // optional params, so appending them here is forward-compatible and harmless today.
   const args = [
     params.maxElements || 80,
     params.containingText ?? null,
@@ -1516,72 +1874,66 @@ async function snapshotInTab(params) {
     params.mode || "auto",
     params.query ?? null,
     params.maxTextChars ?? null,
+    SNAPSHOT_DOM_NODE_BUDGET,
+    SNAPSHOT_DOM_TIME_BUDGET_MS,
   ];
-  await executeScriptTimed({
-    target: { tabId: tab.id, frameIds: [0] },
-    world: "MAIN",
-    files: ["snapshot_injected.js"],
-  }, `inject snapshot script in tab ${tab.id}`);
-  const results = await executeScriptTimed({
-    target: { tabId: tab.id, frameIds: [0] },
-    world: "MAIN",
-    func: async (invocationArgs) => {
-      try {
-        const snapshotPage = globalThis.__piChromeSnapshotPage;
-        if (typeof snapshotPage !== "function") throw new Error("snapshot_injected.js did not install __piChromeSnapshotPage");
-        return { ok: true, value: await snapshotPage(...invocationArgs) };
-      } catch (error) {
-        return { ok: false, error: error?.stack || error?.message || String(error) };
+  await injectSnapshotFile(tab.id, 0);
+  const snapshot = await runSnapshotPageInFrame(tab, 0, args);
+  await mergeSubframeSnapshots(tab, snapshot, args);
+  return snapshot;
+}
+
+// Best-effort cross-origin/sub-frame enumeration: snapshot each sub-frame in its own context and
+// merge its elements (uid-prefixed + frame-tagged) into the top-frame result. Frames that fail to
+// snapshot are listed as iframe placeholders so callers know content lives in a frame.
+async function mergeSubframeSnapshots(tab, snapshot, args) {
+  if (!Array.isArray(snapshot.elements) || !chrome.webNavigation || typeof chrome.webNavigation.getAllFrames !== "function") return;
+  let frames = [];
+  try {
+    frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id });
+  } catch {
+    return;
+  }
+  const subframes = (frames || []).filter((frame) => frame && typeof frame.frameId === "number" && frame.frameId > 0);
+  if (!subframes.length) return;
+  const extra = [];
+  for (const frame of subframes) {
+    let value = null;
+    try {
+      value = await runSnapshotPageInFrame(tab, frame.frameId, args);
+    } catch {
+      // Best-effort: a frame we could not snapshot is still listed as an iframe placeholder.
+    }
+    const frameElements = value && Array.isArray(value.elements) ? value.elements : null;
+    if (frameElements && frameElements.length) {
+      for (const el of frameElements) {
+        if (el && typeof el.uid === "string") el.uid = `el-f${frame.frameId}-${el.uid.replace(/^el-/, "")}`;
+        if (el) {
+          el.frame = frame.frameId;
+          el.context = `frame:${frame.frameId}`;
+        }
       }
-    },
-    args: [args],
-  }, `run snapshot script in tab ${tab.id}`);
-  const first = results?.[0];
-  if (first?.error) {
-    const message = typeof first.error === "string" ? first.error : (first.error.message || JSON.stringify(first.error));
-    throw new Error(message);
+      extra.push(...frameElements);
+    } else {
+      extra.push({ tag: "iframe", role: "iframe", context: `frame:${frame.frameId}`, label: frame.url || "iframe" });
+    }
   }
-  const envelope = first?.result;
-  if (envelope && typeof envelope === "object" && envelope.ok === false) {
-    throw new Error(envelope.error || "Chrome snapshot script failed");
+  if (!extra.length) return;
+  const cap = Math.max(snapshot.elements.length, SNAPSHOT_MAX_MERGED_ELEMENTS);
+  snapshot.elements = [...snapshot.elements, ...extra].slice(0, cap);
+  if (snapshot.summary && typeof snapshot.summary.totalInteractiveSampled === "number") {
+    snapshot.summary.totalInteractiveSampled += extra.length;
   }
-  return envelope?.value;
 }
 
 async function inspectInTab(params) {
   if (!params.uid && !params.selector) throw new Error("chrome_inspect requires uid or selector");
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
-  const args = [params.uid ?? null, params.selector ?? null, params.scrollIntoView === true];
-  await executeScriptTimed({
-    target: { tabId: tab.id, frameIds: [0] },
-    world: "MAIN",
-    files: ["snapshot_injected.js"],
-  }, `inject inspect script in tab ${tab.id}`);
-  const results = await executeScriptTimed({
-    target: { tabId: tab.id, frameIds: [0] },
-    world: "MAIN",
-    func: async (invocationArgs) => {
-      try {
-        const inspectTarget = globalThis.__piChromeInspectTarget;
-        if (typeof inspectTarget !== "function") throw new Error("snapshot_injected.js did not install __piChromeInspectTarget");
-        return { ok: true, value: await inspectTarget(...invocationArgs) };
-      } catch (error) {
-        return { ok: false, error: error?.stack || error?.message || String(error) };
-      }
-    },
-    args: [args],
-  }, `run inspect script in tab ${tab.id}`);
-  const first = results?.[0];
-  if (first?.error) {
-    const message = typeof first.error === "string" ? first.error : (first.error.message || JSON.stringify(first.error));
-    throw new Error(message);
-  }
-  const envelope = first?.result;
-  if (envelope && typeof envelope === "object" && envelope.ok === false) {
-    throw new Error(envelope.error || "Chrome inspect script failed");
-  }
-  return envelope?.value;
+  const frameUid = params.uid ? parseFrameUid(params.uid) : null;
+  const frameId = frameUid ? frameUid.frameId : 0;
+  const args = [frameUid ? frameUid.localUid : (params.uid ?? null), params.selector ?? null, params.scrollIntoView === true];
+  return runInspectPageInFrame(tab, frameId, args);
 }
 
 // One-shot init script registry, scoped per tab. The source is registered with CDP
@@ -1828,8 +2180,8 @@ function pointerEventSequence(element, x, y, sequence) {
 
 async function humanMoveTo(x, y, steps) {
   const state = getPiChromeState();
-  const startX = Number.isFinite(state.pointer?.x) ? state.pointer.x : rand(12, Math.max(24, innerWidth - 12));
-  const startY = Number.isFinite(state.pointer?.y) ? state.pointer.y : rand(12, Math.max(24, innerHeight - 12));
+  const startX = Number.isFinite(state.pointer?.x) ? state.pointer.x : window.__piChromeHelpers.rand(12, Math.max(24, innerWidth - 12));
+  const startY = Number.isFinite(state.pointer?.y) ? state.pointer.y : window.__piChromeHelpers.rand(12, Math.max(24, innerHeight - 12));
   const n = steps || Math.max(12, Math.min(42, Math.round(Math.hypot(x - startX, y - startY) / 18)));
   let prevX = startX, prevY = startY;
   let defaultPrevented = false;
@@ -1837,13 +2189,13 @@ async function humanMoveTo(x, y, steps) {
     const t = i / n;
     const ease = t * t * (3 - 2 * t);
     const wobble = Math.sin(t * Math.PI) * 8;
-    const px = startX + (x - startX) * ease + rand(-wobble, wobble);
-    const py = startY + (y - startY) * ease + rand(-wobble, wobble);
+    const px = startX + (x - startX) * ease + window.__piChromeHelpers.rand(-wobble, wobble);
+    const py = startY + (y - startY) * ease + window.__piChromeHelpers.rand(-wobble, wobble);
     const el = document.elementFromPoint(px, py) || document.body || document.documentElement;
     defaultPrevented = dispatchPointerLikeEvent(el, "pointermove", px, py, prevX, prevY) || defaultPrevented;
     defaultPrevented = dispatchPointerLikeEvent(el, "mousemove", px, py, prevX, prevY) || defaultPrevented;
     prevX = px; prevY = py;
-    await sleepPage(rand(4, 18));
+    await sleepPage(window.__piChromeHelpers.rand(4, 18));
   }
   state.pointer = { x, y, t: performance.now() };
   return defaultPrevented;
@@ -1855,8 +2207,8 @@ function humanClickPoint(point) {
   const insetX = Math.min(rect.width * 0.35, Math.max(2, rect.width / 2 - 1));
   const insetY = Math.min(rect.height * 0.35, Math.max(2, rect.height / 2 - 1));
   return {
-    x: rect.left + rect.width / 2 + rand(-insetX, insetX),
-    y: rect.top + rect.height / 2 + rand(-insetY, insetY),
+    x: rect.left + rect.width / 2 + window.__piChromeHelpers.rand(-insetX, insetX),
+    y: rect.top + rect.height / 2 + window.__piChromeHelpers.rand(-insetY, insetY),
   };
 }
 
@@ -2167,7 +2519,7 @@ async function clickPage(selector, uid, x, y) {
   if (typeof point.element.focus === "function" && /^(A|BUTTON|INPUT|TEXTAREA|SELECT|SUMMARY)$/.test(point.element.tagName)) {
     try { point.element.focus({ preventScroll: true }); } catch { try { point.element.focus(); } catch {} }
   }
-  await sleepPage(rand(45, 140));
+  await sleepPage(window.__piChromeHelpers.rand(45, 140));
   defaultPrevented = dispatchPointerLikeEvent(point.element, "pointerup", point.x, point.y, prevX, prevY) || defaultPrevented;
   defaultPrevented = dispatchPointerLikeEvent(point.element, "mouseup", point.x, point.y, prevX, prevY) || defaultPrevented;
   defaultPrevented = dispatchPointerLikeEvent(point.element, "click", point.x, point.y, prevX, prevY) || defaultPrevented;
@@ -2230,7 +2582,7 @@ async function hoverPage(selector, uid, x, y) {
     defaultPrevented = dispatchPointerLikeEvent(point.element, type, point.x, point.y, prevX, prevY) || defaultPrevented;
   }
   // Small dwell so hover-intent handlers fire.
-  await sleepPage(rand(80, 220));
+  await sleepPage(window.__piChromeHelpers.rand(80, 220));
   return { x: point.x, y: point.y, selector, uid, tag: point.element.tagName, defaultPrevented, input: "dom" };
 }
 
@@ -2261,7 +2613,7 @@ async function dragPage(fromUid, fromSelector, fromX, fromY, toUid, toSelector, 
   dispatchPointerLikeEvent(from.element, "pointerover", from.x, from.y, prevX, prevY);
   dispatchPointerLikeEvent(from.element, "pointerdown", from.x, from.y, prevX, prevY, { pressure: 0.5 });
   dispatchPointerLikeEvent(from.element, "mousedown", from.x, from.y, prevX, prevY);
-  await sleepPage(rand(40, 110));
+  await sleepPage(window.__piChromeHelpers.rand(40, 110));
   dragInit("dragstart", from.element, from.x, from.y);
   dragInit("drag", from.element, from.x, from.y);
   let lastOver = from.element;
@@ -2270,8 +2622,8 @@ async function dragPage(fromUid, fromSelector, fromX, fromY, toUid, toSelector, 
     const t = i / n;
     const ease = t * t * (3 - 2 * t);
     const wobble = Math.sin(t * Math.PI) * 6;
-    const x = from.x + (to.x - from.x) * ease + rand(-wobble, wobble);
-    const y = from.y + (to.y - from.y) * ease + rand(-wobble, wobble);
+    const x = from.x + (to.x - from.x) * ease + window.__piChromeHelpers.rand(-wobble, wobble);
+    const y = from.y + (to.y - from.y) * ease + window.__piChromeHelpers.rand(-wobble, wobble);
     const overEl = document.elementFromPoint(x, y) || to.element;
     dispatchPointerLikeEvent(overEl, "pointermove", x, y, prevX, prevY);
     dispatchPointerLikeEvent(overEl, "mousemove", x, y, prevX, prevY);
@@ -2283,7 +2635,7 @@ async function dragPage(fromUid, fromSelector, fromX, fromY, toUid, toSelector, 
     dragInit("dragover", overEl, x, y);
     dragInit("drag", from.element, x, y);
     prevX = x; prevY = y;
-    await sleepPage(rand(8, 26));
+    await sleepPage(window.__piChromeHelpers.rand(8, 26));
   }
   dispatchPointerLikeEvent(to.element, "pointerover", to.x, to.y, prevX, prevY);
   dispatchPointerLikeEvent(to.element, "mouseover", to.x, to.y, prevX, prevY);
@@ -2341,7 +2693,7 @@ async function scrollPage(selector, uid, deltaY, deltaX, steps) {
       }
     }
     movedY += dy; movedX += dx;
-    await sleepPage(rand(12, 28));
+    await sleepPage(window.__piChromeHelpers.rand(12, 28));
   }
   return {
     deltaX: movedX, deltaY: movedY, steps: n,
@@ -2413,7 +2765,7 @@ async function typeCharacter(element, ch) {
   const needShift = ch.length === 1 && (/^[A-Z]$/.test(ch) || "~!@#$%^&*()_+{}|:\"<>?".includes(ch));
   if (needShift) {
     dispatchKeyEvent(element, "keydown", "Shift", { shiftKey: true });
-    await sleepPage(rand(8, 24));
+    await sleepPage(window.__piChromeHelpers.rand(8, 24));
   }
   const mods = { shiftKey: needShift };
   const down = dispatchKeyEvent(element, "keydown", ch, mods);
@@ -2441,13 +2793,13 @@ async function typeCharacter(element, ch) {
     throw new Error("Focused element is not text-editable");
   }
 
-  await sleepPage(rand(25, 95));
+  await sleepPage(window.__piChromeHelpers.rand(25, 95));
   dispatchKeyEvent(element, "keyup", ch, mods);
   if (needShift) {
-    await sleepPage(rand(5, 18));
+    await sleepPage(window.__piChromeHelpers.rand(5, 18));
     dispatchKeyEvent(element, "keyup", "Shift", { shiftKey: false });
   }
-  await sleepPage(rand(35, 140));
+  await sleepPage(window.__piChromeHelpers.rand(35, 140));
   return { defaultPrevented: false };
 }
 
@@ -2459,7 +2811,7 @@ async function typeIntoPage(selector, uid, text, pressEnter) {
   const initialValue = "value" in element ? element.value : (element.isContentEditable ? element.textContent : null);
   element.focus();
   if (!(element.isContentEditable || "value" in element)) throw new Error("Focused element is not text-editable");
-  for (const ch of Array.from(text)) await typeCharacter(element, ch);
+  for (const ch of Array.from(text)) await window.__piChromeHelpers.typeCharacter(element, ch);
   if (pressEnter) await pressKeyInPage("Enter");
   const finalValue = "value" in element ? element.value : element.textContent;
   const valueMatches = "value" in element ? element.value.includes(text) : (element.textContent || "").includes(text);
@@ -2546,7 +2898,7 @@ async function pressKeyInPage(key) {
       }
     }
   }
-  await sleepPage(rand(25, 95));
+  await sleepPage(window.__piChromeHelpers.rand(25, 95));
   const up = dispatchKeyEvent(target, "keyup", normalized);
   if (normalized === "Enter") {
     const form = target.closest?.("form");

@@ -5,6 +5,8 @@
     const state = window.__PI_CHROME_STATE__ || {
       nextElementUid: 1,
       elements: {},
+      rememberedCount: 0,
+      meaningfulContainerCache: new Map(),
       console: [],
       network: [],
       nextRequestId: 1,
@@ -12,14 +14,93 @@
       lastSnapshotDigest: null,
     };
     window.__PI_CHROME_STATE__ = state;
+    // Migrate states created before the remembered-element eviction landed.
+    if (typeof state.rememberedCount !== "number") state.rememberedCount = Object.keys(state.elements || {}).length;
+    if (!(state.meaningfulContainerCache instanceof Map)) state.meaningfulContainerCache = new Map();
     return state;
   }
+
+  const MAX_REMEMBERED_ELEMENTS = 2000;
 
   function rememberElement(element) {
     const state = getPiChromeState();
     if (!element.__piChromeUid) element.__piChromeUid = "el-" + state.nextElementUid++;
+    if (!(element.__piChromeUid in state.elements)) state.rememberedCount++;
     state.elements[element.__piChromeUid] = element;
+    evictRememberedElements(state);
     return element.__piChromeUid;
+  }
+
+  function uidSequence(uid) {
+    const sequence = Number(String(uid).replace(/^el-/, ""));
+    return Number.isFinite(sequence) ? sequence : 0;
+  }
+
+  // Lazy eviction: once the map exceeds its cap, sweep detached elements first;
+  // if still over the cap, drop the oldest entries (lowest uid sequence).
+  function evictRememberedElements(state) {
+    if (state.rememberedCount <= MAX_REMEMBERED_ELEMENTS) return;
+    const elements = state.elements;
+    for (const uid of Object.keys(elements)) {
+      const el = elements[uid];
+      if (!el || !el.isConnected) {
+        delete elements[uid];
+        state.rememberedCount--;
+      }
+    }
+    if (state.rememberedCount <= MAX_REMEMBERED_ELEMENTS) return;
+    const byAge = Object.keys(elements).sort((a, b) => uidSequence(a) - uidSequence(b));
+    const excess = state.rememberedCount - MAX_REMEMBERED_ELEMENTS;
+    for (let i = 0; i < excess; i++) {
+      delete elements[byAge[i]];
+      state.rememberedCount--;
+    }
+  }
+
+  const DOM_NODE_BUDGET = 8000;
+  const DOM_TIME_BUDGET_MS = 250;
+  const DOM_BUDGET_CLOCK_INTERVAL = 64;
+
+  function createDomBudget() {
+    let nodes = 0;
+    const deadline = Date.now() + DOM_TIME_BUDGET_MS;
+    return {
+      // Exhausted once the node budget is spent or the wall-clock budget lapses
+      // (clock sampled every 64th node so the walk itself stays cheap).
+      consume() {
+        nodes++;
+        if (nodes > DOM_NODE_BUDGET) return false;
+        if ((nodes & (DOM_BUDGET_CLOCK_INTERVAL - 1)) === 0 && Date.now() > deadline) return false;
+        return true;
+      },
+    };
+  }
+
+  const INTERACTIVE_CANDIDATE_SELECTOR =
+    'a, button, input, textarea, select, summary, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="checkbox"], [contenteditable="true"], [tabindex]:not([tabindex="-1"])';
+
+  // Single budgeted TreeWalker pass. Open shadow roots are pierced by recursing
+  // into each host's shadowRoot, so a host and its shadow descendants are all
+  // collected as candidates (closed roots stay opaque by design).
+  function collectInteractiveCandidates() {
+    const budget = createDomBudget();
+    const seen = new Set();
+    const candidates = [];
+    const visit = (root) => {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+      let node = walker.nextNode();
+      while (node) {
+        if (!budget.consume()) return;
+        if (node.matches(INTERACTIVE_CANDIDATE_SELECTOR) && !seen.has(node)) {
+          seen.add(node);
+          candidates.push(node);
+        }
+        if (node.shadowRoot) visit(node.shadowRoot);
+        node = walker.nextNode();
+      }
+    };
+    visit(document);
+    return candidates;
   }
 
   function isElementVisible(element) {
@@ -34,10 +115,29 @@
   }
 
   function occluderAt(x, y, expected) {
+    if (typeof document.elementsFromPoint === "function") {
+      // Composed (flat-tree) hit test: the stack lists the topmost hit plus its
+      // composed ancestors, so an element inside an open shadow root shows up
+      // when the point lands on it or on one of its shadow hosts.
+      const stack = document.elementsFromPoint(x, y);
+      if (!stack.length) return null;
+      const top = stack[0];
+      if (top === expected) return null;
+      if (expected) {
+        if (expected.contains(top)) return null;
+        if (top.contains(expected)) return null;
+        if (stack.includes(expected)) return null;
+      }
+      return {
+        tag: top.tagName.toLowerCase(),
+        id: top.id || undefined,
+        className: typeof top.className === "string" ? top.className : undefined,
+      };
+    }
     const top = document.elementFromPoint(x, y);
     if (!top || top === expected) return null;
     if (expected && expected.contains(top)) return null;
-    if (top.contains(expected)) return null;
+    if (expected && top.contains(expected)) return null;
     return {
       tag: top.tagName.toLowerCase(),
       id: top.id || undefined,
@@ -256,6 +356,14 @@
   }
 
   function meaningfulContainerFor(element) {
+    const state = getPiChromeState();
+    let cache = state.meaningfulContainerCache;
+    if (cache.size >= 5000) {
+      cache = new Map();
+      state.meaningfulContainerCache = cache;
+    }
+    const cached = cache.get(element);
+    if (cached) return cached.isConnected ? cached : document.body;
     let current = element.parentElement;
     let fallback = current;
     let depth = 0;
@@ -271,23 +379,34 @@
       const classHint = /card|panel|pane|modal|dialog|section|content|container|toolbar|menu|list|item|row|cell|header|footer|sidebar|drawer|popover|dropdown/i.test(`${id} ${cls}`);
       const rect = current.getBoundingClientRect();
       const childActions = current.querySelectorAll?.('a, button, input, textarea, select, [role="button"], [role="link"], [tabindex]:not([tabindex="-1"])').length || 0;
-      if ((semantic || classHint || named) && rect.width > 20 && rect.height > 20 && childActions <= 80) return current;
+      if ((semantic || classHint || named) && rect.width > 20 && rect.height > 20 && childActions <= 80) {
+        cache.set(element, current);
+        return current;
+      }
       if (!fallback && rect.width > 20 && rect.height > 20) fallback = current;
       current = current.parentElement;
     }
-    return fallback || document.body;
+    const container = fallback || document.body;
+    cache.set(element, container);
+    return container;
   }
 
   function contextForElement(element) {
     const container = meaningfulContainerFor(element);
     if (!container || container === document.body || container === element) return undefined;
-    return {
+    const context = {
       uid: rememberElement(container),
       tag: container.tagName.toLowerCase(),
       role: roleOf(container),
       label: directHeadingText(container) || accessibleLabel(container) || textOf(container, 140),
       rect: rectSummary(container),
     };
+    const root = element.getRootNode ? element.getRootNode() : document;
+    if (root.nodeType === Node.DOCUMENT_FRAGMENT_NODE && root.host) {
+      const host = root.host;
+      context.shadow = "shadow:" + (accessibleLabel(host) || host.tagName.toLowerCase() || "host");
+    }
+    return context;
   }
 
   function summarizeElement(element, index) {
@@ -523,7 +642,7 @@
     installPiChromeInstrumentation();
     mode = ["auto", "interactive", "forms", "pageMap", "text", "changes", "full"].includes(mode) ? mode : "auto";
     const fullTextLimit = Number(maxTextChars || (mode === "full" ? 30000 : mode === "text" ? 18000 : 6000));
-    let candidates = Array.from(document.querySelectorAll('a, button, input, textarea, select, summary, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="checkbox"], [contenteditable="true"], [tabindex]:not([tabindex="-1"])'));
+    let candidates = collectInteractiveCandidates();
     if (containingText) {
       const needle = String(containingText).toLowerCase();
       candidates = candidates.filter((element) => accessibleLabel(element).toLowerCase().includes(needle));
