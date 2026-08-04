@@ -54,7 +54,7 @@ pi-chrome ships as an unpacked extension so the source and broad browser permiss
 
 ## What's the install footprint?
 
-- Pi side: one extension that registers 21 tools and a few slash commands.
+- Pi side: one extension that registers 22 tools and a few slash commands.
 - Chrome side: one unpacked extension, ~2000 LOC of plain JavaScript, no dependencies.
 
 ## Can I script it without Pi?
@@ -77,11 +77,11 @@ If the page did not change, take a fresh snapshot or screenshot and check for ov
 
 ## If a chrome_* command times out, did it still run?
 
-It may have. Commands are tracked by id and results are delivered with retries, and the timeout message tells you which of three cases you're in: the extension never polled (not installed/running), it polled but never picked up the command (retry is safe), or it picked up the command but never returned a result. In that last case the action — a click, a type, a keypress — may already have executed in Chrome even though no result came back. Don't blindly re-issue the command; take a fresh snapshot or `includeSnapshot=true` result first to see whether the action landed, then retry only what actually didn't.
+It may have. Commands are tracked by id, delivered exactly once, and results are posted back with retries. The timeout message tells you which case you're in: the extension never polled (not installed/running), it is polling but never picked up the command (retry is safe), it delivered the command but never acknowledged it (retry is safe — a duplicate will not re-run because the id is deduplicated), or it acknowledged the command but never returned a result. In that last case the action — a click, a type, a keypress — may already have executed in Chrome even though no result came back. Don't blindly re-issue the command; take a fresh snapshot or `includeSnapshot=true` result first to see whether the action landed, then retry only what actually didn't.
 
 ## Can I see what chrome_* actions ran in this session?
 
-Yes — `/chrome history` prints the per-session action log: every chrome_* call, its parameters, and its result envelope, oldest first. It's the audit trail for what the browser was asked to do, useful for debugging a flaky step, replaying a step against the current page, or explaining a run to someone else.
+Yes — `/chrome history` prints the per-session action log: every chrome_* call, its parameters, and its result envelope, newest first (indices match `replay`). It's the audit trail for what the browser was asked to do, useful for debugging a flaky step, replaying a step against the current page, or explaining a run to someone else.
 
 ## How do I compare the page now versus an earlier snapshot?
 
