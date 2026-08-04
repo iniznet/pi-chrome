@@ -13,15 +13,14 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#go",
-          "trusted": true
+          "selector": "#go"
         }
       }
     ],
     "notes": [
       "Core debugger/CDP smoke test."
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -45,12 +44,11 @@
         "tool": "chrome_type",
         "params": {
           "selector": "#t",
-          "text": "hello",
-          "trusted": true
+          "text": "hello"
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -80,7 +78,7 @@
     "notes": [
       "Environment-sensitive; classify unexpected failures as profile warnings first."
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -107,7 +105,7 @@
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -147,7 +145,7 @@
       }
     ],
     "flakeRisk": "medium",
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -202,7 +200,7 @@
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -229,7 +227,7 @@
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -257,7 +255,7 @@
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -289,7 +287,7 @@
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -312,8 +310,7 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#go",
-          "trusted": true
+          "selector": "#go"
         }
       }
     ],
@@ -323,7 +320,7 @@
       "clipboard/fullscreen allowed by browser policy"
     ],
     "flakeRisk": "high",
-    "manualBaseline": "unverified",
+    "manualBaseline": "CONDITIONAL",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -357,7 +354,7 @@
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -388,7 +385,7 @@
       "non-headless normal Chrome profile"
     ],
     "flakeRisk": "medium",
-    "manualBaseline": "unverified",
+    "manualBaseline": "CONDITIONAL",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -412,13 +409,12 @@
         "tool": "chrome_type",
         "params": {
           "selector": "#t",
-          "text": "x",
-          "trusted": true
+          "text": "x"
         }
       }
     ],
     "flakeRisk": "medium",
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -446,7 +442,7 @@
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -470,15 +466,14 @@
         "tool": "chrome_drag",
         "params": {
           "fromSelector": "#src",
-          "toSelector": "#dst",
-          "trusted": true
+          "toSelector": "#dst"
         }
       }
     ],
     "notes": [
       "May need CDP Input.dispatchDragEvent rather than mouse drag on some Chrome versions."
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -506,7 +501,7 @@
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -529,8 +524,7 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#t",
-          "trusted": true
+          "selector": "#t"
         }
       },
       {
@@ -539,8 +533,7 @@
           "key": "v",
           "modifiers": {
             "metaKey": true
-          },
-          "trusted": true
+          }
         }
       }
     ],
@@ -548,7 +541,7 @@
       "OS clipboard contains pi-chrome",
       "use ctrlKey instead of metaKey on Windows/Linux"
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -571,34 +564,30 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#s",
-          "trusted": true
+          "selector": "#s"
         }
       },
       {
         "tool": "chrome_key",
         "params": {
-          "key": "ArrowDown",
-          "trusted": true
+          "key": "ArrowDown"
         }
       },
       {
         "tool": "chrome_key",
         "params": {
-          "key": "ArrowDown",
-          "trusted": true
+          "key": "ArrowDown"
         }
       },
       {
         "tool": "chrome_key",
         "params": {
-          "key": "Enter",
-          "trusted": true
+          "key": "Enter"
         }
       }
     ],
     "flakeRisk": "high",
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -621,8 +610,7 @@
       {
         "tool": "chrome_hover",
         "params": {
-          "selector": "#trig",
-          "trusted": true
+          "selector": "#trig"
         }
       },
       {
@@ -634,12 +622,11 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#go",
-          "trusted": true
+          "selector": "#go"
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -667,7 +654,7 @@
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -693,12 +680,11 @@
           "key": "a",
           "modifiers": {
             "shiftKey": true
-          },
-          "trusted": true
+          }
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -728,7 +714,7 @@
     "prerequisites": [
       "touch events enabled/supported"
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "CONDITIONAL",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -751,8 +737,7 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#go",
-          "trusted": true
+          "selector": "#go"
         }
       }
     ],
@@ -760,7 +745,7 @@
       "Adversarial probe; selector resolution itself can be detected by monkey-patched DOM APIs.",
       "Should fail only on concrete automation URLs/Runtime frames, not generic anonymous stack formatting."
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -783,12 +768,11 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#go",
-          "trusted": true
+          "selector": "#go"
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -811,19 +795,17 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#a",
-          "trusted": true
+          "selector": "#a"
         }
       },
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#b",
-          "trusted": true
+          "selector": "#b"
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -846,15 +828,13 @@
       {
         "tool": "chrome_hover",
         "params": {
-          "selector": "#pad",
-          "trusted": true
+          "selector": "#pad"
         }
       },
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#go",
-          "trusted": true
+          "selector": "#go"
         }
       }
     ],
@@ -863,7 +843,7 @@
       "Timing thresholds can be tuned via ?threshold.<name>=value for slower CI or high-polling devices."
     ],
     "flakeRisk": "high",
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -888,15 +868,14 @@
         "tool": "chrome_scroll",
         "params": {
           "selector": "#box",
-          "deltaY": 1600,
-          "trusted": true
+          "deltaY": 1600
         }
       }
     ],
     "notes": [
       "Physical detent mouse wheels may fail decay requirement; trackpads usually pass."
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "CONDITIONAL",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -923,20 +902,18 @@
         "tool": "chrome_scroll",
         "params": {
           "selector": "#scroller",
-          "deltaY": 1200,
-          "trusted": true
+          "deltaY": 1200
         }
       },
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#target",
-          "trusted": true
+          "selector": "#target"
         }
       }
     ],
     "flakeRisk": "medium",
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -974,7 +951,7 @@
       "Selector syntax is descriptive; tools may need uid from snapshot rather than CSS.",
       "Current recipe uses descriptive >>> shadow selector syntax; runners must adapt to supported uids/selectors or use evaluate until bridge supports shadow piercing."
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "prerequisites": [
       "pi-chrome shadow-piercing selectors or shadow-root-aware snapshot uids"
     ],
@@ -1014,7 +991,7 @@
     "notes": [
       "Selector syntax is descriptive; benchmark checks whether tool exposes frame-aware uids/selectors."
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "prerequisites": [
       "pi-chrome currently targets frameId 0 for many actions; iframe drilling needs frame-targeting support"
     ],
@@ -1047,7 +1024,7 @@
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "notes": [
       "Recipe paths may contain $PWD; external runners should expand shell-style placeholders before calling chrome_upload_file."
     ],
@@ -1073,68 +1050,59 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#start",
-          "trusted": true
+          "selector": "#start"
         }
       },
       {
         "tool": "chrome_key",
         "params": {
-          "key": "Tab",
-          "trusted": true
+          "key": "Tab"
         }
       },
       {
         "tool": "chrome_type",
         "params": {
-          "text": "one",
-          "trusted": true
+          "text": "one"
         }
       },
       {
         "tool": "chrome_key",
         "params": {
-          "key": "Tab",
-          "trusted": true
+          "key": "Tab"
         }
       },
       {
         "tool": "chrome_type",
         "params": {
-          "text": "two",
-          "trusted": true
+          "text": "two"
         }
       },
       {
         "tool": "chrome_key",
         "params": {
-          "key": "Tab",
-          "trusted": true
+          "key": "Tab"
         }
       },
       {
         "tool": "chrome_type",
         "params": {
-          "text": "three",
-          "trusted": true
+          "text": "three"
         }
       },
       {
         "tool": "chrome_key",
         "params": {
-          "key": "Tab",
-          "trusted": true
+          "key": "Tab"
         }
       },
       {
         "tool": "chrome_key",
         "params": {
-          "key": "Enter",
-          "trusted": true
+          "key": "Enter"
         }
       }
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -1185,7 +1153,7 @@
       "Page verdict only checks in-page fetch result; benchmark harness should also assert captured console/network entries.",
       "First chrome_list_console_messages/chrome_list_network_requests call installs capture hooks; do not move clear/list calls after click."
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "difficulty": "L1",
     "tags": [
@@ -1209,8 +1177,7 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#promptBtn",
-          "trusted": true
+          "selector": "#promptBtn"
         }
       },
       {
@@ -1224,8 +1191,7 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#confirmBtn",
-          "trusted": true
+          "selector": "#confirmBtn"
         }
       },
       {
@@ -1249,7 +1215,7 @@
     "notes": [
       "If dialog handling is unsupported, page may block after click; this is expected signal."
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "gate": "conditional"
   },
@@ -1268,8 +1234,7 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#open",
-          "trusted": true
+          "selector": "#open"
         }
       },
       {
@@ -1295,7 +1260,7 @@
     "notes": [
       "Child tab writes PASS to shared localStorage; harness should verify tab count/title too."
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "gate": "core"
   },
@@ -1314,36 +1279,31 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#open",
-          "trusted": true
+          "selector": "#open"
         }
       },
       {
         "tool": "chrome_key",
         "params": {
-          "key": "Tab",
-          "trusted": true
+          "key": "Tab"
         }
       },
       {
         "tool": "chrome_key",
         "params": {
-          "key": "Tab",
-          "trusted": true
+          "key": "Tab"
         }
       },
       {
         "tool": "chrome_key",
         "params": {
-          "key": "Tab",
-          "trusted": true
+          "key": "Tab"
         }
       },
       {
         "tool": "chrome_key",
         "params": {
-          "key": "Escape",
-          "trusted": true
+          "key": "Escape"
         }
       }
     ],
@@ -1355,7 +1315,7 @@
       "focus",
       "keyboard"
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "gate": "core"
   },
@@ -1375,22 +1335,19 @@
         "tool": "chrome_type",
         "params": {
           "selector": "#combo",
-          "text": "as",
-          "trusted": true
+          "text": "as"
         }
       },
       {
         "tool": "chrome_key",
         "params": {
-          "key": "ArrowDown",
-          "trusted": true
+          "key": "ArrowDown"
         }
       },
       {
         "tool": "chrome_key",
         "params": {
-          "key": "Enter",
-          "trusted": true
+          "key": "Enter"
         }
       }
     ],
@@ -1402,7 +1359,7 @@
       "combobox",
       "forms"
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "gate": "core"
   },
@@ -1421,15 +1378,13 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#settings",
-          "trusted": true
+          "selector": "#settings"
         }
       },
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#billing",
-          "trusted": true
+          "selector": "#billing"
         }
       },
       {
@@ -1438,22 +1393,19 @@
           "key": "ArrowLeft",
           "modifiers": {
             "altKey": true
-          },
-          "trusted": true
+          }
         }
       },
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#billing",
-          "trusted": true
+          "selector": "#billing"
         }
       },
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#save",
-          "trusted": true
+          "selector": "#save"
         }
       }
     ],
@@ -1465,7 +1417,7 @@
       "history",
       "navigation"
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page",
     "notes": [
       "Requires a real browser Back action (e.g. Alt+Left) to exercise popstate before Save."
@@ -1492,11 +1444,16 @@
         }
       },
       {
+        "tool": "chrome_evaluate",
+        "params": {
+          "expression": "(() => { const r = document.getElementById('cspTarget').getBoundingClientRect(); return JSON.stringify({ x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }); })()"
+        }
+      },
+      {
         "tool": "chrome_click",
         "params": {
-          "x": 310,
-          "y": 256,
-          "trusted": true
+          "x": "$RESULT_OF_chrome_evaluate.x",
+          "y": "$RESULT_OF_chrome_evaluate.y"
         }
       }
     ],
@@ -1510,9 +1467,9 @@
       "strict-csp"
     ],
     "notes": [
-      "This challenge exercises the pure screenshot + viewport-coordinate path (no snapshot/evaluate needed). Note: as of the CDP CSP bypass, chrome_snapshot/chrome_evaluate DO work here even though script-src omits unsafe-eval (see challenge 42 strict-csp-evaluate). Read verdict from dashboard/localStorage after leaving the CSP page."
+      "This challenge exercises the pure screenshot + viewport-coordinate path (no snapshot needed; a chrome_evaluate step computes the target's center). Note: as of the CDP CSP bypass, chrome_snapshot/chrome_evaluate DO work here even though script-src omits unsafe-eval (see challenge 42 strict-csp-evaluate). Read verdict from dashboard/localStorage after leaving the CSP page."
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page"
   },
   {
@@ -1539,8 +1496,7 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#readyAction",
-          "trusted": true
+          "selector": "#readyAction"
         }
       }
     ],
@@ -1555,7 +1511,7 @@
     "notes": [
       "Covers explicit wait primitive and avoids fixed sleep as readiness strategy."
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page"
   },
   {
@@ -1607,8 +1563,7 @@
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#verify",
-          "trusted": true
+          "selector": "#verify"
         }
       }
     ],
@@ -1624,7 +1579,7 @@
     "notes": [
       "Recipe contains dynamic tab IDs; runner must substitute ids from chrome_tab list. Complements target=_blank by testing explicit new/close/activate tools."
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page"
   },
   {
@@ -1650,15 +1605,13 @@
         "tool": "chrome_fill",
         "params": {
           "selector": "#tokenInput",
-          "value": "$RESULT_OF_chrome_evaluate",
-          "trusted": true
+          "text": "$RESULT_OF_chrome_evaluate"
         }
       },
       {
         "tool": "chrome_click",
         "params": {
-          "selector": "#verify",
-          "trusted": true
+          "selector": "#verify"
         }
       }
     ],
@@ -1675,7 +1628,7 @@
     "notes": [
       "Regression guard for the CDP CSP bypass: chrome_evaluate and chrome_snapshot must work even though script-src omits unsafe-eval (eval/new Function are blocked). The token is non-enumerable and never in the DOM, so it can only be obtained via chrome_evaluate. Runner must substitute the evaluate result into the fill value. synthetic FAIL is due to the trusted-click gate, not eval availability."
     ],
-    "manualBaseline": "unverified",
+    "manualBaseline": "PASS",
     "gradeSource": "page"
   }
 ]
