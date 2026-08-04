@@ -32,6 +32,10 @@ Chrome control is also locked per Pi session until you run `/chrome authorize`; 
 
 Yes. The first session opens the local bridge; later sessions detect it and pipe their commands through the same bridge. Each Pi session must be authorized with `/chrome authorize` before its chrome_* tools work. Each session also owns its **own** dedicated automation window (ownership is keyed by session id inside the one extension), so concurrent sessions never navigate into or close each other's tabs.
 
+## How do workflow subagents use Chrome?
+
+Workflow subagents can be handed the same chrome_* toolset (the `subagentChromeTools` setting exposes it as the `"chrome-tools"` toolset) without any separate setup. Subagents reuse the host session's `/chrome authorize` grant and the same local bridge, and their automation targets join the **host session's** tab group, so parallel subagents share the host's dedicated automation window instead of each spawning their own. Every subagent action is still tagged with the host session key, keeping targeting and cleanup scoped to that one session.
+
 ## Does pi-chrome navigate my current tab?
 
 No. The first chrome_* action that has no explicit target opens a **dedicated automation window** that pi-chrome owns (falling back to a dedicated tab only if a separate window can't be created), and reuses it for the rest of the session. Your existing tabs and windows are never reused or overwritten. Pass `targetId`/`urlIncludes`/`titleIncludes` to deliberately act on a tab you already have open.
@@ -50,7 +54,7 @@ pi-chrome ships as an unpacked extension so the source and broad browser permiss
 
 ## What's the install footprint?
 
-- Pi side: one extension that registers 19 tools and a few slash commands.
+- Pi side: one extension that registers 21 tools and a few slash commands.
 - Chrome side: one unpacked extension, ~2000 LOC of plain JavaScript, no dependencies.
 
 ## Can I script it without Pi?
@@ -70,6 +74,18 @@ Yes. `chrome_evaluate` and `chrome_snapshot` run in the page's MAIN world throug
 Use `includeSnapshot=true` on `chrome_click`, `chrome_type`, `chrome_fill`, or `chrome_key`. The tool returns the Chrome-input result plus a fresh snapshot, so the agent can verify text, URL, visible elements, or form values before continuing.
 
 If the page did not change, take a fresh snapshot or screenshot and check for overlays, disabled controls, stale element uids, or app-side validation.
+
+## If a chrome_* command times out, did it still run?
+
+It may have. Commands are tracked by id and results are delivered with retries, and the timeout message tells you which of three cases you're in: the extension never polled (not installed/running), it polled but never picked up the command (retry is safe), or it picked up the command but never returned a result. In that last case the action — a click, a type, a keypress — may already have executed in Chrome even though no result came back. Don't blindly re-issue the command; take a fresh snapshot or `includeSnapshot=true` result first to see whether the action landed, then retry only what actually didn't.
+
+## Can I see what chrome_* actions ran in this session?
+
+Yes — `/chrome history` prints the per-session action log: every chrome_* call, its parameters, and its result envelope, oldest first. It's the audit trail for what the browser was asked to do, useful for debugging a flaky step, replaying a step against the current page, or explaining a run to someone else.
+
+## How do I compare the page now versus an earlier snapshot?
+
+`chrome_diff` compares two snapshot states and reports added, removed, and updated elements plus text/URL/title changes — the same diff `chrome_snapshot` computes internally, exposed as a first-class comparison for assertion-style steps. Use it to confirm an action changed the page the way you expected before continuing, instead of eyeballing two full snapshots.
 
 ## How do I attach a file to a React file input?
 
