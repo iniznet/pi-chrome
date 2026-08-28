@@ -55,7 +55,7 @@ pi-chrome ships as an unpacked extension so the source and broad browser permiss
 ## What's the install footprint?
 
 - Pi side: one extension that registers 22 tools and a few slash commands.
-- Chrome side: one unpacked extension, ~2000 LOC of plain JavaScript, no dependencies.
+- Chrome side: one unpacked extension, ~3.8k LOC of plain JavaScript across `service_worker.js` + `snapshot_injected.js`, no dependencies.
 
 ## Can I script it without Pi?
 

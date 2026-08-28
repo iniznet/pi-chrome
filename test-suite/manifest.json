@@ -1394,7 +1394,8 @@
           "modifiers": {
             "altKey": true
           }
-        }
+        },
+        "note": "Primary browser Back synthesis. Alt+Left is OS/environment dependent (macOS Chrome maps Back to Cmd+Left or Cmd+[; CDP-synthesized browser shortcuts are not honored in every environment). If no popstate results, use the re-entry fallback step below."
       },
       {
         "tool": "chrome_click",
@@ -1407,6 +1408,14 @@
         "params": {
           "selector": "#save"
         }
+      },
+      {
+        "tool": "chrome_navigate",
+        "params": {
+          "url": "http://127.0.0.1:8765/challenges/38-spa-route-change.html"
+        },
+        "fallback": true,
+        "note": "Re-entry fallback (do NOT run as part of the happy path): if the Back step above could not synthesize a browser Back, navigate to the challenge again for a clean SPA state, then redo the flow from the top driving Back via a runner-provided mechanism (e.g. chrome_evaluate with history.back(), which fires popstate without a full reload)."
       }
     ],
     "requires": {
@@ -1419,8 +1428,10 @@
     ],
     "manualBaseline": "PASS",
     "gradeSource": "page",
+    "flakeRisk": "high",
     "notes": [
-      "Requires a real browser Back action (e.g. Alt+Left) to exercise popstate before Save."
+      "Requires a real browser Back action (e.g. Alt+Left) to exercise popstate before Save.",
+      "Back shortcut synthesis is OS/environment dependent (macOS Chrome: Cmd+Left / Cmd+[); when Alt+Left cannot be synthesized, use the recipe's documented chrome_navigate re-entry fallback and drive Back via a runner-provided mechanism."
     ],
     "gate": "core"
   },

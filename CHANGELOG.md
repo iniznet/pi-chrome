@@ -2,6 +2,39 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.46 — 2026-08-04
+
+- **Exactly-once command delivery.** The bridge now mints a monotonic command id per send (`pid:seq`), tracks every command through a 3-state machine (pending → received → completed), and deduplicates retries, so a timed-out command can never silently double-execute. The companion extension records executed command ids in an in-memory journal (10-minute TTL, 200-entry cap) and answers duplicate deliveries from it.
+- **Ack/heartbeat wire.** The extension now acknowledges every command it picks up (`/ack`) and heartbeats the bridge on an interval, so the host can classify a timeout four ways — never polled, polled but never picked up, delivered but never acked (retry is safe, dedupe id), or acked but never finished (the action MAY have executed).
+- **Orphan handling.** A command the extension acknowledged but whose result never arrived is surfaced as an orphan notice on the next `/next` poll instead of being silently dropped, so the agent knows the action may have run and can verify before retrying.
+- **Named tab registry.** `chrome_tab save` registers a named handle for the resolved tab and `chrome_tab list` returns the registry (filtered to the owning session when a session key is present), so a workflow subagent can find or close its own tabs later. Entries are mirrored to `chrome.storage.session` so MV3 worker suspension does not lose them.
+- **New `chrome_diff` tool.** Compares two snapshot digests (the `digest` shape from `chrome_snapshot`) and reports what changed: URL/title/text content, focused/modal element, and added/removed/updated controls. Runs entirely on the Pi side — no bridge call — and pairs with `includeSnapshot=true` for assertion-style steps.
+- **New `/chrome history` command.** Per-session action log — every chrome_* call, its parameters, and its result envelope, newest first (default 10, max 50) — with `replay <idx>` to re-send a past action against the current page.
+- **Snapshot producer fixes.** Shadow-DOM and iframe element collection, sub-frame uid namespacing (`el-f<frameId>-…`), element-ambiguity disambiguation, a DOM-node/time budget for huge pages, and user-gesture handling so CDP-driven input paths synthesize activation while arbitrary bridge-driven eval does not.
+- **Authorization state recording.** Chrome tool authorization changes (`/chrome authorize`, `/chrome revoke`, expiry) now explicitly activate/deactivate the chrome_* tools in the active toolset and post a visible `pi-chrome-tool-change` message. The persisted grant is scoped to the session that created it, so a stale session cannot inherit control across `/reload`.
+- **Manifest/test-suite fix.** `chrome_fill`'s `value` param renamed to `text`, computed-rect click for sub-frames, dropped phantom `trusted` param, and the benchmark manifest's 42 challenge baselines updated.
+- **FAQ updates.** Exactly-once timeout semantics (4-way classification), `/chrome history` (newest first, indices match `replay`), and `chrome_diff` documented.
+
+## 0.15.45 — 2026-07-07
+
+- **Explicit authorization-state recording.** Tool-state changes are recorded explicitly with the auth window (`authorizedUntil`) attached, so reauthorization/expiry/revoke each reflect the actual persisted grant state.
+
+## 0.15.44 — 2026-07-07
+
+- **Chrome tool authorization changes are logged and visible.** `/chrome authorize`, `/chrome revoke`, and grant expiry now activate/deactivate the chrome_* tools in the active toolset and post an explicit `pi-chrome-tool-change` message with the affected tool list and auth window, instead of silently flipping authorization.
+
+## 0.15.43 — 2026-06-25
+
+- **README capabilities are user-facing.** The README's capability list was rewritten around what pi-chrome can do for you — read pages you're already signed into, click/type/fill forms, screenshots, console-log and `fetch`/`XMLHttpRequest` inspection, and tab management without taking over your active window — instead of implementation details.
+
+## 0.15.42 — 2026-06-25
+
+- **README quick start removed.** Setup guidance was consolidated into `/chrome onboard` + `docs/` so the README no longer duplicates instructions.
+
+## 0.15.41 — 2026-06-25
+
+- **README shortened; architecture docs moved out.** The README was cut nearly in half and the deep-dive content moved to a new `docs/ARCHITECTURE.md`, keeping the top-level doc focused on setup, commands, and security.
+
 ## 0.15.40 — 2026-06-22
 
 - **Automation targets reuse the session tab group.** When `chrome_navigate` / implicit page actions create a new pi-chrome automation tab, it is now created in this session's existing tab-group window when possible and joins that same group, avoiding duplicate same-title `Pi Session: ...` groups.

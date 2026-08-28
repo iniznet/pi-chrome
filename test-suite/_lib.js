@@ -104,12 +104,43 @@
   };
 
   function persist() {
+    const key = "pi-chrome-suite:" + state.id;
+    const payload = {
+      id: state.id,
+      verdict: state.verdict,
+      reason: state.reason,
+      details: state.details,
+      thresholds: state.thresholds,
+      events: state.events.slice(-50),
+      ts: Date.now(),
+      persisted: true,
+    };
     try {
-      localStorage.setItem(
-        "pi-chrome-suite:" + state.id,
-        JSON.stringify({ id: state.id, verdict: state.verdict, reason: state.reason, details: state.details, thresholds: state.thresholds, events: state.events.slice(-50), ts: Date.now() })
-      );
-    } catch {}
+      localStorage.setItem(key, JSON.stringify(payload));
+      delete window.__verdictLost;
+    } catch (err) {
+      // A lost verdict must never masquerade as "challenge not run": surface a
+      // sentinel record so readers can tell PENDING (no record) from a run whose
+      // result could not be persisted (persisted:false / WARN verdict).
+      const message = err && err.message ? err.message : String(err);
+      console.warn("[pi-chrome-suite] verdict write failed for " + state.id + ": " + message);
+      window.__verdictLost = { id: state.id, verdict: state.verdict, reason: state.reason, ts: Date.now(), error: message };
+      try {
+        // Minimal sentinel (retry usually succeeds when the full payload hit a quota edge).
+        localStorage.setItem(
+          key,
+          JSON.stringify({
+            id: state.id,
+            verdict: "WARN",
+            reason: ["verdict write failed; " + state.verdict + " result not persisted"],
+            persisted: false,
+            ts: Date.now(),
+          })
+        );
+      } catch (err2) {
+        console.warn("[pi-chrome-suite] sentinel write also failed for " + state.id + "; verdict " + state.verdict + " is lost");
+      }
+    }
   }
 
   function parseThresholds(defaults) {

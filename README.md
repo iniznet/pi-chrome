@@ -137,6 +137,7 @@ Security details: [`SECURITY.md`](./SECURITY.md). Architecture details: [`docs/A
 /chrome status              # connection + auth + background state
 /chrome authorize [duration]
 /chrome revoke
+/chrome history [n|replay <idx>]   # per-session action log (default 10, max 50) + replay
 /chrome background on       # default: don't steal focus
 /chrome background off      # foreground/watch mode
 /chrome background status
@@ -152,7 +153,7 @@ If loaded extension is older than installed `pi-chrome`, `/chrome doctor` tells 
 
 Current limits include native Chrome/OS surfaces, print/save dialogs, permission bubbles, password-manager prompts, cross-origin iframe DOM access, CAPTCHA/bot challenges, passkeys/security keys/biometrics, rich multitouch/pinch/stylus gestures, and arbitrary desktop apps.
 
-For strict-CSP pages, use screenshots + coordinate input when snapshot/evaluate paths are blocked.
+For strict-CSP pages, `chrome_snapshot`/`chrome_evaluate`/`chrome_wait_for` and Chrome input run through CDP `Runtime.evaluate`, a DevTools protocol command that is **not** subject to the page's Content-Security-Policy — they keep working even on pages that block `'unsafe-eval'`. Screenshot + coordinate input remains a fallback only for exotic locked-down pages where even the CDP path is unusable.
 
 ---
 

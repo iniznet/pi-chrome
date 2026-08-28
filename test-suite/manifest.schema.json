@@ -26,7 +26,7 @@
           "manual": { "$ref": "#/$defs/outcome" }
         }
       },
-      "manualBaseline": { "description": "Whether human baseline has been explicitly verified in this repo/environment.", "enum": ["unverified", "verified"] },
+      "manualBaseline": { "description": "Recorded outcome of the human baseline run for this recipe. Primary vocabulary is the harness verdict set PASS/CONDITIONAL/FAIL/SKIP/WARN (a manual run is graded with the same verdicts as expected.manual); unverified/verified are legacy pre-verdict flags retained for backward compatibility.", "enum": ["unverified", "verified", "PASS", "CONDITIONAL", "FAIL", "SKIP", "WARN"] },
       "manualBaselineVerifiedAt": { "type": "string", "format": "date-time" },
       "recipe": {
         "type": "array",
