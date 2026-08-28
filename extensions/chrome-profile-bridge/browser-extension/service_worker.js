@@ -5,12 +5,42 @@ const DEFAULT_GROUP_COLOR = "blue";
 const PI_GROUP_RE = /^Pi(\b|\s*-)/i;
 const VALID_GROUP_COLORS = new Set(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
 const COMMAND_TIMEOUT_MS = 25_000;
+// Safety ceiling for host-provided per-command timeouts (the host budget already reaches 120s
+// for fullPage screenshots and 60s+ for waitFor); commands beyond this are clamped, never ignored.
+const COMMAND_TIMEOUT_CEILING_MS = 300_000;
+// Non-destructive timeout for Runtime.evaluate: slow page.evaluate (awaitPromise) must reject
+// WITHOUT detaching the debugger, unlike input-dispatch CDP calls (see cdpRaw).
+const CDP_EVALUATE_TIMEOUT_MS = 30_000;
 const CDP_COMMAND_TIMEOUT_MS = 5_000;
 const SCRIPTING_TIMEOUT_MS = 8_000;
 const ATTACH_TIMEOUT_MS = 3_000;
 const JOURNAL_STORAGE_KEY = "piChromeExecutedCommands";
 const JOURNAL_MAX_ENTRIES = 200;
 const JOURNAL_TTL_MS = 10 * 60 * 1000; // 10 minutes
+// The journal persists only compact digests (never full results), so a total byte budget plus
+// oldest-first eviction keeps it far under storage.session's quota.
+const JOURNAL_MAX_BYTES = 256 * 1024; // 256KB
+// Small in-memory LRU of recent full results used to replay a deduplicated id's real outcome.
+const RECENT_RESULTS_MAX = 40;
+const RECENT_RESULTS_MAX_BYTES = 2 * 1024 * 1024;
+const RECENT_RESULT_MAX_ENTRY_BYTES = 512 * 1024;
+// Sub-frame snapshot merge: bounded concurrency plus a total wall-clock budget; frames beyond
+// the budget become 'skipped' placeholders instead of failing the whole snapshot command.
+const SUBFRAME_SNAPSHOT_CONCURRENCY = 4;
+const SUBFRAME_SNAPSHOT_BUDGET_MS = 10_000;
+// Full-page screenshots default to jpeg (far smaller than PNG tiles) and cap pathological pages.
+const MAX_FULLPAGE_TILES = 30;
+// Bridge-down polling: exponential backoff capped at ~30s, and stop after N consecutive failures
+// (re-armed by the keepalive alarm / action.onClicked).
+const POLL_BACKOFF_CAP_MS = 30_000;
+const POLL_MAX_CONSECUTIVE_FAILURES = 10;
+// No session traffic for this long (and no owned automation targets) => the extension is idle;
+// polling stops and heartbeats are skipped so the MV3 worker can suspend.
+const POLL_IDLE_EXIT_MS = 5 * 60 * 1000;
+const HEARTBEAT_IDLE_SKIP_MS = 2 * 60 * 1000;
+// When idle, the /next probe aborts after this long so the SW does not sit in the bridge's 25s
+// long-poll forever; the keepalive alarm re-arms the probe each cycle.
+const POLL_IDLE_PROBE_MS = 5000;
 const TAB_REGISTRY_STORAGE_KEY = "piChromeTabRegistry";
 const SNAPSHOT_DOM_NODE_BUDGET = 8000;
 const SNAPSHOT_DOM_TIME_BUDGET_MS = 250;
@@ -190,11 +220,33 @@ async function cleanupAutomationTarget(sessionKey) {
   await persistAutomationTargets();
   if (!t) return { closedWindowId: null, closedTabId: null };
   const { windowId, tabId } = t;
+  // The session's target tab is going away; drop its network-capture state and captured entries.
+  if (typeof tabId === "number") {
+    networkModeTabs.delete(tabId);
+    blockedUrlsPerTab.delete(tabId);
+    cdpNetworkEntries.delete(tabId);
+  }
   if (typeof windowId === "number" && chrome.windows && typeof chrome.windows.remove === "function") {
-    const win = await chrome.windows.get(windowId).catch(() => null);
+    const win = await chrome.windows.get(windowId, { populate: true }).catch(() => null);
     if (win) {
-      await chrome.windows.remove(windowId).catch(() => {});
-      return { closedWindowId: windowId, closedTabId: typeof tabId === "number" ? tabId : null };
+      // Only remove the whole window when it still contains exactly the owned tab. A user may
+      // have dragged other tabs into the Pi window since we created it — removing the window
+      // then would silently close the user's tabs. Fall back to closing just our tab.
+      let tabs = Array.isArray(win.tabs) ? win.tabs : null;
+      if (!tabs) tabs = await chrome.tabs.query({ windowId }).catch(() => []);
+      const onlyOwnedTab = tabs.length === 1 && tabs[0] && tabs[0].id === tabId;
+      if (onlyOwnedTab) {
+        await chrome.windows.remove(windowId).catch(() => {});
+        return { closedWindowId: windowId, closedTabId: typeof tabId === "number" ? tabId : null };
+      }
+      if (typeof tabId === "number") {
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        if (tab) {
+          await chrome.tabs.remove(tabId).catch(() => {});
+          return { closedWindowId: null, closedTabId: tabId };
+        }
+      }
+      return { closedWindowId: null, closedTabId: null };
     }
   }
   if (typeof tabId === "number") {
@@ -229,10 +281,49 @@ const CDP_VERSION = "1.3";
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function rng(min, max) { return min + Math.random() * (max - min); }
 
+// =================== JS dialogs (alert/confirm/prompt/beforeunload) ===================
+// Pending CDP-reported dialogs per tab (one modal dialog at a time per tab) plus the set of
+// tabs with an active chrome_dialog waiter. The onEvent listener records dialogs here and
+// auto-dismisses alert() (no accept/dismiss semantics) so a stray alert never wedges the
+// action chain; confirm/prompt/beforeunload stay pending for chrome_dialog to decide.
+const pendingDialogs = new Map(); // tabId -> { tabId, dialogType, message, url, defaultPrompt, hasBrowserHandler, openedAt }
+const dialogWaiters = new Set(); // tabId with an in-flight chrome_dialog wait
+
+// =================== device/UA/touch emulation ===================
+// Emulation overrides live on the CDP target and die with the debugger attach, so after
+// page.emulate set we extend the attach keepalive (and remember what we set) until cleared.
+const emulatedTabs = new Map(); // tabId -> { width, height, deviceScaleFactor, mobile, touch, ua, platform }
+const EMULATE_ATTACH_KEEPALIVE_MS = 10 * 60 * 1000;
+
+// =================== downloads ===================
+const DOWNLOAD_WAIT_DEFAULT_MS = 60_000;
+const DOWNLOAD_WAIT_MAX_MS = 180_000;
+
+// =================== CDP Network-domain observability (feat-cdp-network / feat-har) ===================
+// The in-page fetch/XHR instrumentation cannot see browser-initiated document/static requests.
+// When the agent opts into network capture mode (chrome_network_capture), we keep the debugger
+// attach alive (skipping the idle-detach), enable the CDP Network domain, and record
+// requestWillBeSent / responseReceived / loadingFinished / loadingFailed / dataReceived events
+// into cdpNetworkEntries. Capture is per-tab; the session automation tab makes that effectively
+// per-session. Entries survive a detach so HAR export keeps working after the mode is turned off.
+const CDP_NETWORK_MAX_ENTRIES_PER_TAB = 2000;
+const CDP_NETWORK_MAX_BODY_CHARS = 200_000;
+const NETWORK_MODE_KEEPALIVE_MS = 30 * 60 * 1000;
+const NETWORK_LIST_MAX_RETURNED = 200;
+const NETWORK_HAR_MAX_ENTRIES = 500;
+// Stop fetching response bodies past this total so a busy tab cannot push the /result payload
+// past the bridge's 8MB result cap (endpoint-limits).
+const NETWORK_HAR_BODY_BUDGET_CHARS = 4_000_000;
+const NETWORK_TEXT_MIME_RE = /^(text\/|application\/(json|xml|javascript|x-www-form-urlencoded|graphql))/;
+const networkModeTabs = new Set(); // tabId with opt-in persistent CDP Network capture
+const blockedUrlsPerTab = new Map(); // tabId -> string[] patterns last applied via Network.setBlockedURLs
+const cdpNetworkEntries = new Map(); // tabId -> Map<requestId, entry>
+
 function inputStatus() {
   return {
     attachedTabs: Array.from(attachedTabs.keys()),
     permissionGranted: typeof chrome !== "undefined" && !!chrome.debugger,
+    networkCaptureTabs: Array.from(networkModeTabs.keys()),
   };
 }
 
@@ -337,6 +428,20 @@ async function attachDebugger(tabId) {
   // Seed pointer in a plausible "just left the address bar" location.
   const entry = { detachAt: Date.now() + INPUT_IDLE_DETACH_MS, pointer: { x: 120 + Math.random() * 200, y: 80 + Math.random() * 120 }, debuggee: attachedDebuggee || { tabId } };
   attachedTabs.set(tabId, entry);
+  // Best-effort Page.enable so JS-dialog events (alert/confirm/prompt/beforeunload) are reported
+  // while the debugger is attached (dialog-handling): a dialog that opens during a page.* command
+  // is recorded / auto-dismissed by the onEvent listener instead of hard-blocking the chain.
+  // Deliberately NOT routed through cdpRaw: its timeout path force-detaches, which would tear
+  // down the attach we just made if Page.enable ever stalled.
+  void withTimeout(new Promise((resolve, reject) => {
+    chrome.debugger.sendCommand(entry.debuggee || { tabId }, "Page.enable", {}, (result) => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(result);
+    });
+  }), CDP_COMMAND_TIMEOUT_MS, "CDP Page.enable").catch(() => undefined);
+  // Emulation overrides live on the CDP target and die when the debugger detaches; extend the
+  // keepalive for emulated tabs so chrome_emulate settings survive past the normal idle detach.
+  if (emulatedTabs.has(tabId)) entry.detachAt = Date.now() + EMULATE_ATTACH_KEEPALIVE_MS;
   return entry;
 }
 
@@ -381,10 +486,155 @@ async function detachAll() {
 
 if (chrome.debugger && chrome.debugger.onDetach) {
   chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
-    if (tabId !== undefined) attachedTabs.delete(tabId);
+    if (tabId !== undefined) {
+      attachedTabs.delete(tabId);
+      // A detach kills every CDP domain on the target: pending JS dialogs are dismissed by Chrome
+      // and Emulation overrides are reset, so forget what we knew about this tab. Network-mode
+      // flags and blocked-URL patterns die with the attach too; captured entries are retained so
+      // chrome_network_export still has data after the mode was turned off or Chrome detached us.
+      pendingDialogs.delete(tabId);
+      dialogWaiters.delete(tabId);
+      emulatedTabs.delete(tabId);
+      networkModeTabs.delete(tabId);
+      blockedUrlsPerTab.delete(tabId);
+    }
     if (reason === "canceled_by_user") {
       console.warn(`[pi-chrome] debugger canceled by user on tab ${tabId}; Chrome input will reattach on next call`);
     }
+  });
+}
+
+// Routes CDP Network-domain events into the per-tab capture store. Only active while the agent
+// opted into network capture mode (networkModeTabs) — the default idle-detach model stays intact.
+function handleCdpNetworkEvent(tabId, method, params) {
+  if (!networkModeTabs.has(tabId) || !params || typeof params !== "object") return;
+  const requestId = params.requestId;
+  if (requestId === undefined || requestId === null) return;
+  let tabEntries = cdpNetworkEntries.get(tabId);
+  if (!tabEntries) {
+    tabEntries = new Map();
+    cdpNetworkEntries.set(tabId, tabEntries);
+  }
+  if (method === "Network.requestWillBeSent") {
+    // Redirects re-fire requestWillBeSent with the same requestId; chain the previous hop.
+    const prior = tabEntries.get(requestId);
+    const req = params.request || {};
+    const entry = prior || {
+      requestId,
+      method: String(req.method || "GET").toUpperCase(),
+      url: String(req.url || ""),
+      startedAt: Date.now(),
+      source: "cdp",
+      resourceType: String(params.type || ""),
+      requestHeaders: objectToHeaderList(req.headers),
+      postData: typeof req.postData === "string" ? req.postData.slice(0, CDP_NETWORK_MAX_BODY_CHARS) : undefined,
+      timings: {},
+      redirects: [],
+    };
+    if (prior) {
+      entry.redirects.push({
+        url: entry.url,
+        status: entry.status,
+        statusText: entry.statusText || "",
+        responseHeaders: entry.responseHeaders || [],
+      });
+      entry.url = String(req.url || "");
+      entry.method = String(req.method || "GET").toUpperCase();
+      entry.requestHeaders = objectToHeaderList(req.headers);
+      entry.postData = typeof req.postData === "string" ? req.postData.slice(0, CDP_NETWORK_MAX_BODY_CHARS) : undefined;
+    }
+    if (params.redirectResponse) {
+      const rr = params.redirectResponse;
+      entry.redirects.push({
+        url: entry.url,
+        status: rr.status,
+        statusText: rr.statusText || "",
+        mimeType: rr.mimeType || "",
+        responseHeaders: objectToHeaderList(rr.headers),
+      });
+    }
+    if (typeof params.timestamp === "number") entry.requestTimestamp = params.timestamp;
+    if (params.documentURL) entry.documentURL = String(params.documentURL);
+    if (params.frameId) entry.frameId = String(params.frameId);
+    if (params.initiator && params.initiator.type) entry.initiatorType = String(params.initiator.type);
+    tabEntries.set(requestId, entry);
+    trimCdpNetworkEntries(tabEntries);
+  } else if (method === "Network.responseReceived") {
+    const entry = tabEntries.get(requestId);
+    if (!entry) return;
+    const resp = params.response || {};
+    entry.status = resp.status;
+    entry.statusText = resp.statusText || "";
+    entry.mimeType = resp.mimeType || "";
+    entry.responseHeaders = objectToHeaderList(resp.headers);
+    entry.protocol = resp.protocol || "";
+    entry.fromServiceWorker = resp.fromServiceWorker === true;
+    entry.fromCache = resp.fromDiskCache === true || resp.fromMemoryCache === true;
+    if (typeof params.timestamp === "number") entry.responseTimestamp = params.timestamp;
+    if (resp.timing && typeof resp.timing === "object") entry.timings = { ...resp.timing };
+    if (resp.remoteIPAddress) entry.serverIPAddress = String(resp.remoteIPAddress);
+    if (typeof resp.encodedDataLength === "number") entry.encodedDataLength = resp.encodedDataLength;
+  } else if (method === "Network.loadingFinished") {
+    const entry = tabEntries.get(requestId);
+    if (!entry) return;
+    if (typeof params.timestamp === "number") entry.finishedTimestamp = params.timestamp;
+    if (typeof params.encodedDataLength === "number") entry.encodedDataLength = params.encodedDataLength;
+    entry.finishedAt = Date.now();
+    entry.durationMs = entry.finishedAt - entry.startedAt;
+  } else if (method === "Network.loadingFailed") {
+    const entry = tabEntries.get(requestId);
+    if (!entry) return;
+    entry.errorText = String(params.errorText || "Failed");
+    entry.canceled = params.canceled === true;
+    if (typeof params.timestamp === "number") entry.failedTimestamp = params.timestamp;
+    entry.failedAt = Date.now();
+    entry.durationMs = entry.failedAt - entry.startedAt;
+  } else if (method === "Network.dataReceived") {
+    const entry = tabEntries.get(requestId);
+    if (!entry) return;
+    entry.dataLength = (entry.dataLength || 0) + (params.dataLength || 0);
+    if (typeof params.encodedDataLength === "number") entry.encodedDataLength = (entry.encodedDataLength || 0) + params.encodedDataLength;
+  }
+}
+
+function objectToHeaderList(headers) {
+  if (!headers || typeof headers !== "object") return [];
+  return Object.entries(headers).map(([name, value]) => ({ name, value: String(value) }));
+}
+
+// Oldest-first eviction (Map preserves insertion order) so capture never grows unbounded.
+function trimCdpNetworkEntries(tabEntries) {
+  if (tabEntries.size <= CDP_NETWORK_MAX_ENTRIES_PER_TAB) return;
+  const overflow = tabEntries.size - CDP_NETWORK_MAX_ENTRIES_PER_TAB;
+  for (const key of Array.from(tabEntries.keys()).slice(0, overflow)) tabEntries.delete(key);
+}
+
+// Feeds the chrome_dialog tool. Records every Page.javascriptDialogOpening and auto-dismisses
+// alert() dialogs (no accept/dismiss semantics) that no chrome_dialog call is waiting for, so a
+// stray alert() never hard-blocks the action chain. confirm/prompt/beforeunload stay pending for
+// the agent to handle explicitly via chrome_dialog (dialog-handling).
+if (chrome.debugger && chrome.debugger.onEvent) {
+  chrome.debugger.onEvent.addListener((source, method, eventParams) => {
+    if (source.tabId === undefined) return;
+    const tabId = source.tabId;
+    if (method === "Page.javascriptDialogOpening") {
+      const info = {
+        tabId,
+        dialogType: String(eventParams?.type || "alert"),
+        message: String(eventParams?.message || ""),
+        url: String(eventParams?.url || ""),
+        defaultPrompt: String(eventParams?.defaultPrompt || ""),
+        hasBrowserHandler: eventParams?.hasBrowserHandler === true,
+        openedAt: Date.now(),
+      };
+      pendingDialogs.set(tabId, info);
+      if (info.dialogType === "alert" && !dialogWaiters.has(tabId)) {
+        pendingDialogs.delete(tabId);
+        void cdpRaw(tabId, "Page.handleJavaScriptDialog", { accept: false }).catch(() => undefined);
+      }
+      return;
+    }
+    if (method.startsWith("Network.")) handleCdpNetworkEvent(tabId, method, eventParams);
   });
 }
 
@@ -392,6 +642,12 @@ setInterval(() => {
   const now = Date.now();
   for (const [tabId, entry] of attachedTabs) {
     if (entry.detachAt && entry.detachAt < now) {
+      // A pending modal dialog is dismissed by Chrome on detach; keep the attach alive so the
+      // agent can still reach it with chrome_dialog after the triggering command returns.
+      if (pendingDialogs.has(tabId)) { entry.detachAt = now + 2000; continue; }
+      // Network-mode capture (chrome_network_capture on) must NOT idle-detach: the CDP Network
+      // domain dies with the attach, silently ending document/static capture mid-session.
+      if (networkModeTabs.has(tabId)) { entry.detachAt = now + NETWORK_MODE_KEEPALIVE_MS; continue; }
       void detachDebugger(tabId);
     }
   }
@@ -399,14 +655,22 @@ setInterval(() => {
 
 function cdpRaw(tabId, method, params) {
   const debuggee = attachedTabs.get(tabId)?.debuggee || { tabId };
+  // Runtime.evaluate (page.evaluate / long awaitPromise) gets a longer, NON-destructive timeout:
+  // force-detaching the debugger here would abort a slow page script and lose its result. The
+  // aggressive detach stays for input-dispatch methods and transport-sensitive commands, where a
+  // hung session must be torn down so the next call re-attaches cleanly.
+  const isEvaluate = method === "Runtime.evaluate";
+  const timeoutMs = isEvaluate ? CDP_EVALUATE_TIMEOUT_MS : CDP_COMMAND_TIMEOUT_MS;
   return withTimeout(new Promise((resolve, reject) => {
     chrome.debugger.sendCommand(debuggee, method, params || {}, (result) => {
       if (chrome.runtime.lastError) reject(new Error(`${method}: ${chrome.runtime.lastError.message}`));
       else resolve(result);
     });
-  }), CDP_COMMAND_TIMEOUT_MS, `CDP ${method}`, async () => {
-    attachedTabs.delete(tabId);
-    try { await chrome.debugger.detach(debuggee); } catch {}
+  }), timeoutMs, `CDP ${method}`, async () => {
+    if (!isEvaluate) {
+      attachedTabs.delete(tabId);
+      try { await chrome.debugger.detach(debuggee); } catch {}
+    }
   });
 }
 
@@ -526,7 +790,10 @@ function cdpIsSyntaxError(details) {
   return className === "SyntaxError" || /SyntaxError/.test(cdpExceptionText(details));
 }
 
-// Resolve target -> {x, y, rect} in viewport coords by running tiny script in tab.
+// Resolve target -> {x, y, rect} in TOP-LEVEL viewport coords by running tiny script in tab.
+// CDP Input.dispatchMouseEvent/TouchEvent/mouseWheel take coordinates relative to the TOP
+// frame's viewport, while getBoundingClientRect inside a sub-frame is relative to that frame's
+// own viewport — so frame-local coords must be translated before dispatching (subframe-coords).
 async function resolveTargetInTab(tabId, params) {
   // A uid from a merged sub-frame snapshot carries an "el-f<frameId>-<n>" prefix; resolve the
   // target inside the owning frame so selectors/uid lookups run against the right document.
@@ -558,7 +825,69 @@ async function resolveTargetInTab(tabId, params) {
   const v = results?.[0]?.result;
   if (v?.staleUid) throw new Error(v.reason || "snapshot uid is stale; refresh chrome_snapshot");
   if (!v || !v.found) throw new Error("Could not resolve target element for Chrome input");
+  if (frameId > 0) {
+    // Translate the sub-frame's viewport-local coordinates into top-level viewport coordinates
+    // so CDP input lands on the right element (a frame-local rect is meaningless to the top
+    // frame's input dispatcher).
+    const offset =
+      (await frameOffsetViaPageWalk(tabId, frameId)) ||
+      (await frameOffsetViaCDP(tabId, frameId).catch(() => null));
+    if (offset && typeof offset.dx === "number" && typeof offset.dy === "number") {
+      v.x += offset.dx;
+      v.y += offset.dy;
+      if (v.rect) {
+        v.rect.left += offset.dx;
+        v.rect.top += offset.dy;
+      }
+      v.frameOffset = { dx: offset.dx, dy: offset.dy, method: offset.method || "page-walk" };
+    }
+  }
   return v;
+}
+
+// Same-origin sub-frame -> top viewport offset by walking the window.frameElement chain. Each
+// frame's content-box origin is its iframe element's border-box origin + border widths, summed
+// up to the top window. Cross-origin frames hide frameElement (returns null), so the walk
+// reports crossOrigin and the caller falls back to the CDP DOM.getBoxModel path.
+async function frameOffsetViaPageWalk(tabId, frameId) {
+  const results = await executeScriptTimed({
+    target: { tabId, frameIds: [frameId] },
+    world: "MAIN",
+    func: () => {
+      let dx = 0, dy = 0;
+      let w = window;
+      while (w && w !== window.top) {
+        const fe = w.frameElement;
+        if (!fe || typeof fe.getBoundingClientRect !== "function") return { crossOrigin: true };
+        const r = fe.getBoundingClientRect();
+        const cs = getComputedStyle(fe);
+        // Border-box -> content-box: the frame's own viewport starts inside the iframe border.
+        dx += r.left + (parseFloat(cs.borderLeftWidth) || 0);
+        dy += r.top + (parseFloat(cs.borderTopWidth) || 0);
+        w = w.parent;
+      }
+      return { dx, dy, crossOrigin: false, nested: w !== window.top };
+    },
+  }, `translate subframe offset for tab ${tabId} frame ${frameId}`);
+  const v = results?.[0]?.result;
+  if (v && !v.crossOrigin && typeof v.dx === "number" && typeof v.dy === "number") return v;
+  return null;
+}
+
+// Cross-origin (OOPIF) and nested-chain fallback: resolve the frame's owner element from the
+// TOP frame via CDP DOM.getFrameOwner and read its content-box origin (the frame's viewport
+// origin in top-frame CSS pixels) from DOM.getBoxModel. Works uniformly for same-origin frames
+// too; the page-walk is just cheaper when it applies.
+async function frameOffsetViaCDP(tabId, frameId) {
+  await cdp(tabId, "DOM.enable", {}).catch(() => undefined);
+  const owner = await cdp(tabId, "DOM.getFrameOwner", { frameId });
+  if (!owner || typeof owner.nodeId !== "number") throw new Error(`DOM.getFrameOwner returned no owner for frame ${frameId}`);
+  const box = await cdp(tabId, "DOM.getBoxModel", { nodeId: owner.nodeId });
+  if (!box || !box.model || !Array.isArray(box.model.content) || box.model.content.length < 2) {
+    throw new Error(`DOM.getBoxModel returned no content box for frame ${frameId}`);
+  }
+  // model.content = [x1,y1, x2,y1, x2,y2, x1,y2] in top-frame CSS pixels.
+  return { dx: box.model.content[0], dy: box.model.content[1], method: "cdp-box-model" };
 }
 
 function pickInsideRect(rect) {
@@ -658,13 +987,14 @@ function cdpKeyInfo(key, shifted) {
   return { key, code: key, windowsVirtualKeyCode: 0, text: "" };
 }
 
-async function cdpTypeChar(tabId, ch) {
+async function cdpTypeChar(tabId, ch, delayScale) {
+  const pace = typeof delayScale === "number" && Number.isFinite(delayScale) ? Math.max(0, Math.min(4, delayScale)) : 1;
   const needShift = /^[A-Z]$/.test(ch) || "~!@#$%^&*()_+{}|:\"<>?".includes(ch);
   let modifiers = 0;
   if (needShift) {
     await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16, modifiers: 8 });
     modifiers = 8;
-    await sleep(rng(8, 22));
+    await sleep(rng(8, 22) * pace);
   }
   const info = cdpKeyInfo(ch);
   await cdp(tabId, "Input.dispatchKeyEvent", {
@@ -672,16 +1002,30 @@ async function cdpTypeChar(tabId, ch) {
     windowsVirtualKeyCode: info.windowsVirtualKeyCode, nativeVirtualKeyCode: info.windowsVirtualKeyCode,
     text: info.text, unmodifiedText: info.text, modifiers,
   });
-  await sleep(rng(25, 90));
+  await sleep(rng(25, 90) * pace);
   await cdp(tabId, "Input.dispatchKeyEvent", {
     type: "keyUp", key: info.key, code: info.code,
     windowsVirtualKeyCode: info.windowsVirtualKeyCode, modifiers,
   });
   if (needShift) {
-    await sleep(rng(5, 18));
+    await sleep(rng(5, 18) * pace);
     await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16, modifiers: 0 });
   }
-  await sleep(rng(35, 130));
+  await sleep(rng(35, 130) * pace);
+}
+
+// One-shot CDP text insertion (DevTools' own fast path). Fires a single beforeinput/input per
+// composition — much faster than per-character key events; usable where the page accepts it.
+async function cdpInsertText(tabId, text) {
+  await cdp(tabId, "Input.insertText", { text });
+}
+
+// Normalize the chrome_type/chrome_fill pacing scale. 1 = current humanized pace; values below
+// 1 speed typing up (0 = no sleeps); values above 1 slow it down. Clamped to [0, 4].
+function typingDelayScale(params) {
+  const value = params && (params.delayScale ?? params.typingSpeed);
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, Math.min(4, value));
+  return 1;
 }
 
 async function domClickFallback(tabId, params, cause) {
@@ -822,18 +1166,31 @@ async function chromeInputType(params) {
     await sleep(rng(50, 120));
   }
   const text = String(params.text || "");
-  for (const ch of Array.from(text)) await cdpTypeChar(tab.id, ch);
+  const delayScale = typingDelayScale(params);
+  if (text) {
+    if (params.insertText === true) {
+      // Whole-string fast path (one CDP Input.insertText) for pages that accept it.
+      await cdpInsertText(tab.id, text);
+    } else {
+      for (const ch of Array.from(text)) await cdpTypeChar(tab.id, ch, delayScale);
+    }
+  }
   if (params.pressEnter) {
-    await cdpTypeChar(tab.id, "\r").catch(() => undefined);
+    // One proper Enter only — a preceding '\r' text insertion caused a double Enter/newline and
+    // double form submission (double-enter).
     await chromeInputKey({ ...params, key: "Enter" });
   }
-  return { input: "chrome", length: text.length };
+  return { input: "chrome", length: text.length, pacing: delayScale };
 }
 
 async function domFillFallback(tabId, params, cause) {
   if (!(params.selector || params.uid)) throw cause;
+  // Route to the owning frame for sub-frame uids, same as domClickFallback / resolveTargetInTab.
+  const frameUid = params.uid ? parseFrameUid(params.uid) : null;
+  const frameId = frameUid ? frameUid.frameId : 0;
+  const localUid = frameUid ? frameUid.localUid : (params.uid ?? null);
   const results = await executeScriptTimed({
-    target: { tabId, frameIds: [0] },
+    target: { tabId, frameIds: [frameId] },
     world: "MAIN",
     func: async (selector, uid, text, submit) => {
       const state = window.__PI_CHROME_STATE__;
@@ -863,11 +1220,40 @@ async function domFillFallback(tabId, params, cause) {
       }
       return { valueMatches: "value" in el ? el.value === value : el.textContent === value, tag: el.tagName, url: location.href };
     },
-    args: [params.selector ?? null, params.uid ?? null, params.text ?? "", params.submit === true],
-  }, `DOM fill fallback in tab ${tabId}`);
+    args: [params.selector ?? null, localUid, params.text ?? "", params.submit === true],
+  }, `DOM fill fallback in tab ${tabId} frame ${frameId}`);
   const v = results?.[0]?.result;
   if (v?.staleUid) throw new Error(v.reason || "snapshot uid is stale; refresh chrome_snapshot");
   return { input: "dom-fallback", length: String(params.text || "").length, valueMatches: v?.valueMatches, reason: String(cause?.message || cause).slice(0, 500), tag: v?.tag };
+}
+
+// Core fill sequence for one already-resolved field: focus via triple-click, clear, type text.
+// Shared by chromeInputFill (single field) and chromeFillForm (batched fields) so batch fills
+// behave exactly like single fills. Returns the outcome shape of chrome_fill.
+async function fillAtPoint(tabId, fieldParams, resolved) {
+  const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
+  await cdpMoveTo(tabId, point.x, point.y);
+  // Triple-click selects all in input fields.
+  for (let i = 1; i <= 3; i++) {
+    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: i, pointerType: "mouse", force: 0.5 });
+    await sleep(rng(20, 60));
+    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: i, pointerType: "mouse" });
+    await sleep(rng(20, 60));
+  }
+  // Delete selection.
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
+  await sleep(rng(20, 60));
+  const text = String(fieldParams.text || "");
+  const delayScale = typingDelayScale(fieldParams);
+  if (text) {
+    if (fieldParams.insertText === true) {
+      await cdpInsertText(tabId, text);
+    } else {
+      for (const ch of Array.from(text)) await cdpTypeChar(tabId, ch, delayScale);
+    }
+  }
+  return { input: "chrome", length: text.length, pacing: delayScale };
 }
 
 async function chromeInputFill(params) {
@@ -877,27 +1263,112 @@ async function chromeInputFill(params) {
     await attachDebugger(tab.id);
     if (!(params.selector || params.uid)) throw new Error("chrome.fill: selector or uid required");
     const resolved = await resolveTargetInTab(tab.id, params);
-    const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
-    await cdpMoveTo(tab.id, point.x, point.y);
-    // Triple-click selects all in input fields.
-    for (let i = 1; i <= 3; i++) {
-      await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: i, pointerType: "mouse", force: 0.5 });
-      await sleep(rng(20, 60));
-      await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: i, pointerType: "mouse" });
-      await sleep(rng(20, 60));
-    }
-    // Delete selection.
-    await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
-    await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
-    await sleep(rng(20, 60));
-    const text = String(params.text || "");
-    for (const ch of Array.from(text)) await cdpTypeChar(tab.id, ch);
+    const outcome = await fillAtPoint(tab.id, params, resolved);
     if (params.submit) await chromeInputKey({ ...params, key: "Enter" });
-    return { input: "chrome", length: text.length };
+    return outcome;
   } catch (error) {
     if (params.domFallback === false) throw error;
     return domFillFallback(tab.id, params, error);
   }
+}
+
+// Read back the filled value of one field (MAIN world, CSP-safe via scripting.executeScript).
+// Best-effort verification for the batched chrome_fill_form path: returns null when the element
+// is stale (it may have been re-rendered by a framework between fill and verify).
+async function verifyFieldValue(tabId, field) {
+  const frameUid = field.uid ? parseFrameUid(field.uid) : null;
+  const frameId = frameUid ? frameUid.frameId : 0;
+  const localUid = frameUid ? frameUid.localUid : (field.uid ?? null);
+  const results = await executeScriptTimed({
+    target: { tabId, frameIds: [frameId] },
+    world: "MAIN",
+    func: (selector, uid, expected) => {
+      const state = window.__PI_CHROME_STATE__;
+      let el = uid && state && state.elements ? state.elements[uid] : null;
+      if (uid && (!el || !el.isConnected)) return { stale: true };
+      if (!el && selector) el = document.querySelector(selector);
+      if (!el) return { stale: true };
+      const actual = "value" in el ? el.value : (el.isContentEditable ? el.textContent : "");
+      return { actual: String(actual ?? ""), expected: String(expected ?? "") };
+    },
+    args: [field.selector ?? null, localUid, field.text],
+  }, `verify filled value in tab ${tabId} frame ${frameId}`);
+  const v = results?.[0]?.result;
+  if (!v || v.stale) return null;
+  return { verified: v.actual === v.expected, actual: v.actual };
+}
+
+// Batch form fill: fills many fields in ONE bridge call. Target resolution runs in parallel
+// (read-only), then each field is filled SEQUENTIALLY through the same CDP input path as
+// chrome_fill (concurrent CDP input on one tab would race focus and interleave keystrokes).
+// Per-field outcomes include the chrome_fill result plus a best-effort value verification.
+async function chromeFillForm(params) {
+  const tab = await getTabByParams(params);
+  if (params.foreground) await bringToFront(tab);
+  if (!Array.isArray(params.fields) || !params.fields.length) throw new Error("chrome_fill_form: fields[] is required");
+  const fields = params.fields.map((field, index) => ({
+    index,
+    uid: field?.uid ?? null,
+    selector: field?.selector ?? null,
+    text: String(field?.text ?? ""),
+    insertText: field?.insertText === true,
+    delayScale: field?.delayScale,
+    domFallback: field?.domFallback !== false,
+  }));
+  for (const field of fields) {
+    if (!field.uid && !field.selector) throw new Error(`chrome_fill_form: field #${field.index} needs uid or selector`);
+  }
+  await attachDebugger(tab.id);
+  // Resolve every target in parallel (read-only script executions never race input).
+  const resolved = await Promise.all(fields.map((field) =>
+    resolveTargetInTab(tab.id, { uid: field.uid, selector: field.selector })
+      .catch((error) => ({ resolveError: String(error?.message || error) })),
+  ));
+  const results = [];
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i];
+    const target = resolved[i];
+    if (target.resolveError) {
+      results.push({ index: field.index, ok: false, error: target.resolveError });
+      continue;
+    }
+    try {
+      results.push({ index: field.index, ok: true, ...(await fillAtPoint(tab.id, field, target)) });
+    } catch (error) {
+      if (!field.domFallback) {
+        results.push({ index: field.index, ok: false, error: String(error?.message || error) });
+        continue;
+      }
+      try {
+        results.push({ index: field.index, ok: true, ...(await domFillFallback(tab.id, field, error)) });
+      } catch (fallbackError) {
+        results.push({ index: field.index, ok: false, error: String(fallbackError?.message || fallbackError) });
+      }
+    }
+  }
+  // Per-field verification in parallel after all fills (chrome_fill semantics kept per field).
+  const verified = await Promise.all(fields.map((field, i) =>
+    results[i]?.ok ? verifyFieldValue(tab.id, field).catch(() => null) : null,
+  ));
+  for (let i = 0; i < results.length; i++) {
+    if (results[i]?.ok && verified[i]) {
+      results[i].verified = verified[i].verified;
+      results[i].actualValue = verified[i].actual;
+    }
+  }
+  if (params.submit) {
+    const last = fields[fields.length - 1];
+    try {
+      await chromeInputKey({ ...params, uid: last.uid ?? undefined, selector: last.selector ?? undefined, key: "Enter" });
+    } catch {
+      // Enter-in-field is best-effort; a form that needs a real submit button is the agent's call.
+    }
+  }
+  const failed = results.filter((r) => !r.ok);
+  if (failed.length) {
+    throw new Error(`chrome_fill_form: ${failed.length}/${fields.length} field(s) failed: ${JSON.stringify(results)}`);
+  }
+  return { fields: results, count: results.length, submitted: params.submit === true };
 }
 
 async function chromeInputScroll(params) {
@@ -998,23 +1469,15 @@ async function chromeInputUpload(params) {
   if (!(params.selector || params.uid)) throw new Error("chrome.upload: selector or uid required");
   const paths = Array.isArray(params.paths) ? params.paths.map(String) : [];
   if (!paths.length) throw new Error("chrome.upload: no file paths provided");
-  const expression = `(() => {
-    const selector = ${JSON.stringify(params.selector ?? null)};
-    const uid = ${JSON.stringify(params.uid ?? null)};
-    const state = window.__PI_CHROME_STATE__;
-    const el = uid && state && state.elements ? state.elements[uid] : (selector ? document.querySelector(selector) : null);
-    if (!el || el.tagName !== "INPUT" || el.type !== "file") throw new Error("Target must be <input type=file>");
-    el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-    return el;
-  })()`;
-  const evaluated = await cdp(tab.id, "Runtime.evaluate", { expression, objectGroup: "pi-chrome-upload", includeCommandLineAPI: false, returnByValue: false, userGesture: true });
-  if (evaluated.exceptionDetails) throw new Error(evaluated.exceptionDetails.text || "Could not resolve file input");
-  const objectId = evaluated.result?.objectId;
-  if (!objectId) throw new Error("Could not resolve file input object");
-  await cdp(tab.id, "DOM.enable", {}).catch(() => undefined);
-  const requested = await cdp(tab.id, "DOM.requestNode", { objectId });
-  if (!requested.nodeId) throw new Error("Could not resolve file input node");
-  await cdp(tab.id, "DOM.setFileInputFiles", { nodeId: requested.nodeId, files: paths });
+  // Sub-frame uids (el-f<frameId>-<n>) must resolve the <input type=file> inside the owning
+  // frame; the top-frame Runtime.evaluate path can only see the top document (fill-frame audit).
+  const frameUid = params.uid ? parseFrameUid(params.uid) : null;
+  const frameId = frameUid ? frameUid.frameId : 0;
+  const localUid = frameUid ? frameUid.localUid : (params.uid ?? null);
+  const { objectId, nodeId } = frameId > 0
+    ? await resolveFileInputInFrame(tab.id, frameId, params.selector ?? null, localUid)
+    : await resolveFileInputTopFrame(tab.id, params.selector ?? null, params.uid ?? null);
+  await cdp(tab.id, "DOM.setFileInputFiles", { nodeId, files: paths });
   await cdp(tab.id, "Runtime.callFunctionOn", {
     objectId,
     functionDeclaration: `function() { this.dispatchEvent(new Event("input", { bubbles: true })); this.dispatchEvent(new Event("change", { bubbles: true })); return this.files ? this.files.length : 0; }`,
@@ -1023,8 +1486,76 @@ async function chromeInputUpload(params) {
   await cdp(tab.id, "Runtime.releaseObject", { objectId }).catch(() => undefined);
   return { input: "chrome", uploaded: paths.map((path) => ({ path })) };
 }
+
+// Resolve a file input in the TOP frame (existing CDP path). Returns {objectId, nodeId}.
+async function resolveFileInputTopFrame(tabId, selector, uid) {
+  const expression = `(() => {
+    const selector = ${JSON.stringify(selector ?? null)};
+    const uid = ${JSON.stringify(uid ?? null)};
+    const state = window.__PI_CHROME_STATE__;
+    const el = uid && state && state.elements ? state.elements[uid] : (selector ? document.querySelector(selector) : null);
+    if (!el || el.tagName !== "INPUT" || el.type !== "file") throw new Error("Target must be <input type=file>");
+    el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    return el;
+  })()`;
+  const evaluated = await cdp(tabId, "Runtime.evaluate", { expression, objectGroup: "pi-chrome-upload", includeCommandLineAPI: false, returnByValue: false, userGesture: true });
+  if (evaluated.exceptionDetails) throw new Error(evaluated.exceptionDetails.text || "Could not resolve file input");
+  const objectId = evaluated.result?.objectId;
+  if (!objectId) throw new Error("Could not resolve file input object");
+  await cdp(tabId, "DOM.enable", {}).catch(() => undefined);
+  const requested = await cdp(tabId, "DOM.requestNode", { objectId });
+  if (!requested.nodeId) throw new Error("Could not resolve file input node");
+  return { objectId, nodeId: requested.nodeId };
+}
+
+// Resolve a file input inside a same-origin SUB-frame: DOM.getFrameOwner gives the iframe's
+// owner node, resolveNode hands us the element, and callFunctionOn on its contentDocument finds
+// the input in the frame's own main world (where the frame's __PI_CHROME_STATE__ lives).
+// Cross-origin (OOPIF) frames cannot expose contentDocument to the top frame — surface a clear
+// error instead of silently resolving against the wrong document.
+async function resolveFileInputInFrame(tabId, frameId, selector, localUid) {
+  await cdp(tabId, "DOM.enable", {}).catch(() => undefined);
+  const owner = await cdp(tabId, "DOM.getFrameOwner", { frameId });
+  if (!owner || typeof owner.nodeId !== "number") throw new Error("Could not resolve the sub-frame's owner element");
+  const ownerObj = await cdp(tabId, "DOM.resolveNode", { nodeId: owner.nodeId });
+  if (!ownerObj?.object?.objectId) throw new Error("Could not resolve the sub-frame's document");
+  const found = await cdp(tabId, "Runtime.callFunctionOn", {
+    objectId: ownerObj.object.objectId,
+    functionDeclaration: `function(selector, uid) {
+      const doc = this.contentDocument;
+      if (!doc) return null;
+      const state = doc.defaultView && doc.defaultView.__PI_CHROME_STATE__;
+      let el = uid && state && state.elements ? state.elements[uid] : null;
+      if (!el && selector) el = doc.querySelector(selector);
+      if (el && el.tagName === "INPUT" && el.type === "file") {
+        el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        return el;
+      }
+      return null;
+    }`,
+    arguments: [{ value: selector }, { value: localUid }],
+    returnByValue: false,
+  });
+  await cdp(tabId, "Runtime.releaseObject", { objectId: ownerObj.object.objectId }).catch(() => undefined);
+  if (found.exceptionDetails) throw new Error(`Could not resolve file input in sub-frame: ${found.exceptionDetails.text || "evaluation failed"}`);
+  const objectId = found.result?.objectId;
+  if (!objectId) throw new Error("File input not found in sub-frame (cross-origin frames cannot be reached for file upload)");
+  const requested = await cdp(tabId, "DOM.requestNode", { objectId });
+  if (!requested.nodeId) throw new Error("Could not resolve file input node in sub-frame");
+  return { objectId, nodeId: requested.nodeId };
+}
 // ===============================================================
 
+// --- bridge polling state ---
+// reloadIntent: version-skew detected; the reload is DEFERRED until the /next payload already
+//   served in this response has been fully consumed (version-reload-drop).
+let reloadIntent = false;
+// lastBridgeActivity: last time a real session contact happened (command handled, orphan
+//   served, heartbeat posted). NOT bumped by empty /next polls, so an idle extension stops
+//   polling and heartbeating and the MV3 worker can suspend.
+let lastBridgeActivity = Date.now();
+// consecutivePollFailures: bridge-down probe counter for exponential backoff + stop (poll-backoff).
+let consecutivePollFailures = 0;
 
 function armKeepaliveAlarm() {
   chrome.alarms.create("pi-bridge-keepalive", { periodInMinutes: 0.5 });
@@ -1046,33 +1577,41 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "pi-bridge-keepalive") {
+    // The alarm is the cold-wake mechanism for the pull model: it re-arms pollLoop after an
+    // idle suspend or a bridge-down backoff exit. pollLoop/sendHeartbeat self-gate on session
+    // activity so an idle worker does no redundant work between alarm fires.
     void pollLoop();
-    // Liveness signal for the session-scoped grant: one beat per 30s keepalive alarm, so the
-    // bridge can expire grants for sessions whose extension died mid-workflow.
     void sendHeartbeat();
   }
 });
 
 chrome.action.onClicked.addListener(() => {
   armKeepaliveAlarm();
+  consecutivePollFailures = 0;
+  lastBridgeActivity = Date.now();
   void pollLoop();
 });
 
 armKeepaliveAlarm();
+// NOTE: no 1s setInterval here — the /next while-loop + alarm already re-arm polling (sw-keepalive).
 
-setInterval(() => {
-  void pollLoop();
-}, 1000);
-
+// Post liveness heartbeats for the session keys we actually know (the automationTargets this
+// extension owns); fall back to the default key when nothing is owned. Skipped entirely while the
+// extension is idle so a suspended worker doesn't keep dead grants alive.
 async function sendHeartbeat() {
-  try {
-    await fetch(`${BRIDGE_URL}/heartbeat`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sessionKey: DEFAULT_SESSION_KEY }),
-    });
-  } catch {
-    // Best-effort liveness signaling; a down bridge is handled by pollLoop's backoff.
+  if (automationTargets.size === 0 && Date.now() - lastBridgeActivity > HEARTBEAT_IDLE_SKIP_MS) return;
+  const keys = automationTargets.size ? Array.from(automationTargets.keys()) : [DEFAULT_SESSION_KEY];
+  for (const sessionKey of keys) {
+    try {
+      await fetch(`${BRIDGE_URL}/heartbeat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionKey }),
+      });
+      lastBridgeActivity = Date.now();
+    } catch {
+      // Best-effort liveness signaling; a down bridge is handled by pollLoop's backoff.
+    }
   }
 }
 
@@ -1081,25 +1620,65 @@ async function pollLoop() {
   polling = true;
   try {
     while (true) {
-      const response = await fetch(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}`, {
-        cache: "no-store",
-      });
-      if (!response.ok) throw new Error(`bridge /next HTTP ${response.status}`);
+      // Idle = no owned automation targets AND no session traffic for a long while. While idle we
+      // still probe /next ONCE per alarm cycle with a short timeout (so a fresh command/session
+      // is noticed within ~30s), then exit and let the MV3 worker suspend. An active session
+      // keeps the continuous long-poll (sw-keepalive / poll-backoff).
+      const idle = automationTargets.size === 0 && Date.now() - lastBridgeActivity > POLL_IDLE_EXIT_MS;
+      let response;
+      let idleTimer;
+      try {
+        if (idle) {
+          const controller = new AbortController();
+          idleTimer = setTimeout(() => controller.abort(), POLL_IDLE_PROBE_MS);
+          response = await fetch(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}`, { cache: "no-store", signal: controller.signal });
+        } else {
+          response = await fetch(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}`, { cache: "no-store" });
+        }
+      } catch {
+        if (idleTimer) clearTimeout(idleTimer);
+        consecutivePollFailures++;
+        if (idle) break; // idle probe aborted (nothing queued) -> suspend until the alarm re-arms.
+        if (consecutivePollFailures >= POLL_MAX_CONSECUTIVE_FAILURES) break;
+        await sleep(pollBackoffDelay());
+        continue;
+      } finally {
+        if (idleTimer) clearTimeout(idleTimer);
+      }
+      if (!response.ok) {
+        // HTTP errors (5xx etc.) count as bridge-down; retrying on a short backoff keeps the
+        // loop from hot-spinning either way.
+        consecutivePollFailures++;
+        if (consecutivePollFailures >= POLL_MAX_CONSECUTIVE_FAILURES) break;
+        await sleep(pollBackoffDelay());
+        continue;
+      }
+      consecutivePollFailures = 0;
       const expected = response.headers.get("x-pi-chrome-version");
       const ours = chrome.runtime.getManifest().version;
-      if (expected && expected !== ours && isVersionOlder(ours, expected)) {
-        console.warn(`[pi-chrome] extension v${ours} behind pi-chrome v${expected}; reloading extension`);
-        try { chrome.runtime.reload(); } catch {}
-        return;
-      }
       const payload = await response.json();
+      const versionSkewed = !!expected && expected !== ours && isVersionOlder(ours, expected);
+      if (versionSkewed) reloadIntent = true;
       if (payload.type === "command") {
+        lastBridgeActivity = Date.now();
         await handleCommand(payload.command);
       } else if (payload.type === "orphan") {
         // The bridge served a delivered-but-unacked-result command that it gave up on. Never
         // re-execute; surface the warning and keep polling (the client decides whether to verify
         // page state and retry with a NEW id).
+        lastBridgeActivity = Date.now();
         console.warn(`[pi-chrome] orphan: ${payload.orphan.id} may have executed`);
+      } else if (idle) {
+        // No command and still idle: exit so the worker can suspend; the alarm re-arms polling.
+        break;
+      }
+      // Reload only AFTER the payload was consumed (a command served in this /next response is
+      // handled to completion first), so version-skew reloads never drop a command (version-reload-drop).
+      if (reloadIntent) {
+        reloadIntent = false;
+        console.warn(`[pi-chrome] extension v${ours} behind pi-chrome v${expected}; reloading extension`);
+        try { chrome.runtime.reload(); } catch {}
+        return;
       }
     }
   } catch (error) {
@@ -1109,12 +1688,24 @@ async function pollLoop() {
   }
 }
 
+// Exponential backoff capped at POLL_BACKOFF_CAP_MS (2s -> 4s -> 8s -> 16s -> 30s -> 30s ...).
+function pollBackoffDelay() {
+  const exponent = Math.min(Math.max(consecutivePollFailures - 1, 0), 6);
+  return Math.min(POLL_BACKOFF_CAP_MS, POLL_ERROR_BACKOFF_MS * Math.pow(2, exponent));
+}
+
 // =================== exactly-once executed-command journal ===================
 // A delivered command that the SW acknowledged but whose result never reached the bridge (owner
 // death between /next and /result) looks identical to a never-executed command. The journal
 // remembers executed ids so a client retry with the SAME id is answered from the journal instead
 // of re-running the side effect. Persisted in chrome.storage.session: survives SW restarts (MV3
 // suspends workers at any time) and is cleared on browser restart.
+//
+// journal-quota: only a compact digest is persisted per entry ({id, action, ok, resultHash,
+// completedAt, aborted?}) under a total byte budget with oldest-first eviction — storing FULL
+// results made storage.session quota failures silently drop dedupe protection. Full results for
+// replay live in a small in-memory LRU (recentResults); a retried id whose result is no longer
+// retained is answered with "already executed; retry with a new id" instead of replaying stale data.
 async function loadJournal() {
   try {
     const stored = await chrome.storage?.session?.get?.(JOURNAL_STORAGE_KEY);
@@ -1133,21 +1724,106 @@ async function persistJournal(journal) {
   }
 }
 
-// Drop entries older than the TTL and cap the map. Called on every handleCommand so the journal
-// never grows unbounded.
+// Compact, bounded fingerprint of a command result (never the result itself).
+function resultDigest(result) {
+  let raw;
+  if (typeof result === "string") raw = result;
+  else { try { raw = JSON.stringify(result ?? null); } catch { raw = String(result); } }
+  if (raw.length > 2000) raw = raw.slice(0, 2000);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < raw.length; i++) {
+    h ^= raw.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16);
+}
+
+function journalEntryBytes(entry) {
+  try { return JSON.stringify(entry).length; } catch { return 128; }
+}
+
+// Drop entries older than the TTL, cap the map by entry count AND by total serialized bytes
+// (oldest first). Called on every handleCommand so the journal never grows unbounded.
 function sweepJournal(journal, now) {
   const ttlBoundary = now - JOURNAL_TTL_MS;
   for (const id of Object.keys(journal)) {
     const entry = journal[id];
     if (!entry || typeof entry.completedAt !== "number" || entry.completedAt < ttlBoundary) delete journal[id];
   }
-  const ids = Object.keys(journal);
+  let ids = Object.keys(journal);
   if (ids.length > JOURNAL_MAX_ENTRIES) {
-    ids
-      .sort((a, b) => (journal[a].completedAt || 0) - (journal[b].completedAt || 0))
-      .slice(0, ids.length - JOURNAL_MAX_ENTRIES)
-      .forEach((id) => delete journal[id]);
+    ids = ids.sort((a, b) => (journal[a].completedAt || 0) - (journal[b].completedAt || 0));
+    const excess = ids.length - JOURNAL_MAX_ENTRIES;
+    for (let i = 0; i < excess; i++) delete journal[ids[i]];
   }
+  ids = Object.keys(journal).sort((a, b) => (journal[a].completedAt || 0) - (journal[b].completedAt || 0));
+  // Budget the FULL serialized map — entry values AND their id keys — so the persisted journal
+  // cannot exceed JOURNAL_MAX_BYTES regardless of how long ids are. Each id serializes as
+  // `"id":` (id.length + 3 chars) plus a comma separator (1 char); braces add 2 (conservative
+  // by exactly 1 byte vs the true serialization).
+  let bytes = 2;
+  for (const id of ids) bytes += journalEntryBytes(journal[id]) + id.length + 4;
+  while (bytes > JOURNAL_MAX_BYTES && ids.length) {
+    const oldest = ids.shift();
+    bytes -= journalEntryBytes(journal[oldest]) + oldest.length + 4;
+    delete journal[oldest];
+  }
+}
+
+// In-memory LRU of recent FULL results for dedupe replay (id -> { result, bytes, at }). Bounded by
+// both entry count and total bytes; oversized results are never cached.
+const recentResults = new Map();
+function rememberRecentResult(id, result) {
+  let bytes = 0;
+  try { bytes = JSON.stringify(result ?? null).length; } catch { bytes = 4096; }
+  if (bytes > RECENT_RESULT_MAX_ENTRY_BYTES) return;
+  recentResults.delete(id);
+  recentResults.set(id, { result, bytes, at: Date.now() });
+  let total = 0;
+  for (const [k, v] of recentResults) {
+    total += v.bytes;
+    if (total > RECENT_RESULTS_MAX_BYTES || recentResults.size > RECENT_RESULTS_MAX) recentResults.delete(k);
+  }
+}
+
+// Per-command timeout: the host already sends timeoutMs on the /command wire; thread it through
+// with a safety ceiling and scale it by operation cost so long commands (typing, waitFor,
+// full-page screenshots) are not killed by the fixed 25s budget (command-timeout).
+function computeCommandTimeout(command) {
+  const wire = command?.timeoutMs;
+  const base = typeof wire === "number" && Number.isFinite(wire) ? wire : COMMAND_TIMEOUT_MS;
+  const clamped = Math.max(1000, Math.min(COMMAND_TIMEOUT_CEILING_MS, base));
+  const params = command?.params || {};
+  if ((command?.action === "page.type" || command?.action === "page.fill") && typeof params.text === "string") {
+    // ~55ms/char over the humanized per-character pace plus headroom.
+    return Math.min(COMMAND_TIMEOUT_CEILING_MS, clamped + params.text.length * 55 + 5000);
+  }
+  if (command?.action === "page.fillForm" && Array.isArray(params.fields)) {
+    // Batch fills are sequential CDP input; scale by total text length and field count.
+    const totalChars = params.fields.reduce((sum, field) => sum + String(field?.text || "").length, 0);
+    return Math.min(COMMAND_TIMEOUT_CEILING_MS, clamped + totalChars * 55 + params.fields.length * 5000 + 8000);
+  }
+  if (command?.action === "page.dialog") {
+    const requested = typeof params.timeoutMs === "number" ? params.timeoutMs : 10000;
+    return Math.min(COMMAND_TIMEOUT_CEILING_MS, Math.max(clamped, requested + 8000));
+  }
+  if (command?.action === "downloads.wait") {
+    const requested = typeof params.timeoutMs === "number" ? params.timeoutMs : DOWNLOAD_WAIT_DEFAULT_MS;
+    return Math.min(COMMAND_TIMEOUT_CEILING_MS, Math.max(clamped, requested + 5000));
+  }
+  if (command?.action === "page.waitFor") {
+    const requested = typeof params.timeoutMs === "number" ? params.timeoutMs : 10000;
+    return Math.min(COMMAND_TIMEOUT_CEILING_MS, Math.max(clamped, requested + 10000));
+  }
+  return clamped;
+}
+
+// Mark a command that was interrupted (timeout or pre-reload teardown) so a same-id retry is
+// warned instead of silently re-executing the side effect.
+function markInterrupted(id, journal, action) {
+  if (!journal[id]) journal[id] = { id, action: action || "", ok: false, aborted: true, completedAt: Date.now() };
+  else journal[id].aborted = true;
+  void persistJournal(journal);
 }
 
 async function handleCommand(command) {
@@ -1161,27 +1837,50 @@ async function handleCommand(command) {
   const prior = journal[id];
   if (prior) {
     // Already executed (client retried with the same stable id after an owner-death timeout). Do
-    // NOT re-run; replay the recorded result so the client sees the outcome it missed.
+    // NOT re-run. Full results replay from the in-memory LRU; otherwise answer with a "new id"
+    // hint — the persisted digest is a dedupe marker, not a replay oracle.
     await persistJournal(journal);
-    await postResult({ id, ok: true, result: prior.result, deduplicated: true });
+    if (prior.aborted) {
+      await postResult({ id, ok: false, error: `Command ${id} was interrupted before it completed; it may have executed. Retry with a NEW id to re-run.`, deduplicated: true });
+      return;
+    }
+    const recent = recentResults.get(id);
+    if (recent) {
+      await postResult({ id, ok: true, result: recent.result, deduplicated: true });
+    } else {
+      await postResult({ id, ok: false, error: `Command ${id} was already executed; its result is no longer retained. Retry with a NEW id to re-run.`, deduplicated: true });
+    }
     return;
   }
   // Mark the command received BEFORE executing so the bridge's orphan sweep can tell "executed
   // but result lost" from "never picked up". Best-effort: execution proceeds even if the ack
   // fails (the /ack endpoint is idempotent).
   await postAck(id);
+  lastBridgeActivity = Date.now();
+  const timeoutMs = computeCommandTimeout(command);
   try {
     const result = await withTimeout(
       dispatch(command.action, command.params ?? {}),
-      COMMAND_TIMEOUT_MS,
+      timeoutMs,
       command.action || "Chrome command",
-      () => detachAll(),
+      // The timeout must ACTUALLY cancel: tear down the debugger sessions (stopping in-flight
+      // CDP input) and journal the id as executed-but-aborted so a same-id retry is warned
+      // instead of starting a second concurrent input stream (command-timeout).
+      () => { markInterrupted(id, journal, command.action || ""); detachAll(); },
     );
-    journal[id] = { result, completedAt: Date.now() };
+    journal[id] = { id, action: command.action || "", ok: true, resultHash: resultDigest(result), completedAt: Date.now() };
+    // Enforce the TTL/count/byte budget against the NEW entry too — the top-of-function sweep
+    // ran before it existed, and persisting past the budget would violate the journal-quota bound.
+    sweepJournal(journal, Date.now());
     await persistJournal(journal);
+    rememberRecentResult(id, result);
     await postResult({ id, ok: true, result });
   } catch (error) {
-    // Never journal failures: a retried failed command must execute again.
+    // Never journal plain failures (a retried failed command must execute again), but KEEP an
+    // interrupted marker written by the timeout handler so a same-id retry is warned instead of
+    // re-executing the side effect.
+    if (!journal[id] || !journal[id].aborted) delete journal[id];
+    await persistJournal(journal);
     await postResult({ id, ok: false, error: error?.message ?? String(error) });
   }
 }
@@ -1304,6 +2003,308 @@ async function groupTab(tab, title, color) {
   return { tab: await formatTab(grouped), group: await groupRecord(groupId) };
 }
 
+// =================== CDP Network-domain commands (feat-cdp-network / feat-har) ===================
+// enableNetworkDomain deliberately does NOT route through cdpRaw: its timeout path force-detaches,
+// which would tear down the persistent attach we are building (same policy as the Page.enable
+// call inside attachDebugger).
+async function enableNetworkDomain(tabId) {
+  await withTimeout(new Promise((resolve, reject) => {
+    chrome.debugger.sendCommand(attachedTabs.get(tabId)?.debuggee || { tabId }, "Network.enable", {}, (result) => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(result);
+    });
+  }), CDP_COMMAND_TIMEOUT_MS, "CDP Network.enable");
+}
+
+// Opt a tab into persistent CDP Network capture: attach (if needed), mark the attach as
+// network-mode (the idle-detach sweep skips it), enable the Network domain, and re-apply any
+// blocked-URL patterns previously set (Network.setBlockedURLs dies with the attach).
+async function ensureNetworkCapture(tabId) {
+  const entry = await attachDebugger(tabId);
+  entry.networkMode = true;
+  entry.detachAt = Date.now() + NETWORK_MODE_KEEPALIVE_MS;
+  networkModeTabs.add(tabId);
+  if (!cdpNetworkEntries.has(tabId)) cdpNetworkEntries.set(tabId, new Map());
+  await enableNetworkDomain(tabId);
+  const blocked = blockedUrlsPerTab.get(tabId);
+  if (blocked && blocked.length) {
+    await cdp(tabId, "Network.setBlockedURLs", { urls: blocked }).catch(() => undefined);
+  }
+}
+
+async function disableNetworkCapture(tabId) {
+  networkModeTabs.delete(tabId);
+  const entry = attachedTabs.get(tabId);
+  if (entry) {
+    entry.networkMode = false;
+    // Back to the default idle-detach model; the sweep detaches after the idle window.
+    entry.detachAt = Date.now() + INPUT_IDLE_DETACH_MS;
+  }
+}
+
+// Fetch one response body via the Network domain on demand (HAR export / CDP entry lookup). Uses
+// the non-destructive sendCommand wrapper so a slow body must NOT force-detach the persistent
+// attach; a failure just means that body is skipped. Returns { text, base64Encoded }.
+async function fetchCdpResponseBody(tabId, requestId) {
+  try {
+    const result = await withTimeout(new Promise((resolve, reject) => {
+      chrome.debugger.sendCommand(attachedTabs.get(tabId)?.debuggee || { tabId }, "Network.getResponseBody", { requestId }, (res) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(res);
+      });
+    }), CDP_COMMAND_TIMEOUT_MS, `CDP Network.getResponseBody`);
+    return { text: String(result && result.body !== undefined ? result.body : ""), base64Encoded: !!(result && result.base64Encoded) };
+  } catch (error) {
+    return { error: String(error?.message || error) };
+  }
+}
+
+function isHarBodyEligible(mimeType) {
+  // Skip known-binary types (images/media/fonts/streams); empty mime is attempted and capped.
+  const mime = String(mimeType || "").toLowerCase();
+  if (!mime || NETWORK_TEXT_MIME_RE.test(mime)) return true;
+  return !/^(image\/|audio\/|video\/|font\/|application\/(octet-stream|zip|gzip|pdf))/.test(mime);
+}
+
+function capHarBody(text) {
+  if (typeof text !== "string" || text.length <= CDP_NETWORK_MAX_BODY_CHARS) return text;
+  return text.slice(0, CDP_NETWORK_MAX_BODY_CHARS) + `\n[truncated ${text.length - CDP_NETWORK_MAX_BODY_CHARS} chars]`;
+}
+
+function isoTime(ms) {
+  return new Date(ms).toISOString();
+}
+
+// CDP Network.timing -> HAR timings (seconds in CDP, ms in HAR; -1 = unknown, as HAR allows).
+function cdpTimingsToHar(cdpTiming) {
+  if (!cdpTiming || typeof cdpTiming !== "object") return { blocked: -1, dns: -1, connect: -1, send: 0, wait: -1, receive: 0, ssl: -1 };
+  // CDP Network.timing uses -1 (seconds) for phases that were not measured; treat those as
+  // unknown instead of converting them into a bogus negative-millisecond value.
+  const toMs = (v) => (typeof v === "number" && v >= 0 ? Math.round(v * 1000) : -1);
+  const diffMs = (a, b) => (toMs(a) !== -1 && toMs(b) !== -1 ? Math.max(0, toMs(a) - toMs(b)) : -1);
+  return {
+    blocked: diffMs(cdpTiming.sendStart, cdpTiming.requestTime),
+    dns: diffMs(cdpTiming.dnsEnd, cdpTiming.dnsStart),
+    connect: diffMs(cdpTiming.connectEnd, cdpTiming.connectStart),
+    send: diffMs(cdpTiming.sendEnd, cdpTiming.sendStart),
+    wait: diffMs(cdpTiming.receiveHeadersEnd, cdpTiming.sendEnd),
+    receive: diffMs(cdpTiming.receiveEnd, cdpTiming.receiveHeadersEnd),
+    ssl: -1,
+  };
+}
+
+function harTimingsTotal(timings) {
+  const keys = ["blocked", "dns", "connect", "send", "wait", "receive", "ssl"];
+  let total = 0, unknown = 0;
+  for (const key of keys) {
+    const v = timings[key];
+    if (typeof v === "number" && v >= 0) total += v;
+    else unknown++;
+  }
+  return unknown === keys.length ? -1 : total;
+}
+
+function headersFromPairs(pairs) {
+  if (!Array.isArray(pairs)) return [];
+  return pairs.map(([name, value]) => ({ name: String(name), value: String(value) }));
+}
+
+// In-page fetch/XHR capture entry -> HAR entry (has response bodies; no request headers captured).
+function pageEntryToHar(pe, now, includeBodies) {
+  const body =
+    includeBodies && pe._bodySkipped !== "budget" && typeof pe.responseBody === "string" ? pe.responseBody : undefined;
+  return {
+    pageref: "page_1",
+    startedDateTime: isoTime(pe.startedAt || now),
+    time: typeof pe.durationMs === "number" ? Math.max(0, pe.durationMs) : 0,
+    request: {
+      method: pe.method || "GET",
+      url: pe.url || "",
+      httpVersion: "",
+      cookies: [],
+      headers: [],
+      queryString: [],
+      headersSize: -1,
+      bodySize: -1,
+    },
+    response: {
+      status: typeof pe.status === "number" ? pe.status : 0,
+      statusText: pe.statusText || "",
+      httpVersion: "",
+      cookies: [],
+      headers: headersFromPairs(pe.responseHeaders),
+      content: { size: body !== undefined ? body.length : -1, mimeType: pe.mimeType || "", ...(body !== undefined ? { text: body } : {}) },
+      redirectURL: pe.responseUrl && pe.responseUrl !== pe.url ? pe.responseUrl : "",
+      headersSize: -1,
+      bodySize: body !== undefined ? body.length : -1,
+      ...(pe.error !== undefined ? { _error: pe.error } : {}),
+      ...(pe._bodySkipped ? { _bodySkipped: pe._bodySkipped } : {}),
+    },
+    cache: {},
+    timings: { blocked: -1, dns: -1, connect: -1, send: 0, wait: typeof pe.durationMs === "number" ? Math.max(0, pe.durationMs) : -1, receive: 0, ssl: -1 },
+    _source: "page",
+    _requestId: pe.id,
+    _pageUrl: pe.pageUrl,
+  };
+}
+
+// CDP Network-domain entry -> HAR entry. Response bodies are attached by the caller (page-captured
+// body on merge, or budgeted CDP Network.getResponseBody fetch); this builder never fetches itself
+// so the export budget applies exactly once (feat-har).
+async function cdpEntryToHar(tabId, ce, now, includeBodies) {
+  const pageBody = includeBodies && typeof ce._pageBody === "string" ? ce._pageBody : undefined;
+  const fetchedBody = includeBodies && typeof ce._fetchedBody === "string" ? ce._fetchedBody : undefined;
+  const bodyText = pageBody !== undefined ? pageBody : fetchedBody;
+  const content = {
+    size: bodyText !== undefined ? bodyText.length : (typeof ce.encodedDataLength === "number" ? ce.encodedDataLength : -1),
+    mimeType: ce.mimeType || "",
+    ...(bodyText !== undefined ? { text: bodyText } : {}),
+    ...(ce.bodyError ? { _bodyError: ce.bodyError } : {}),
+    ...(ce._bodySkipped ? { _bodySkipped: ce._bodySkipped } : {}),
+  };
+  const timings = cdpTimingsToHar(ce.timings || {});
+  return {
+    pageref: "page_1",
+    startedDateTime: isoTime(ce.startedAt || now),
+    time: typeof ce.durationMs === "number" ? Math.max(0, ce.durationMs) : harTimingsTotal(timings),
+    request: {
+      method: ce.method || "GET",
+      url: ce.url || "",
+      httpVersion: ce.protocol || "",
+      cookies: [],
+      headers: ce.requestHeaders || [],
+      queryString: [],
+      ...(includeBodies && ce.postData !== undefined ? { postData: { mimeType: "", text: capHarBody(ce.postData) } } : {}),
+      headersSize: -1,
+      bodySize: typeof ce.postData === "string" ? ce.postData.length : -1,
+    },
+    response: {
+      status: typeof ce.status === "number" ? ce.status : 0,
+      statusText: ce.statusText || "",
+      httpVersion: ce.protocol || "",
+      cookies: [],
+      headers: ce.responseHeaders || [],
+      content,
+      redirectURL: "",
+      headersSize: -1,
+      bodySize: bodyText !== undefined ? bodyText.length : -1,
+      ...(typeof ce.encodedDataLength === "number" ? { _transferSize: ce.encodedDataLength } : {}),
+      ...(ce.errorText !== undefined ? { _error: ce.errorText, _canceled: ce.canceled === true } : {}),
+    },
+    cache: {},
+    timings,
+    ...(ce.serverIPAddress !== undefined ? { serverIPAddress: ce.serverIPAddress } : {}),
+    ...(ce.redirects && ce.redirects.length ? { _redirects: ce.redirects } : {}),
+    _source: "cdp",
+    _requestId: ce.requestId,
+    _resourceType: ce.resourceType || "",
+    _fromCache: ce.fromCache === true,
+    _fromServiceWorker: ce.fromServiceWorker === true,
+    _pageUrl: ce.documentURL || "",
+  };
+}
+
+// Compose the HAR payload for the session automation tab: CDP Network-domain entries (document/
+// static/fetch/XHR) merged with the in-page fetch/XHR capture (which carries response bodies).
+// Returns the full HAR object; the host writes it to disk under .pi/chrome-network/.
+async function exportNetworkHar(tab, params) {
+  const includeBodies = params.includeBodies !== false;
+  const now = Date.now();
+  const cdpEntries = Array.from((cdpNetworkEntries.get(tab.id) || new Map()).values());
+  // Page-level capture is best-effort: it runs in the page world and yields nothing when the
+  // page cannot be reached (about:blank, crashed tab, etc.).
+  let pageEntries = [];
+  try {
+    const res = await executeInTab({ targetId: tab.id, foreground: false }, listNetworkRequests, [true, false]);
+    pageEntries = Array.isArray(res && res.requests) ? res.requests : [];
+  } catch {}
+  // Index CDP entries by method+URL so page entries can merge into the richer CDP metadata.
+  const cdpByKey = new Map();
+  for (const ce of cdpEntries) {
+    const key = `${ce.method} ${ce.url}`;
+    if (!cdpByKey.has(key)) cdpByKey.set(key, []);
+    cdpByKey.get(key).push(ce);
+  }
+  const usedCdp = new Set();
+  const pageHarEntries = [];
+  // ONE shared body text budget across page-captured and CDP-fetched bodies keeps the /result
+  // payload under the bridge's 8MB result cap no matter how chatty the page was.
+  let bodyBudget = NETWORK_HAR_BODY_BUDGET_CHARS;
+  for (const pe of pageEntries) {
+    const candidates = cdpByKey.get(`${pe.method} ${pe.url}`) || [];
+    const match = candidates.find((ce) => !usedCdp.has(ce.requestId) && Math.abs(ce.startedAt - pe.startedAt) < 8000);
+    if (match) {
+      // Keep the page-captured body (already fetched) and drop the page-only duplicate.
+      if (includeBodies && typeof pe.responseBody === "string") {
+        if (bodyBudget <= 0) match._bodySkipped = "budget";
+        else {
+          const entryBudget = bodyBudget;
+          bodyBudget -= CDP_NETWORK_MAX_BODY_CHARS;
+          match._pageBody = capHarBody(pe.responseBody).slice(0, entryBudget);
+        }
+      }
+      match._pageBodyTruncated = pe.responseBodyTruncated === true;
+      match._pageId = pe.id;
+      usedCdp.add(match.requestId);
+    } else {
+      if (includeBodies && typeof pe.responseBody === "string") {
+        if (bodyBudget <= 0) pe._bodySkipped = "budget";
+        else {
+          const entryBudget = bodyBudget;
+          bodyBudget -= CDP_NETWORK_MAX_BODY_CHARS;
+          pe.responseBody = capHarBody(pe.responseBody).slice(0, entryBudget);
+        }
+      }
+      pageHarEntries.push(pageEntryToHar(pe, now, includeBodies));
+    }
+  }
+  // Only CDP entries that survive the HAR entry cap get a body fetch (text-like types, size-
+  // capped, and sharing the same budget as page-captured bodies). Merged entries (page body
+  // attached) always make the cut; standalone entries fill the rest.
+  const mergedCdp = cdpEntries.filter((ce) => usedCdp.has(ce.requestId));
+  const standaloneCdp = cdpEntries.filter((ce) => !usedCdp.has(ce.requestId));
+  const cdpBudget = Math.max(0, NETWORK_HAR_MAX_ENTRIES - pageHarEntries.length);
+  const includedCdp = standaloneCdp.slice(0, Math.max(0, cdpBudget - mergedCdp.length));
+  const harCdp = [...mergedCdp, ...includedCdp];
+  if (includeBodies) {
+    const bodyPromises = [];
+    for (const ce of harCdp) {
+      if (bodyBudget <= 0) { ce._bodySkipped = "budget"; continue; }
+      if (ce._fetchedBody !== undefined || ce._pageBody !== undefined) continue;
+      if (!ce.status || !isHarBodyEligible(ce.mimeType) || ce.bodyError !== undefined) continue;
+      const entryBudget = bodyBudget;
+      bodyBudget -= CDP_NETWORK_MAX_BODY_CHARS;
+      bodyPromises.push(
+        fetchCdpResponseBody(tab.id, ce.requestId).then((res) => {
+          if (res && typeof res.text === "string") ce._fetchedBody = capHarBody(res.text).slice(0, entryBudget);
+          else if (res && res.error) ce.bodyError = res.error;
+        }, () => { ce.bodyError = "body fetch rejected"; }),
+      );
+    }
+    await Promise.all(bodyPromises);
+  }
+  const cdpHarEntries = [];
+  for (const ce of harCdp) cdpHarEntries.push(await cdpEntryToHar(tab.id, ce, now, includeBodies));
+  const entries = [...pageHarEntries, ...cdpHarEntries].slice(0, NETWORK_HAR_MAX_ENTRIES);
+  const har = {
+    log: {
+      version: "1.2",
+      creator: { name: "pi-chrome", version: chrome.runtime.getManifest().version, comment: "pi-chrome CDP Network-domain + in-page fetch/XHR capture" },
+      pages: [{ startedDateTime: isoTime(now), id: "page_1", title: tab.title || tab.url || "Chrome tab", pageTimings: {}, _url: tab.url || "" }],
+      entries,
+    },
+  };
+  return {
+    har,
+    count: entries.length,
+    pageEntries: pageEntries.length,
+    cdpEntries: cdpEntries.length,
+    truncated: pageHarEntries.length + cdpHarEntries.length > NETWORK_HAR_MAX_ENTRIES,
+    mode: networkModeTabs.has(tab.id),
+    note: "HAR payload — the host writes it under .pi/chrome-network/ and returns the path.",
+  };
+}
+
 async function dispatch(action, params) {
   switch (action) {
     case "tab.version":
@@ -1404,6 +2405,22 @@ async function dispatch(action, params) {
       return withOptionalSnapshot(params, chromeInputType);
     case "page.fill":
       return withOptionalSnapshot(params, chromeInputFill);
+    case "page.fillForm":
+      return chromeFillForm(params);
+    case "page.dialog":
+      return handleDialogCommand(params);
+    case "page.emulate":
+      return chromeEmulate(params);
+    case "page.perfMetrics":
+      return chromePerfMetrics(params);
+    case "storage.op":
+      return chromeStorage(params);
+    case "downloads.list":
+      return listDownloads(params);
+    case "downloads.wait":
+      return waitForDownload(params);
+    case "downloads.clear":
+      return clearDownloads(params);
     case "page.key":
       return withOptionalSnapshot(params, chromeInputKey);
     case "page.scroll":
@@ -1416,29 +2433,153 @@ async function dispatch(action, params) {
       return inputDebug(params);
     case "page.console.list":
       return executeInTab(params, listConsoleMessages, [params.clear === true]);
-    case "page.network.list":
-      return executeInTab(params, listNetworkRequests, [params.includePreservedRequests === true, params.clear === true]);
-    case "page.network.get":
-      return executeInTab(params, getNetworkRequest, [params.requestId]);
+    case "network.mode": {
+      // Opt-in persistent CDP Network capture on the session automation tab (feat-cdp-network).
+      // Off by default so the idle-detach model stays intact; on, the attach is held open and the
+      // Network domain captures document/static/fetch/XHR traffic that in-page hooks cannot see.
+      const enabled = params.enabled !== false;
+      // Disabling must not spawn an automation window just to turn the mode off.
+      const tab = enabled
+        ? await getTabByParams(params)
+        : await getTabByParams(params, { createOwnedTarget: false }).catch(() => null);
+      if (tab) {
+        if (enabled) {
+          await ensureNetworkCapture(tab.id);
+        } else {
+          await disableNetworkCapture(tab.id);
+        }
+        if (params.clear === true) cdpNetworkEntries.set(tab.id, new Map());
+      }
+      const stored = tab ? cdpNetworkEntries.get(tab.id) : undefined;
+      return {
+        enabled: tab ? networkModeTabs.has(tab.id) : false,
+        tabId: tab ? tab.id : null,
+        capturedCdpEntries: stored ? stored.size : 0,
+        blockedUrls: tab ? (blockedUrlsPerTab.get(tab.id) || []) : [],
+      };
+    }
+    case "network.block": {
+      // Block matching requests via Network.setBlockedURLs (wildcards supported). Requires the
+      // network capture attach, which is created on demand if the mode is not already on.
+      const tab = await getTabByParams(params);
+      await ensureNetworkCapture(tab.id);
+      const patterns = Array.isArray(params.urlPatterns) ? params.urlPatterns.map((p) => String(p)) : [];
+      blockedUrlsPerTab.set(tab.id, patterns);
+      try {
+        await cdp(tab.id, "Network.setBlockedURLs", { urls: patterns });
+      } catch (error) {
+        // A stale session can auto-re-attach without the Network domain re-enabled; re-enable once.
+        await enableNetworkDomain(tab.id);
+        await cdp(tab.id, "Network.setBlockedURLs", { urls: patterns });
+      }
+      return { tabId: tab.id, urlPatterns: patterns, blocked: patterns.length > 0 };
+    }
+    case "network.list": {
+      const tab = await getTabByParams(params);
+      const stored = cdpNetworkEntries.get(tab.id);
+      const cdpList = stored ? Array.from(stored.values()) : [];
+      const cleared = params.clear === true ? cdpList.length : 0;
+      if (params.clear === true) cdpNetworkEntries.set(tab.id, new Map());
+      // Return metadata-only entries (bodies are fetched on demand by export); cap the payload.
+      const recent = cdpList.length > NETWORK_LIST_MAX_RETURNED ? cdpList.slice(cdpList.length - NETWORK_LIST_MAX_RETURNED) : cdpList;
+      return { entries: recent, count: recent.length, totalCdpEntries: cdpList.length, cleared, mode: networkModeTabs.has(tab.id) };
+    }
+    case "network.get": {
+      const tab = await getTabByParams(params);
+      const stored = cdpNetworkEntries.get(tab.id);
+      const entry = stored && stored.get(String(params.requestId));
+      if (!entry) throw new Error(`No CDP network entry with requestId ${params.requestId}`);
+      if (entry.status && isHarBodyEligible(entry.mimeType) && entry.bodyError === undefined && params.includeBodies !== false) {
+        const body = await fetchCdpResponseBody(tab.id, entry.requestId);
+        if (body && typeof body.text === "string") entry._fetchedBody = capHarBody(body.text);
+        else if (body && body.error) entry.bodyError = body.error;
+      }
+      return { ...entry };
+    }
+    case "network.export": {
+      const tab = await getTabByParams(params);
+      return exportNetworkHar(tab, params);
+    }
+    case "page.network.list": {
+      const result = await executeInTab(params, listNetworkRequests, [params.includePreservedRequests === true, params.clear === true]);
+      // Enrich with CDP Network-domain entries captured while network capture mode is on — the
+      // in-page fetch/XHR capture cannot see document/static requests (feat-cdp-network).
+      const tab = await getTabByParams(params);
+      const stored = cdpNetworkEntries.get(tab.id);
+      const cdpList = stored ? Array.from(stored.values()) : [];
+      const recent = cdpList.length > NETWORK_LIST_MAX_RETURNED ? cdpList.slice(cdpList.length - NETWORK_LIST_MAX_RETURNED) : cdpList;
+      return { ...result, cdpEntries: recent, cdpCount: cdpList.length, networkCaptureMode: networkModeTabs.has(tab.id) };
+    }
+    case "page.network.get": {
+      try {
+        return await executeInTab(params, getNetworkRequest, [params.requestId]);
+      } catch (error) {
+        // Fall back to CDP-captured entries when the id is not an in-page fetch/XHR request
+        // (e.g. a document/static request captured by the Network domain).
+        const tab = await getTabByParams(params);
+        const stored = cdpNetworkEntries.get(tab.id);
+        const entry = stored && stored.get(String(params.requestId));
+        if (!entry) throw error;
+        if (entry.status && isHarBodyEligible(entry.mimeType) && entry.bodyError === undefined && params.includeBodies !== false) {
+          const body = await fetchCdpResponseBody(tab.id, entry.requestId);
+          if (body && typeof body.text === "string") entry._fetchedBody = capHarBody(body.text);
+          else if (body && body.error) entry.bodyError = body.error;
+        }
+        return { ...entry, source: "cdp" };
+      }
+    }
     case "page.waitFor": {
       // Poll from the service worker via CDP (bypasses CSP). The old approach ran the polling
       // loop in-page with new Function() for expression checks, which fails under strict CSP.
       const tab = await getTabByParams(params);
       if (params.foreground) await bringToFront(tab);
+      if ((params.kind === "selector" || params.kind === "expression") && !params.value) {
+        throw new Error(`chrome_wait_for: value is required for kind=${params.kind}`);
+      }
       const timeoutMs = params.timeoutMs || 10000;
       const intervalMs = params.intervalMs || 250;
       const started = Date.now();
+      // networkIdle needs the fetch/XHR instrumentation installed so entries are tagged pending.
+      if (params.kind === "networkIdle") {
+        try { await ensureNetworkInstrumentation(tab.id); } catch {}
+      }
+      const baselineUrl = tab.url || "";
+      const idleMs = Math.max(Number(params.value) || 500, 100);
+      let idleSince = null;
       while (Date.now() - started < timeoutMs) {
         let ok = false;
         try {
-          const expr = params.kind === "selector"
-            ? `!!document.querySelector(${JSON.stringify(params.value)})`
-            : params.value;
-          ok = Boolean(await evaluateInTab({ ...params, expression: expr, foreground: false }));
+          let expr;
+          if (params.kind === "selector") expr = `!!document.querySelector(${JSON.stringify(params.value)})`;
+          else if (params.kind === "navigation") {
+            // Wait until location.href differs from the command-start URL, or includes a given
+            // substring when value is provided (click -> wait -> assert in one round trip).
+            expr = params.value
+              ? `location.href.includes(${JSON.stringify(params.value)})`
+              : `location.href !== ${JSON.stringify(baselineUrl)}`;
+          } else if (params.kind === "networkIdle") {
+            expr = `(() => { const s = window.__PI_CHROME_STATE__; return !s || !Array.isArray(s.network) ? true : !s.network.some(e => e.status === "pending"); })()`;
+          } else {
+            expr = params.value;
+          }
+          // Reuse the resolved tab instead of re-resolving (chrome.tabs.get) every 250ms.
+          ok = Boolean(await evaluateInResolvedTab(tab, { ...params, expression: expr, foreground: false }));
         } catch {
           ok = false;
         }
-        if (ok) return { elapsedMs: Date.now() - started };
+        if (ok) {
+          if (params.kind === "networkIdle") {
+            // Must stay request-free for the requested duration, not just one poll.
+            if (idleSince === null) idleSince = Date.now();
+            if (Date.now() - idleSince >= idleMs) {
+              return { elapsedMs: Date.now() - started, kind: "networkIdle", idleMs };
+            }
+          } else {
+            return { elapsedMs: Date.now() - started };
+          }
+        } else {
+          idleSince = null;
+        }
         await sleep(intervalMs);
       }
       throw new Error(`Timed out after ${timeoutMs}ms waiting for ${params.kind}: ${params.value}`);
@@ -1524,7 +2665,9 @@ async function formatTab(tab) {
 //     throw asking for an explicit target — so e.g. `chrome_tab close` can never silently close
 //     the user's active tab the way it used to, and never spawns a throwaway tab just to close it.
 async function getTabByParams(params, { createOwnedTarget = true } = {}) {
-  const tabs = await chrome.tabs.query({});
+  // tab-enumeration: avoid the full chrome.tabs.query({}) when an explicit targetId is given —
+  // chrome.tabs.get(id) is a single lookup, and waitFor polls evaluateInTab every 250ms. The
+  // full enumeration is only needed for urlIncludes/titleIncludes matching and stale-id listings.
   let tab;
   if (params.targetId !== undefined) {
     const id = Number(params.targetId);
@@ -1532,26 +2675,23 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
     if (!tab?.id) {
       // Chrome tab ids are not stable across reloads/navigations; a long session can hold a
       // stale id. Surface the current tabs so the caller can re-target instead of guessing.
-      const listed = tabs
-        .filter((candidate) => candidate.id !== undefined)
-        .slice(0, 20)
-        .map((candidate) => `  ${candidate.id}${candidate.active ? " *" : ""}\t${(candidate.title || "(untitled)").slice(0, 60)}\t${candidate.url || ""}`)
-        .join("\n");
       throw new Error(
         `No Chrome tab with id ${id} (it was likely closed or replaced). ` +
         `Re-target with chrome_tab list, or pass urlIncludes/titleIncludes instead of targetId.\n` +
-        `Current tabs:\n${listed || "  (none)"}`,
+        `Current tabs:\n${(await listTabCandidates().catch(() => "")) || "  (none)"}`,
       );
     }
   } else if (params.urlIncludes) {
     // Multiple matches must NOT resolve silently to the first tab (audit: Array.find could drive
     // the wrong tab). Error with the candidate list so the caller re-targets explicitly.
+    const tabs = await chrome.tabs.query({});
     const matching = tabs.filter((candidate) => (candidate.url || "").includes(params.urlIncludes));
     if (matching.length > 1) {
       throw ambiguityError(matching.length, `urlIncludes "${params.urlIncludes}"`, matching);
     }
     tab = matching[0];
   } else if (params.titleIncludes) {
+    const tabs = await chrome.tabs.query({});
     const matching = tabs.filter((candidate) => (candidate.title || "").includes(params.titleIncludes));
     if (matching.length > 1) {
       throw ambiguityError(matching.length, `titleIncludes "${params.titleIncludes}"`, matching);
@@ -1585,6 +2725,16 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
     await joinSessionGroup(tab, params.sessionGroupTitle);
   }
   return tab;
+}
+
+// Enumerate current tabs once for error listings (stale-id diagnostics).
+async function listTabCandidates() {
+  const tabs = await chrome.tabs.query({});
+  return tabs
+    .filter((candidate) => candidate.id !== undefined)
+    .slice(0, 20)
+    .map((candidate) => `  ${candidate.id}${candidate.active ? " *" : ""}\t${(candidate.title || "(untitled)").slice(0, 60)}\t${candidate.url || ""}`)
+    .join("\n");
 }
 
 // A target predicate that matched several tabs is ambiguous — acting on the first match would
@@ -1638,24 +2788,24 @@ const HELPER_FUNCS = [
   scrollPage,
 ];
 
+// helper-globals: only helpers the CURRENT SW commands actually reference are injected, and they
+// all live under one window.__piChromeHelpers namespace. The DOM-input emulation helpers
+// (clickPage/typeIntoPage/humanMoveTo/rand/typeCharacter/...) are legacy code no command reaches
+// today; injecting ~24 of them as bare page globals clobbered generic site globals.
+const INJECTED_HELPERS = new Set(["getPiChromeState", "installPiChromeInstrumentation"]);
+
 async function executeInTab(params, func, args) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
 
-  // Phase 1: define the helpers and the action function as page globals via CDP
-  // Runtime.evaluate. This bypasses page CSP (no `eval`/`new Function`), which is the
-  // root cause of snapshot/click/etc silently failing on `script-src 'self'` sites.
-  // Each helper is a named function declaration assigned to the page. The three helpers with
-  // generic/clobbering names (rand, typeCharacter, __piAction) live under one
-  // window.__piChromeHelpers namespace instead of polluting page globals (audit: window.rand /
-  // window.typeCharacter / window.__piAction could clobber site globals). All other helpers stay
-  // as window.<name> so their bare-name cross-references keep resolving at call time.
-  const NAMESPACED_HELPERS = new Set(["rand", "typeCharacter"]);
-  const assignments = HELPER_FUNCS.map((helper) => (
-    NAMESPACED_HELPERS.has(helper.name)
-      ? `window.__piChromeHelpers[${JSON.stringify(helper.name)}]=${helper.toString()}`
-      : `window.${helper.name}=${helper.toString()}`
-  )).join(";\n");
+  // Phase 1: define the helpers and the action function under the page's
+  // window.__piChromeHelpers namespace via CDP Runtime.evaluate. This bypasses page CSP
+  // (no `eval`/`new Function`), which is the root cause of snapshot/click/etc silently failing
+  // on `script-src 'self'` sites.
+  const assignments = HELPER_FUNCS
+    .filter((helper) => INJECTED_HELPERS.has(helper.name))
+    .map((helper) => `window.__piChromeHelpers[${JSON.stringify(helper.name)}]=${helper.toString()}`)
+    .join(";\n");
   const actionAssign = `window.__piChromeHelpers.__piAction=(${func.toString()})`;
   const defineRes = await cdpEval(tab.id, `(()=>{window.__piChromeHelpers=window.__piChromeHelpers||{};\n${assignments};\n${actionAssign};})()`);
   if (defineRes.exceptionDetails) {
@@ -1716,6 +2866,12 @@ function piEvalStringify(v) {
 // pages that ship `script-src 'self'` without `'unsafe-eval'` (which blocks `eval`/`new Function`).
 async function evaluateInTab(params) {
   const tab = await getTabByParams(params);
+  return evaluateInResolvedTab(tab, params);
+}
+
+// Evaluate against an already-resolved tab (used by page.waitFor so the tab is not re-resolved
+// on every 250ms iteration — tab-enumeration).
+async function evaluateInResolvedTab(tab, params) {
   if (params.foreground) await bringToFront(tab);
   const expression = String(params.expression ?? "");
   const stringifySrc = `(${piEvalStringify.toString()})`;
@@ -1746,6 +2902,19 @@ async function evaluateInTab(params) {
     if (v.kind === "error") throw new Error(`${v.name}: ${v.message}\n${v.stack || ""}`);
   }
   return v;
+}
+
+// Install the fetch/XHR instrumentation (same helper + action-injection path as executeInTab's
+// Phase 1) so a networkIdle wait can see in-flight requests tagged status 'pending'.
+async function ensureNetworkInstrumentation(tabId) {
+  const assignments = HELPER_FUNCS
+    .filter((helper) => INJECTED_HELPERS.has(helper.name))
+    .map((helper) => `window.__piChromeHelpers[${JSON.stringify(helper.name)}]=${helper.toString()}`)
+    .join(";\n");
+  const res = await cdpEval(tabId, `(()=>{window.__piChromeHelpers=window.__piChromeHelpers||{};\n${assignments};\nwindow.__piChromeHelpers.installPiChromeInstrumentation();})()`);
+  if (res.exceptionDetails) {
+    throw new Error(`Failed to install network instrumentation: ${cdpExceptionText(res.exceptionDetails) || "unknown error"}`);
+  }
 }
 
 async function withOptionalSnapshot(params, actionFn) {
@@ -1780,12 +2949,32 @@ function parseFrameUid(uid) {
   return { frameId: Number(match[1]), localUid: `el-${match[2]}` };
 }
 
+// snapshotScriptFrames: per-tab (and per-frame) "snapshot script installed" tracking so the
+// snapshot file is NOT re-injected on every snapshot (re-injection). Cleared on navigation via
+// webNavigation.onCommitted and when a tab closes.
+const snapshotScriptFrames = new Map(); // tabId -> Set<frameId>
 async function injectSnapshotFile(tabId, frameId) {
   await executeScriptTimed({
     target: { tabId, frameIds: [frameId] },
     world: "MAIN",
     files: ["snapshot_injected.js"],
   }, `inject snapshot script in tab ${tabId} frame ${frameId}`);
+  let set = snapshotScriptFrames.get(tabId);
+  if (!set) { set = new Set(); snapshotScriptFrames.set(tabId, set); }
+  set.add(frameId);
+}
+
+function isSnapshotScriptInstalled(tabId, frameId) {
+  const set = snapshotScriptFrames.get(tabId);
+  return !!set && set.has(frameId);
+}
+
+function clearSnapshotScriptInstalled(tabId, frameId) {
+  if (frameId === 0) snapshotScriptFrames.delete(tabId);
+  else {
+    const set = snapshotScriptFrames.get(tabId);
+    if (set) set.delete(frameId);
+  }
 }
 
 // Invoke the installed snapshot page function inside one frame, re-injecting the file once when
@@ -1799,7 +2988,24 @@ async function runSnapshotPageInFrame(tab, frameId, args) {
         try {
           const snapshotPage = globalThis.__piChromeSnapshotPage;
           if (typeof snapshotPage !== "function") throw new Error("snapshot_injected.js did not install __piChromeSnapshotPage");
-          return { ok: true, value: await snapshotPage(...invocationArgs) };
+          const value = await snapshotPage(...invocationArgs);
+          // elements-map surfacing: report evicted uids and an unresolved nearUid on the returned
+          // snapshot so the agent refreshes instead of clicking a stale uid / assuming near-sort.
+          if (value && typeof value === "object") {
+            const pageState = globalThis.__PI_CHROME_STATE__;
+            if (pageState && Array.isArray(pageState.evictedUids) && pageState.evictedUids.length) {
+              if (!value.summary) value.summary = {};
+              value.summary.evictedUids = pageState.evictedUids.slice(-20);
+            }
+            if (Array.isArray(invocationArgs) && typeof invocationArgs[3] === "string") {
+              const resolved = pageState && pageState.elements ? pageState.elements[invocationArgs[3]] : null;
+              if (!resolved || !resolved.isConnected) {
+                if (!value.filter) value.filter = {};
+                value.filter.nearUidResolved = false;
+              }
+            }
+          }
+          return { ok: true, value };
         } catch (error) {
           return { ok: false, error: error?.stack || error?.message || String(error) };
         }
@@ -1864,8 +3070,8 @@ async function snapshotInTab(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   // Trailing budget args are the service-worker-side hookup for the snippet's single budgeted
-  // TreeWalker pass (node + wall-clock budgets); the snippet ignores them until it grows
-  // optional params, so appending them here is forward-compatible and harmless today.
+  // TreeWalker pass (node + wall-clock budgets): the values are passed positionally (args 8/9)
+  // and read by snapshot_injected.js when it grows optional params (budget-exhausted).
   const args = [
     params.maxElements || 80,
     params.containingText ?? null,
@@ -1877,15 +3083,27 @@ async function snapshotInTab(params) {
     SNAPSHOT_DOM_NODE_BUDGET,
     SNAPSHOT_DOM_TIME_BUDGET_MS,
   ];
-  await injectSnapshotFile(tab.id, 0);
+  // re-injection: skip the file injection when this tab/frame already has the script installed;
+  // a navigation clears the flag (and the missingGlobal re-inject covers a replaced global).
+  if (!isSnapshotScriptInstalled(tab.id, 0)) await injectSnapshotFile(tab.id, 0);
   const snapshot = await runSnapshotPageInFrame(tab, 0, args);
   await mergeSubframeSnapshots(tab, snapshot, args);
   return snapshot;
 }
 
+// Sub-frame snapshots contribute only element summaries to the merged result; force interactive
+// mode (elements only) so per-frame text/pageMap/forms work is skipped on the output side
+// (subframe-snapshot-cost; snapshot_injected.js can additionally skip the computation lazily).
+function subframeSnapshotArgs(args) {
+  const copy = Array.isArray(args) ? args.slice() : [];
+  copy[4] = "interactive";
+  return copy;
+}
+
 // Best-effort cross-origin/sub-frame enumeration: snapshot each sub-frame in its own context and
 // merge its elements (uid-prefixed + frame-tagged) into the top-frame result. Frames that fail to
-// snapshot are listed as iframe placeholders so callers know content lives in a frame.
+// snapshot — or that we skip because the shared wall-clock budget lapsed — are listed as iframe
+// placeholders so callers know content lives in a frame (subframe-snapshot-cost).
 async function mergeSubframeSnapshots(tab, snapshot, args) {
   if (!Array.isArray(snapshot.elements) || !chrome.webNavigation || typeof chrome.webNavigation.getAllFrames !== "function") return;
   let frames = [];
@@ -1896,26 +3114,53 @@ async function mergeSubframeSnapshots(tab, snapshot, args) {
   }
   const subframes = (frames || []).filter((frame) => frame && typeof frame.frameId === "number" && frame.frameId > 0);
   if (!subframes.length) return;
-  const extra = [];
-  for (const frame of subframes) {
-    let value = null;
-    try {
-      value = await runSnapshotPageInFrame(tab, frame.frameId, args);
-    } catch {
-      // Best-effort: a frame we could not snapshot is still listed as an iframe placeholder.
+  const started = Date.now();
+  const subframeArgs = subframeSnapshotArgs(args);
+  const results = new Array(subframes.length);
+  let next = 0;
+  // Bounded-concurrency worker pool (the serial per-frame full snapshots blew the command
+  // timeout on multi-iframe pages).
+  const worker = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= subframes.length) return;
+      const frame = subframes[i];
+      if (Date.now() - started > SUBFRAME_SNAPSHOT_BUDGET_MS) {
+        results[i] = { skipped: true };
+        continue;
+      }
+      let value = null;
+      try {
+        value = await runSnapshotPageInFrame(tab, frame.frameId, subframeArgs);
+      } catch {
+        // Best-effort: a frame we could not snapshot is still listed as an iframe placeholder.
+      }
+      results[i] = value && Array.isArray(value.elements) ? { elements: value.elements } : { elements: null };
     }
-    const frameElements = value && Array.isArray(value.elements) ? value.elements : null;
+  };
+  await Promise.all(Array.from({ length: Math.min(SUBFRAME_SNAPSHOT_CONCURRENCY, subframes.length) }, worker));
+  const extra = [];
+  let skipped = 0;
+  let snapshotted = 0;
+  for (let i = 0; i < subframes.length; i++) {
+    const frame = subframes[i];
+    const res = results[i] || {};
+    if (res.skipped) { skipped++; extra.push(placeholderFrame(frame)); continue; }
+    const frameElements = res.elements;
     if (frameElements && frameElements.length) {
+      snapshotted++;
       for (const el of frameElements) {
         if (el && typeof el.uid === "string") el.uid = `el-f${frame.frameId}-${el.uid.replace(/^el-/, "")}`;
         if (el) {
           el.frame = frame.frameId;
-          el.context = `frame:${frame.frameId}`;
+          // context-clobber: preserve any structured context object (uid/label) and ADD the frame
+          // marker instead of replacing it with a bare 'frame:<id>' string.
+          el.context = { ...(typeof el.context === "object" && el.context !== null ? el.context : {}), frame: frame.frameId };
         }
       }
       extra.push(...frameElements);
     } else {
-      extra.push({ tag: "iframe", role: "iframe", context: `frame:${frame.frameId}`, label: frame.url || "iframe" });
+      extra.push(placeholderFrame(frame));
     }
   }
   if (!extra.length) return;
@@ -1924,6 +3169,13 @@ async function mergeSubframeSnapshots(tab, snapshot, args) {
   if (snapshot.summary && typeof snapshot.summary.totalInteractiveSampled === "number") {
     snapshot.summary.totalInteractiveSampled += extra.length;
   }
+  if (typeof snapshot.summary === "object" && snapshot.summary !== null) {
+    snapshot.summary.subframes = { total: subframes.length, snapshotted, skipped, merged: extra.length };
+  }
+}
+
+function placeholderFrame(frame) {
+  return { tag: "iframe", role: "iframe", context: { frame: frame.frameId }, label: frame.url || "iframe" };
 }
 
 async function inspectInTab(params) {
@@ -1962,6 +3214,9 @@ async function unregisterInitScript(tabId) {
 // installPiChromeInstrumentation() call is idempotent.
 if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
   chrome.webNavigation.onCommitted.addListener((details) => {
+    // A committed navigation invalidates the injected snapshot script: top-frame navigations
+    // clear the whole tab; sub-frame navigations clear just that frame (re-injection).
+    clearSnapshotScriptInstalled(details.tabId, details.frameId);
     if (details.frameId !== 0) return;
     chrome.scripting.executeScript({
       target: { tabId: details.tabId, frameIds: [0] },
@@ -1971,6 +3226,10 @@ if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
       args: [],
     }).catch(() => undefined);
   });
+}
+
+if (chrome.tabs && chrome.tabs.onRemoved) {
+  chrome.tabs.onRemoved.addListener((tabId) => snapshotScriptFrames.delete(tabId));
 }
 
 async function bringToFront(tab) {
@@ -1998,6 +3257,12 @@ function waitForTabComplete(tabId, timeoutMs) {
 async function takeScreenshot(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
+  // Element-scoped screenshots (feat-element-screenshot): resolve uid/selector to a viewport
+  // rect and capture through the attached CDP debugger, which works on inactive tabs — so
+  // background mode never activates the tab (no focus/restore churn like captureVisibleTab).
+  if (params.uid || params.selector) {
+    return elementScreenshot(tab, params);
+  }
   let previousActiveId;
   if (!tab.active) {
     const activeBefore = await chrome.tabs.query({ active: true, windowId: tab.windowId });
@@ -2006,19 +3271,20 @@ async function takeScreenshot(params) {
   }
   try {
     if (params.fullPage) {
-      // Tile-stitched full page capture: scroll, capture, paste, repeat.
-      const tiles = await executeInTab({ ...params, foreground: false }, captureFullPageTiles, []);
+      // Tile-stitched full page capture: scroll, capture, paste, repeat. Defaults to jpeg (PNG
+      // tiles for tall pages are tens of MB per tile set) and caps pathological page heights.
+      const tiles = await executeInTab({ ...params, foreground: false }, captureFullPageTiles, [MAX_FULLPAGE_TILES]);
       // captureFullPageTiles only computes scroll positions / metrics; we capture per scroll here
       // (chrome.tabs.captureVisibleTab can't be called from MAIN world).
       const captured = [];
-      for (const tile of tiles.tiles) {
+      const tilePlan = Array.isArray(tiles.tiles) ? tiles.tiles.slice(0, MAX_FULLPAGE_TILES) : [];
+      const format = params.format || "jpeg";
+      const quality = format === "jpeg" ? (typeof params.quality === "number" ? params.quality : 90) : undefined;
+      for (const tile of tilePlan) {
         await executeInTab({ ...params, foreground: false }, scrollToY, [tile.scrollY]);
         // Small settle delay; many sites have on-scroll animations / lazy-load.
         await sleep(120);
-        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-          format: params.format || "png",
-          quality: params.format === "jpeg" ? params.quality : undefined,
-        });
+        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format, quality });
         captured.push({ y: tile.y, dataUrl });
       }
       await executeInTab({ ...params, foreground: false }, scrollToY, [tiles.originalScrollY]);
@@ -2027,6 +3293,7 @@ async function takeScreenshot(params) {
         tab: await formatTab(tab),
         dimensions: { width: tiles.width, height: tiles.height, viewportHeight: tiles.viewportHeight, dpr: tiles.dpr },
         tiles: captured,
+        tilesTruncated: Array.isArray(tiles.tiles) && tiles.tiles.length > MAX_FULLPAGE_TILES ? tiles.tiles.length - MAX_FULLPAGE_TILES : undefined,
       };
     }
     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
@@ -2035,10 +3302,55 @@ async function takeScreenshot(params) {
     });
     return { dataUrl, tab: await formatTab(tab) };
   } finally {
+    // Restore the previous active tab before returning so the user is not left on the Pi tab
+    // when this was a background capture (screenshot-tiles).
     if (previousActiveId !== undefined && previousActiveId !== tab.id) {
       await chrome.tabs.update(previousActiveId, { active: true }).catch(() => undefined);
     }
   }
+}
+
+// Element-scoped screenshot via CDP Page.captureScreenshot {clip} on the attached debugger
+// (feat-element-screenshot). resolveTargetInTab computes the element's top-level viewport rect
+// (it scrolls the element into view first), then we capture just that rect. CDP capture works
+// on non-active tabs, so this path never activates/restores the tab in background mode.
+async function elementScreenshot(tab, params) {
+  if (params.fullPage) {
+    throw new Error("chrome_screenshot: fullPage cannot be combined with uid/selector; drop uid/selector for a full-page capture");
+  }
+  let resolved;
+  try {
+    resolved = await resolveTargetInTab(tab.id, params);
+  } catch (error) {
+    throw new Error(`chrome_screenshot: ${error?.message || error}`);
+  }
+  if (!resolved.rect || typeof resolved.rect.width !== "number" || typeof resolved.rect.height !== "number") {
+    throw new Error("chrome_screenshot: could not compute a bounding rect for the target element");
+  }
+  await attachDebugger(tab.id);
+  const format = params.format || "png";
+  // CDP clip is in top-level-viewport CSS px; clamp into positive integers like Chrome expects.
+  const clip = {
+    x: Math.max(0, Math.round(resolved.rect.left)),
+    y: Math.max(0, Math.round(resolved.rect.top)),
+    width: Math.max(1, Math.round(resolved.rect.width)),
+    height: Math.max(1, Math.round(resolved.rect.height)),
+    scale: 1,
+  };
+  const shot = await cdp(tab.id, "Page.captureScreenshot", {
+    format,
+    quality: format === "jpeg" ? (typeof params.quality === "number" ? params.quality : 90) : undefined,
+    clip,
+    captureBeyondViewport: false,
+  });
+  if (!shot || typeof shot.data !== "string" || !shot.data) {
+    throw new Error("chrome_screenshot: CDP capture returned no image data");
+  }
+  return {
+    dataUrl: `data:image/${format};base64,${shot.data}`,
+    tab: await formatTab(tab),
+    element: { uid: params.uid ?? null, selector: params.selector ?? null, rect: resolved.rect },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -2055,14 +3367,58 @@ function getPiChromeState() {
     instrumentationInstalled: false,
   };
   window.__PI_CHROME_STATE__ = state;
+  // Migrate states created before the remembered-element eviction landed (parity with
+  // snapshot_injected.js so whichever copy initializes first stays compatible).
+  if (typeof state.rememberedCount !== "number") state.rememberedCount = Object.keys(state.elements || {}).length;
+  if (!Array.isArray(state.evictedUids)) state.evictedUids = [];
   return state;
 }
 
 function rememberElement(element) {
   const state = getPiChromeState();
   if (!element.__piChromeUid) element.__piChromeUid = "el-" + state.nextElementUid++;
+  if (!(element.__piChromeUid in state.elements)) state.rememberedCount++;
   state.elements[element.__piChromeUid] = element;
+  evictRememberedElements(state);
   return element.__piChromeUid;
+}
+
+function rememberUidSequence(uid) {
+  const n = Number(String(uid).replace(/^el-/, ""));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function recordEvictedUid(state, uid) {
+  state.evictedUids.push(uid);
+  if (state.evictedUids.length > 100) state.evictedUids.splice(0, state.evictedUids.length - 100);
+}
+
+// Cap the remembered-element map (elements-map): evict disconnected entries first, then the
+// oldest uids, so a uid stays stable as long as its element is still live. Mirrors the policy in
+// snapshot_injected.js and records dropped uids in state.evictedUids for summary surfacing.
+function evictRememberedElements(state) {
+  const MAX_REMEMBERED_ELEMENTS = 2000;
+  if (state.rememberedCount <= MAX_REMEMBERED_ELEMENTS) return;
+  const elements = state.elements;
+  for (const uid of Object.keys(elements)) {
+    const el = elements[uid];
+    if (!el || !el.isConnected) {
+      delete elements[uid];
+      state.rememberedCount--;
+      recordEvictedUid(state, uid);
+    }
+  }
+  if (state.rememberedCount <= MAX_REMEMBERED_ELEMENTS) return;
+  const byAge = Object.keys(elements).sort((a, b) => rememberUidSequence(a) - rememberUidSequence(b));
+  const excess = state.rememberedCount - MAX_REMEMBERED_ELEMENTS;
+  for (let i = 0; i < excess; i++) {
+    const uid = byAge[i];
+    if (uid) {
+      delete elements[uid];
+      state.rememberedCount--;
+      recordEvictedUid(state, uid);
+    }
+  }
 }
 
 function elementBySelectorOrUid(selector, uid) {
@@ -2103,24 +3459,24 @@ function occluderAt(x, y, expected) {
 }
 
 function pageHash() {
-  // Cheap rolling hash used for `pageMutated`. Combines first 4kb of body innerText with the
-  // current values of inputs/textareas (which are not part of innerText) and the count of
-  // descendants of <body>. This catches: text changes, input value edits, and DOM structure
-  // changes — the three things a click/type/fill might cause.
-  const body = document.body;
-  const text = (body ? body.innerText : "").slice(0, 4000);
+  // Cheap rolling hash used for `pageMutated` (pagehash-layout). The old version forced a full
+  // document innerText pass (layout + text generation) before AND after every interaction; this
+  // samples bounded textContent prefixes instead (no forced layout), plus current input values
+  // and the descendant count, which together still catch text edits, value changes, and DOM
+  // structure changes.
+  const body = document.body || document.documentElement;
+  if (!body) return 0;
   let h = 0;
-  for (let i = 0; i < text.length; i++) h = (h * 31 + text.charCodeAt(i)) | 0;
-  if (body) {
-    const inputs = body.querySelectorAll("input,textarea,select");
-    let valueBlob = "";
-    for (let i = 0; i < inputs.length && valueBlob.length < 4000; i++) {
-      const v = inputs[i].value;
-      if (typeof v === "string") valueBlob += v + "\x00";
-    }
-    for (let i = 0; i < valueBlob.length; i++) h = (h * 31 + valueBlob.charCodeAt(i)) | 0;
-    h = (h * 31 + body.getElementsByTagName("*").length) | 0;
+  const feed = (s) => { for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; };
+  feed((body.textContent || "").slice(0, 4000));
+  const inputs = body.querySelectorAll("input,textarea,select");
+  let valueBlob = "";
+  for (let i = 0; i < inputs.length && valueBlob.length < 4000; i++) {
+    const v = inputs[i].value;
+    if (typeof v === "string") valueBlob += v + "\x00";
   }
+  feed(valueBlob);
+  h = (h * 31 + body.getElementsByTagName("*").length) | 0;
   return h;
 }
 
@@ -2213,7 +3569,7 @@ function humanClickPoint(point) {
 }
 
 function installPiChromeInstrumentation() {
-  const state = getPiChromeState();
+  const state = window.__piChromeHelpers.getPiChromeState();
   if (state.instrumentationInstalled) return;
   state.instrumentationInstalled = true;
   const pushConsole = (level, args) => {
@@ -2224,11 +3580,17 @@ function installPiChromeInstrumentation() {
       url: location.href,
       args: Array.from(args).map((arg) => {
         try {
-          if (typeof arg === "string") return arg;
+          // console-deep-clone: primitives pass through untouched; objects are serialized once
+          // to a capped string (never parsed back / deep-cloned), so a console.log({huge}) on a
+          // hot path cannot blow up memory or slow every call.
+          if (typeof arg === "string") return arg.length > 8000 ? arg.slice(0, 8000) + "…[truncated]" : arg;
+          if (typeof arg === "number" || typeof arg === "boolean" || arg === null || arg === undefined) return arg;
           if (arg instanceof Error) return { name: arg.name, message: arg.message, stack: arg.stack };
-          return JSON.parse(JSON.stringify(arg));
+          const json = JSON.stringify(arg);
+          if (json === undefined) return String(arg).slice(0, 8000);
+          return json.length > 8000 ? json.slice(0, 8000) + "…[truncated]" : json;
         } catch {
-          return String(arg);
+          return String(arg).slice(0, 8000);
         }
       }),
     });
@@ -2347,11 +3709,16 @@ function installEarlyCapture() {
       url: location.href,
       args: Array.from(args).map(function(arg) {
         try {
-          if (typeof arg === "string") return arg;
+          // console-deep-clone: primitives pass through; objects serialize once to a capped
+          // string instead of a full deep clone (same policy as installPiChromeInstrumentation).
+          if (typeof arg === "string") return arg.length > 8000 ? arg.slice(0, 8000) + "…[truncated]" : arg;
+          if (typeof arg === "number" || typeof arg === "boolean" || arg === null || arg === undefined) return arg;
           if (arg instanceof Error) return { name: arg.name, message: arg.message, stack: arg.stack };
-          return JSON.parse(JSON.stringify(arg));
+          var json = JSON.stringify(arg);
+          if (json === undefined) return String(arg).slice(0, 8000);
+          return json.length > 8000 ? json.slice(0, 8000) + "…[truncated]" : json;
         } catch (e) {
-          return String(arg);
+          return String(arg).slice(0, 8000);
         }
       }),
     });
@@ -2464,9 +3831,10 @@ function probePage() {
   };
 }
 
-function captureFullPageTiles() {
+function captureFullPageTiles(maxTiles) {
   // Returns the *plan* for tile capture; the actual chrome.tabs.captureVisibleTab calls happen
-  // in the SW. We just report the scroll positions and metrics.
+  // in the SW. We just report the scroll positions and metrics. `maxTiles` caps pathological
+  // pages (screenshot-tiles) so a 100k-px document does not produce an unbounded tile list.
   const html = document.documentElement;
   const body = document.body;
   const width = Math.max(html.scrollWidth, body ? body.scrollWidth : 0, innerWidth);
@@ -2474,18 +3842,58 @@ function captureFullPageTiles() {
   const viewportHeight = innerHeight;
   const dpr = window.devicePixelRatio || 1;
   const originalScrollY = scrollY;
+  const cap = Number.isFinite(maxTiles) && maxTiles > 0 ? Math.floor(maxTiles) : 30;
   const tiles = [];
   let y = 0;
-  while (y < height) {
+  while (y < height && tiles.length < cap) {
     tiles.push({ y, scrollY: y });
     y += viewportHeight;
   }
-  return { width, height, viewportHeight, dpr, originalScrollY, tiles };
+  return { width, height, viewportHeight, dpr, originalScrollY, tiles, tilesTruncated: tiles.length < Math.ceil(height / viewportHeight) };
 }
 
 function scrollToY(y) {
   window.scrollTo({ top: y, left: 0, behavior: "instant" });
   return { scrollY };
+}
+
+// MAIN-world web-storage accessors (feat-storage), run via executeInTab in the resolved tab.
+// Each returns location.origin so the SW reports which origin the entries belong to.
+function piWebStorageList(store) {
+  const s = store === "sessionStorage" ? window.sessionStorage : window.localStorage;
+  const entries = [];
+  for (let i = 0; i < s.length; i++) {
+    const key = s.key(i);
+    if (key === null) continue;
+    entries.push({ key, value: s.getItem(key) });
+  }
+  return { origin: location.origin, entries };
+}
+
+function piWebStorageGet(store, key) {
+  const s = store === "sessionStorage" ? window.sessionStorage : window.localStorage;
+  const value = s.getItem(key);
+  return { origin: location.origin, key, value, exists: value !== null };
+}
+
+function piWebStorageSet(store, key, value) {
+  const s = store === "sessionStorage" ? window.sessionStorage : window.localStorage;
+  s.setItem(key, String(value));
+  return { origin: location.origin, key, ok: true };
+}
+
+function piWebStorageDelete(store, key) {
+  const s = store === "sessionStorage" ? window.sessionStorage : window.localStorage;
+  const existed = s.getItem(key) !== null;
+  s.removeItem(key);
+  return { origin: location.origin, key, ok: true, existed };
+}
+
+function piWebStorageClear(store) {
+  const s = store === "sessionStorage" ? window.sessionStorage : window.localStorage;
+  const cleared = s.length;
+  s.clear();
+  return { origin: location.origin, cleared };
 }
 
 function resolvePoint(selector, uid, x, y) {
@@ -2913,29 +4321,521 @@ async function pressKeyInPage(key) {
 }
 
 function listConsoleMessages(clear) {
-  installPiChromeInstrumentation();
-  const state = getPiChromeState();
+  window.__piChromeHelpers.installPiChromeInstrumentation();
+  const state = window.__piChromeHelpers.getPiChromeState();
   const messages = state.console.slice();
   if (clear) state.console = [];
   return { messages, count: messages.length };
 }
 
 function listNetworkRequests(includePreservedRequests, clear) {
-  installPiChromeInstrumentation();
-  const state = getPiChromeState();
+  window.__piChromeHelpers.installPiChromeInstrumentation();
+  const state = window.__piChromeHelpers.getPiChromeState();
   const currentUrl = location.href;
   const requests = state.network
     .filter((request) => includePreservedRequests || request.pageUrl === currentUrl)
     .map(({ responseBody, ...summary }) => ({ ...summary, hasResponseBody: responseBody !== undefined }));
   if (clear) state.network = [];
-  return { requests, count: requests.length, note: "Captures fetch/XHR after instrumentation is installed. Browser-initiated document/static asset requests are not captured." };
+  return {
+    requests,
+    count: requests.length,
+    note: "In-page fetch/XHR capture. For document/static requests, enable chrome_network_capture (CDP Network domain) and read the returned cdpEntries.",
+  };
 }
 
 function getNetworkRequest(requestId) {
-  installPiChromeInstrumentation();
-  const request = getPiChromeState().network.find((entry) => entry.id === requestId);
+  window.__piChromeHelpers.installPiChromeInstrumentation();
+  const request = window.__piChromeHelpers.getPiChromeState().network.find((entry) => entry.id === requestId);
   if (!request) throw new Error(`No network request with id ${requestId}`);
   return request;
+}
+
+// =================== chrome_downloads (feat-downloads) ===================
+// Browser-global download tracking: chrome.downloads.search + onChanged. The final `filename` is
+// the resolved absolute filesystem path (Chrome rewrites it on auto-rename), which is what makes
+// a 'click Export CSV' workflow observable to the agent.
+function summarizeDownload(item) {
+  return {
+    id: item.id,
+    finalPath: item.filename || null,
+    url: item.url || null,
+    state: item.state || "in_progress",
+    mime: item.mime || null,
+    bytesReceived: typeof item.bytesReceived === "number" ? item.bytesReceived : null,
+    totalBytes: typeof item.totalBytes === "number" ? item.totalBytes : null,
+    error: item.error || null,
+    danger: item.danger || null,
+    startedAt: item.startTime || null,
+    endedAt: item.endTime || null,
+    exists: typeof item.exists === "boolean" ? item.exists : null,
+  };
+}
+
+function downloadsSearchQuery(params) {
+  const query = {};
+  if (params.id !== undefined) query.id = Number(params.id);
+  if (params.filenameRegex) query.filenameRegex = params.filenameRegex;
+  if (params.urlRegex) query.urlRegex = params.urlRegex;
+  if (params.state) query.state = params.state;
+  if (typeof params.limit === "number" && params.limit > 0) query.limit = params.limit;
+  return query;
+}
+
+function downloadMatches(params, item, initialIds) {
+  if (params.id !== undefined && item.id !== Number(params.id)) return false;
+  if (params.filenameRegex) {
+    try { if (!new RegExp(params.filenameRegex).test(item.filename || "")) return false; }
+    catch { return false; }
+  }
+  if (params.urlRegex) {
+    try { if (!new RegExp(params.urlRegex).test(item.url || "")) return false; }
+    catch { return false; }
+  }
+  if (params.onlyNew === true && initialIds && initialIds.has(item.id)) return false;
+  return true;
+}
+
+async function listDownloads(params) {
+  const items = await chrome.downloads.search(downloadsSearchQuery(params));
+  const limit = typeof params.limit === "number" && params.limit > 0 ? Math.min(params.limit, 200) : 50;
+  const sorted = [...items].sort((a, b) => (b.startTime || "").localeCompare(a.startTime || ""));
+  const active = sorted.filter((item) => item.state === "in_progress");
+  return {
+    downloads: sorted.slice(0, limit).map(summarizeDownload),
+    count: items.length,
+    inProgress: active.length,
+  };
+}
+
+async function waitForDownload(params) {
+  const timeoutMs = Math.min(Math.max(Number(params.timeoutMs) || DOWNLOAD_WAIT_DEFAULT_MS, 1000), DOWNLOAD_WAIT_MAX_MS);
+  const started = Date.now();
+  const initialIds = new Set((await chrome.downloads.search({}).catch(() => [])).map((item) => item.id));
+  const settled = (item) => item.state === "complete" || item.state === "interrupted";
+  // Suppress the download shelf for non-focus runs so a headless-ish session does not poke a
+  // visible download bar; best-effort.
+  if (params.foreground !== true) {
+    try { await chrome.downloads.setShelfBehavior({ behavior: "suppress" }); } catch {}
+  }
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    let timer = null;
+    let poller = null;
+    const cleanup = () => {
+      clearTimeout(timer);
+      clearInterval(poller);
+      if (chrome.downloads.onChanged) chrome.downloads.onChanged.removeListener(check);
+    };
+    const check = async () => {
+      if (finished) return;
+      let items = [];
+      try { items = await chrome.downloads.search({}); } catch { return; }
+      const done = items.filter((item) => downloadMatches(params, item, initialIds) && settled(item));
+      if (!done.length) return;
+      finished = true;
+      cleanup();
+      resolve({
+        downloads: done.map(summarizeDownload),
+        elapsedMs: Date.now() - started,
+        newDownload: done.some((item) => !initialIds.has(item.id)),
+      });
+    };
+    timer = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      reject(new Error(`downloads.wait timed out after ${timeoutMs}ms; no matching download settled`));
+    }, timeoutMs);
+    // Poll (keeps the MV3 worker alive during long waits) + onChanged for prompt completion.
+    poller = setInterval(() => void check(), 500);
+    if (chrome.downloads.onChanged) chrome.downloads.onChanged.addListener(check);
+    void check();
+  });
+}
+
+async function clearDownloads(params) {
+  const items = await chrome.downloads.search(downloadsSearchQuery(params));
+  let removed = 0;
+  let removedFiles = 0;
+  for (const item of items) {
+    if (params.removeFiles === true) {
+      try { await chrome.downloads.removeFile(item.id); removedFiles++; } catch {}
+    }
+    try { await chrome.downloads.erase(item.id); removed++; } catch {}
+  }
+  return { removed, removedFiles, matched: items.length };
+}
+
+// =================== chrome_dialog (feat-dialog) ===================
+// Handles a JavaScript dialog (alert/confirm/prompt/beforeunload) surfaced by the Page domain of
+// the attached debugger. The global onEvent listener records every dialog opening; this resolves
+// the recorded entry when one already matches, otherwise arms a waiter for the next event.
+async function handleDialogCommand(params) {
+  const tab = await getTabByParams(params);
+  if (params.foreground) await bringToFront(tab);
+  await attachDebugger(tab.id);
+  try { await cdp(tab.id, "Page.enable"); } catch {}
+  const wantedType = params.type && params.type !== "any" ? String(params.type) : null;
+  const timeoutMs = Math.min(Math.max(Number(params.timeoutMs) || 10000, 1000), 60000);
+  const matches = (info) => info && info.tabId === tab.id && (!wantedType || info.dialogType === wantedType);
+
+  const existing = Array.from(pendingDialogs.values()).find(matches);
+  if (existing) {
+    pendingDialogs.delete(tab.id);
+    return handleDialogNow(tab.id, existing, params);
+  }
+
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    let cleanup = () => {
+      clearTimeout(timer);
+      dialogWaiters.delete(tab.id);
+      if (chrome.debugger.onEvent) chrome.debugger.onEvent.removeListener(listener);
+    };
+    const timer = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      reject(new Error(`chrome_dialog: no ${params.type || "any"} dialog appeared in tab ${tab.id} within ${timeoutMs}ms`));
+    }, timeoutMs);
+    const listener = (source, method, eventParams) => {
+      if (source.tabId !== tab.id || method !== "Page.javascriptDialogOpening") return;
+      const info = pendingDialogs.get(tab.id);
+      if (!matches(info)) return;
+      finished = true;
+      pendingDialogs.delete(tab.id);
+      cleanup();
+      void handleDialogNow(tab.id, info, params).then(resolve, reject);
+    };
+    dialogWaiters.add(tab.id);
+    // Re-check after arming in case a dialog opened between the first scan and listener install.
+    const late = Array.from(pendingDialogs.values()).find(matches);
+    if (late) {
+      pendingDialogs.delete(tab.id);
+      cleanup();
+      void handleDialogNow(tab.id, late, params).then(resolve, reject);
+      return;
+    }
+    if (chrome.debugger.onEvent) chrome.debugger.onEvent.addListener(listener);
+    // Blind-handle fallback: if the dialog was already open when the debugger attached, Chrome may
+    // not re-report it as an event. Probe once with Page.handleJavaScriptDialog after a short
+    // grace; it errors harmlessly when no dialog is showing, and we keep waiting for events.
+    const probeTimer = setTimeout(() => {
+      if (finished) return;
+      void cdp(tab.id, "Page.handleJavaScriptDialog", { accept: params.accept !== false, ...(params.promptText !== undefined && params.accept !== false ? { promptText: String(params.promptText) } : {}) })
+        .then(() => {
+          if (finished) return;
+          finished = true;
+          cleanup();
+          resolve({
+            handled: true,
+            dialogType: params.type && params.type !== "any" ? params.type : "unknown",
+            message: "(dialog already open when the debugger attached)",
+            url: "",
+            defaultPrompt: "",
+            accept: params.accept !== false,
+            promptText: params.promptText !== undefined ? String(params.promptText) : null,
+            source: "blind-handle",
+          });
+        })
+        .catch(() => { /* no dialog showing — keep waiting */ });
+    }, 1500);
+    const originalCleanup = cleanup;
+    cleanup = () => {
+      clearTimeout(probeTimer);
+      originalCleanup();
+    };
+  });
+}
+
+async function handleDialogNow(tabId, info, params) {
+  const accept = params.accept !== false; // default: accept (OK)
+  const promptText = accept && params.promptText !== undefined ? String(params.promptText) : undefined;
+  const commandParams = { accept };
+  if (promptText !== undefined) commandParams.promptText = promptText;
+  await cdp(tabId, "Page.handleJavaScriptDialog", commandParams);
+  return {
+    handled: true,
+    dialogType: info.dialogType,
+    message: info.message,
+    url: info.url,
+    defaultPrompt: info.defaultPrompt,
+    accept,
+    promptText: promptText ?? null,
+  };
+}
+
+// =================== chrome_emulate (feat-emulate) ===================
+// Device metrics / UA / touch emulation via CDP Emulation.* on the session automation tab.
+// Emulation overrides live on the CDP target, so after `set` we extend the attach keepalive and
+// remember the state so `clear` (or a re-attach) can reset it.
+async function chromeEmulate(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  if (params.action === "clear") {
+    await cdp(tab.id, "Emulation.clearDeviceMetricsOverride").catch(() => undefined);
+    await cdp(tab.id, "Emulation.setTouchEmulationEnabled", { enabled: false }).catch(() => undefined);
+    if (params.ua) {
+      try {
+        await cdp(tab.id, "Emulation.setUserAgentOverride", { userAgent: String(params.ua) });
+        await cdp(tab.id, "Network.setUserAgentOverride", { userAgent: String(params.ua) }).catch(() => undefined);
+      } catch {}
+    }
+    emulatedTabs.delete(tab.id);
+    return { action: "clear", cleared: true };
+  }
+  const width = Math.max(200, Math.round(Number(params.width) || 1280));
+  const height = Math.max(200, Math.round(Number(params.height) || 800));
+  const deviceScaleFactor = Math.max(0.5, Number(params.deviceScaleFactor) || 1);
+  const mobile = params.mobile === true;
+  // Touch emulation is ON by default when setting metrics: the touch benchmark requires real
+  // TouchEvents, which the renderer only synthesizes while touch emulation is enabled.
+  const touch = params.touch !== false;
+  await cdp(tab.id, "Emulation.setDeviceMetricsOverride", {
+    width, height, deviceScaleFactor, mobile,
+    screenWidth: width, screenHeight: height,
+    positionX: 0, positionY: 0,
+  });
+  if (params.ua) {
+    await cdp(tab.id, "Emulation.setUserAgentOverride", {
+      userAgent: String(params.ua),
+      ...(params.platform ? { platform: String(params.platform) } : {}),
+      ...(params.acceptLanguage ? { acceptLanguage: String(params.acceptLanguage) } : {}),
+    });
+    await cdp(tab.id, "Network.setUserAgentOverride", { userAgent: String(params.ua) }).catch(() => undefined);
+  }
+  await cdp(tab.id, "Emulation.setTouchEmulationEnabled", { enabled: touch, maxTouchPoints: touch ? 5 : 1 });
+  const entry = attachedTabs.get(tab.id);
+  if (entry) entry.detachAt = Date.now() + EMULATE_ATTACH_KEEPALIVE_MS;
+  emulatedTabs.set(tab.id, { width, height, deviceScaleFactor, mobile, touch, ua: params.ua ? String(params.ua) : null, platform: params.platform ? String(params.platform) : null });
+  return { action: "set", width, height, deviceScaleFactor, mobile, touch, ua: params.ua ? String(params.ua) : null };
+}
+
+// =================== chrome_storage (feat-storage) ===================
+// Cookie / web-storage / IndexedDB read-write plus auth-state detection. Wire action
+// "storage.op" carries kind (cookies|localStorage|sessionStorage|indexedDB) and action
+// (get|set|delete|clear|summary). Every response includes a compact `summary` whose values are
+// always redacted; only `get` returns the raw values (unless redact=true suppresses them).
+async function chromeStorage(params) {
+  const kind = String(params.kind || "cookies");
+  const action = String(params.action || "get");
+  if (kind === "cookies") return cookieStorage(action, params);
+  if (kind === "localStorage" || kind === "sessionStorage") return webStorageOperation(kind, action, params);
+  if (kind === "indexedDB") return indexedDBOperation(action, params);
+  throw new Error(`chrome_storage: unknown kind '${kind}' (use cookies, localStorage, sessionStorage, or indexedDB)`);
+}
+
+// Cookies are browser-global (no tab resolution), so cookie ops never create or touch a tab.
+async function cookieStorage(action, params) {
+  if (!chrome.cookies) throw new Error("chrome_storage: chrome.cookies API unavailable; reload the extension after granting the cookies permission");
+  const filter = {};
+  if (params.url !== undefined) filter.url = String(params.url);
+  if (params.domain !== undefined) filter.domain = String(params.domain);
+  if (params.name !== undefined) filter.name = String(params.name);
+  const all = await chrome.cookies.getAll(filter);
+  const cookieRecord = (c) => ({
+    name: c.name, value: c.value, domain: c.domain, path: c.path,
+    secure: c.secure, httpOnly: c.httpOnly, sameSite: c.sameSite,
+    session: c.session, expirationDate: c.expirationDate, storeId: c.storeId,
+  });
+  if (action === "get") {
+    const cookies = all.map(cookieRecord);
+    return { kind: "cookies", action, cookies, summary: cookieAuthSummary(all) };
+  }
+  if (action === "summary") {
+    return { kind: "cookies", action, summary: cookieAuthSummary(all) };
+  }
+  if (action === "set") {
+    if (params.name === undefined) throw new Error("chrome_storage cookies set requires name");
+    if (params.value === undefined) throw new Error("chrome_storage cookies set requires value");
+    let url = params.url !== undefined ? String(params.url) : null;
+    if (!url && params.domain !== undefined) url = `https://${String(params.domain).replace(/^\./, "")}/`;
+    if (!url) throw new Error("chrome_storage cookies set requires url (or domain)");
+    const details = {
+      url,
+      name: String(params.name),
+      value: String(params.value),
+      path: params.path !== undefined ? String(params.path) : "/",
+      secure: params.secure === true,
+      httpOnly: params.httpOnly === true,
+      sameSite: ["no_restriction", "lax", "strict", "unspecified"].includes(params.sameSite) ? params.sameSite : "unspecified",
+    };
+    if (params.domain !== undefined) details.domain = String(params.domain).replace(/^\./, "");
+    if (params.expirationDate !== undefined) details.expirationDate = Number(params.expirationDate);
+    const c = await chrome.cookies.set(details);
+    if (!c) throw new Error("chrome_storage cookies set was rejected by Chrome");
+    return { kind: "cookies", action, ok: true, cookie: cookieRecord(c) };
+  }
+  if (action === "delete") {
+    if (params.name === undefined) throw new Error("chrome_storage cookies delete requires name");
+    let url = params.url !== undefined ? String(params.url) : null;
+    if (!url && params.domain !== undefined) url = `https://${String(params.domain).replace(/^\./, "")}/`;
+    if (!url) throw new Error("chrome_storage cookies delete requires url (or domain)");
+    const removed = await chrome.cookies.remove({ url, name: String(params.name) });
+    return { kind: "cookies", action, ok: true, removed: removed !== null, name: String(params.name) };
+  }
+  if (action === "clear") {
+    // chrome.cookies.remove matches on URL scheme: secure cookies only remove over https, so
+    // try both schemes for non-secure cookies (feat-storage clear-all).
+    let removed = 0;
+    for (const c of all) {
+      const host = c.domain.replace(/^\./, "");
+      try { const r = await chrome.cookies.remove({ url: `https://${host}${c.path}`, name: c.name }); if (r !== null) removed++; } catch {}
+      if (!c.secure) {
+        try { const r = await chrome.cookies.remove({ url: `http://${host}${c.path}`, name: c.name }); if (r !== null) removed++; } catch {}
+      }
+    }
+    return { kind: "cookies", action, ok: true, removed, matched: all.length, summary: cookieAuthSummary(all) };
+  }
+  throw new Error(`chrome_storage cookies: unsupported action ${action}`);
+}
+
+// Compact auth-state summary: origin list with cookie counts and cookie NAMES only — values are
+// never included here (feat-storage redaction). A domain with session cookies reads as logged-in.
+function cookieAuthSummary(cookies) {
+  const byOrigin = new Map();
+  for (const c of cookies) {
+    const origin = c.domain || "(no domain)";
+    let bucket = byOrigin.get(origin);
+    if (!bucket) { bucket = { origin, cookieCount: 0, sessionCookieCount: 0, names: [] }; byOrigin.set(origin, bucket); }
+    bucket.cookieCount++;
+    if (c.session) bucket.sessionCookieCount++;
+    if (bucket.names.length < 20) bucket.names.push(c.name);
+  }
+  return Array.from(byOrigin.values()).map((b) => ({
+    origin: b.origin,
+    cookieCount: b.cookieCount,
+    sessionCookieCount: b.sessionCookieCount,
+    loggedIn: b.sessionCookieCount > 0,
+    cookieNames: b.names,
+    namesTruncated: b.cookieCount > b.names.length,
+  }));
+}
+
+async function webStorageOperation(kind, action, params) {
+  const store = kind === "sessionStorage" ? "sessionStorage" : "localStorage";
+  const key = params.key !== undefined ? String(params.key) : params.name !== undefined ? String(params.name) : undefined;
+  const redact = params.redact === true;
+  const redactEntry = (e) => ({ key: e.key, value: "[redacted]" });
+  if (action === "get") {
+    if (key !== undefined) {
+      const value = await executeInTab(params, piWebStorageGet, [store, key]);
+      const entry = redact ? redactEntry(value) : { key: value.key, value: value.value };
+      return {
+        kind, action, origin: value.origin, entry,
+        summary: { origin: value.origin, keyCount: 1, keys: [value.key] },
+      };
+    }
+    const list = await executeInTab(params, piWebStorageList, [store]);
+    const entries = redact ? list.entries.map(redactEntry) : list.entries;
+    return {
+      kind, action, origin: list.origin, entryCount: entries.length, entries,
+      summary: { origin: list.origin, keyCount: entries.length, keys: list.entries.map((e) => e.key) },
+    };
+  }
+  if (action === "set") {
+    if (key === undefined) throw new Error(`chrome_storage ${kind} set requires key`);
+    if (params.value === undefined) throw new Error(`chrome_storage ${kind} set requires value`);
+    const out = await executeInTab(params, piWebStorageSet, [store, key, params.value]);
+    return { kind, action, ok: true, origin: out.origin, key, summary: { origin: out.origin, keyCount: 1, keys: [key] } };
+  }
+  if (action === "delete") {
+    if (key === undefined) throw new Error(`chrome_storage ${kind} delete requires key`);
+    const out = await executeInTab(params, piWebStorageDelete, [store, key]);
+    return { kind, action, ok: true, origin: out.origin, key, existed: out.existed, summary: { origin: out.origin, keyCount: 1, keys: [key] } };
+  }
+  if (action === "clear") {
+    const out = await executeInTab(params, piWebStorageClear, [store]);
+    return { kind, action, ok: true, origin: out.origin, cleared: out.cleared, summary: { origin: out.origin, keyCount: 0, keys: [] } };
+  }
+  if (action === "summary") {
+    const list = await executeInTab(params, piWebStorageList, [store]);
+    return { kind, action, summary: { origin: list.origin, keyCount: list.entries.length, keys: list.entries.map((e) => e.key) } };
+  }
+  throw new Error(`chrome_storage ${kind}: unsupported action ${action}`);
+}
+
+// IndexedDB via CDP IndexedDB.enable / requestDatabaseNames / requestDatabase / requestData,
+// plus deleteDatabase for clear. Per-record set/delete is intentionally not exposed — CDP
+// writes through object stores are not ergonomic; page.evaluate with a real transaction is.
+async function indexedDBOperation(action, params) {
+  const tab = await getTabByParams(params);
+  if (params.foreground) await bringToFront(tab);
+  await attachDebugger(tab.id);
+  const originRes = await cdpEval(tab.id, "location.origin");
+  if (originRes.exceptionDetails) {
+    throw new Error(`chrome_storage IndexedDB: cannot read page origin: ${cdpExceptionText(originRes.exceptionDetails) || "unknown error"}`);
+  }
+  const securityOrigin = originRes.result?.value ? String(originRes.result.value) : String(tab.url || "");
+  if (!securityOrigin) throw new Error("chrome_storage IndexedDB: could not determine the tab origin");
+  await cdp(tab.id, "IndexedDB.enable").catch(() => undefined);
+  if (action === "summary" || (action === "get" && params.database === undefined)) {
+    const namesRes = await cdp(tab.id, "IndexedDB.requestDatabaseNames", { securityOrigin });
+    const databaseNames = Array.isArray(namesRes?.databaseNames) ? namesRes.databaseNames : [];
+    return { kind: "indexedDB", action, origin: securityOrigin, databases: databaseNames.map((name) => ({ name })), summary: { origin: securityOrigin, databases: databaseNames } };
+  }
+  if (action === "get") {
+    const databaseName = String(params.database);
+    const dbRes = await cdp(tab.id, "IndexedDB.requestDatabase", { securityOrigin, databaseName });
+    const db = dbRes?.databaseWithObjectStores;
+    const stores = Array.isArray(db?.objectStores) ? db.objectStores.map((s) => ({
+      name: s.name, keyPath: s.keyPath ?? null, autoIncrement: s.autoIncrement === true,
+      indexCount: Array.isArray(s.indexes) ? s.indexes.length : 0,
+    })) : [];
+    if (params.objectStore === undefined) {
+      return { kind: "indexedDB", action, origin: securityOrigin, database: databaseName, stores, summary: { origin: securityOrigin, databases: [databaseName] } };
+    }
+    const objectStoreName = String(params.objectStore);
+    const pageSize = Math.max(1, Math.min(200, Number(params.limit) || 50));
+    const dataRes = await cdp(tab.id, "IndexedDB.requestData", {
+      securityOrigin, databaseName, objectStoreName, indexName: "", skipCount: 0, pageSize,
+    });
+    const rawEntries = Array.isArray(dataRes?.objectStoreDataEntries) ? dataRes.objectStoreDataEntries : [];
+    const entries = rawEntries.map((e) => ({
+      key: cdpRemoteValue(e?.key), primaryKey: cdpRemoteValue(e?.primaryKey), value: cdpRemoteValue(e?.value),
+    }));
+    return { kind: "indexedDB", action, origin: securityOrigin, database: databaseName, objectStore: objectStoreName, entryCount: entries.length, entries, summary: { origin: securityOrigin, databases: [databaseName], objectStore: objectStoreName, entryCount: entries.length } };
+  }
+  if (action === "clear") {
+    if (params.database === undefined) throw new Error("chrome_storage IndexedDB clear requires database (deletes the whole database)");
+    const databaseName = String(params.database);
+    await cdp(tab.id, "IndexedDB.deleteDatabase", { securityOrigin, databaseName });
+    return { kind: "indexedDB", action, ok: true, origin: securityOrigin, deletedDatabase: databaseName };
+  }
+  if (action === "set" || action === "delete") {
+    throw new Error("chrome_storage IndexedDB does not support per-record set/delete via CDP; use chrome_evaluate with an IndexedDB transaction to modify records");
+  }
+  throw new Error(`chrome_storage IndexedDB: unsupported action ${action}`);
+}
+
+// Convert a CDP RemoteObject into a JSON-safe value for IndexedDB reads: primitives carry
+// `.value`; objects come back as a bounded preview summary instead of raw descriptors.
+function cdpRemoteValue(obj) {
+  if (!obj || typeof obj !== "object") return obj ?? null;
+  if (obj.value !== undefined) return obj.value;
+  if (obj.preview && typeof obj.preview === "object") {
+    const props = Array.isArray(obj.preview.properties) ? obj.preview.properties : [];
+    const parts = props.slice(0, 8).map((p) => `${p.name}:${p.value !== undefined ? p.value : p.type || "?"}`);
+    if (props.length > 8 || obj.preview.overflow) parts.push("…");
+    return `[${obj.preview.type || obj.type || "object"}${parts.length ? " " + parts.join(", ") : ""}]`;
+  }
+  return obj.description ?? obj.type ?? null;
+}
+
+// =================== chrome_perf_metrics (feat-perf-metrics) ===================
+// One-shot CDP Performance metrics from the attached tab. Performance.enable restarts metric
+// collection, then getMetrics snapshots counters (task duration, JS heap, layout/node counts).
+// Cheap by design: no persistent-attach change, no tracing (a later chrome_trace stages that).
+async function chromePerfMetrics(params) {
+  const tab = await getTabByParams(params);
+  if (params.foreground) await bringToFront(tab);
+  await attachDebugger(tab.id);
+  await cdp(tab.id, "Performance.enable").catch(() => undefined);
+  const res = await cdp(tab.id, "Performance.getMetrics");
+  const metrics = Array.isArray(res?.metrics)
+    ? res.metrics.map((m) => ({ name: m.name, value: m.value }))
+    : [];
+  return { metrics, tab: await formatTab(tab) };
 }
 
 function normalizeKey(key) {

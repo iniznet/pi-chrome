@@ -122,6 +122,10 @@ async function run() {
   ok((await evaluateInTab({ expression: "void 0" })) === undefined, "evaluate: undefined marker -> undefined");
   ok((await evaluateInTab({ expression: "10n" })) === "10", "evaluate: bigint marker -> string");
   ok(/^\[Function:/.test(await evaluateInTab({ expression: "(function foo(){})" })), "evaluate: function marker");
+  // symbol marker (advertised in the header, was never asserted)
+  ok((await evaluateInTab({ expression: "Symbol('symA')" })) === "[Symbol: symA]", "evaluate: symbol marker -> [Symbol: desc]");
+  // Error value marker: the wrapper must throw the unwrapped Error (message + name preserved)
+  await throwsWith(() => evaluateInTab({ expression: "new Error('marker-boom')" }), /marker-boom/, "evaluate: Error value marker propagates");
   ok((await evaluateInTab({ expression: "Promise.resolve(42)" })) === 42, "evaluate: promise is awaited");
 
   // DOMRect-like (toJSON + width/height/top) is expanded, not flattened to {}
@@ -166,22 +170,95 @@ async function run() {
 
   // ===== usKeyLayoutForChar / cdpKeyInfo: US-layout key codes =====
   // Regression: punctuation must NOT use charCodeAt() (".":46 collides with VK_DELETE,
-  // "-":45 with VK_INSERT), which made apps drop the char on keydown.
+  // "-":45 with VK_INSERT), which made apps drop the char on keydown. This is now a
+  // table-driven spec over every ASCII printable so the layout tables and the type path's
+  // duplicated shift predicate cannot silently diverge again.
   const { usKeyLayoutForChar, cdpKeyInfo } = sandbox;
+
+  // Independent US-layout spec, written as literals (not derived from the worker) so a
+  // change to the tables in service_worker.js must be consciously mirrored here.
+  const SHIFT_DIGIT_SPEC = { ")": "0", "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7", "*": "8", "(": "9" };
+  const PUNCT_SPEC = {
+    "`": { code: "Backquote", keyCode: 192 }, "~": { code: "Backquote", keyCode: 192, needShift: true },
+    "-": { code: "Minus", keyCode: 189 }, "_": { code: "Minus", keyCode: 189, needShift: true },
+    "=": { code: "Equal", keyCode: 187 }, "+": { code: "Equal", keyCode: 187, needShift: true },
+    "[": { code: "BracketLeft", keyCode: 219 }, "{": { code: "BracketLeft", keyCode: 219, needShift: true },
+    "]": { code: "BracketRight", keyCode: 221 }, "}": { code: "BracketRight", keyCode: 221, needShift: true },
+    "\\": { code: "Backslash", keyCode: 220 }, "|": { code: "Backslash", keyCode: 220, needShift: true },
+    ";": { code: "Semicolon", keyCode: 186 }, ":": { code: "Semicolon", keyCode: 186, needShift: true },
+    "'": { code: "Quote", keyCode: 222 }, "\"": { code: "Quote", keyCode: 222, needShift: true },
+    ",": { code: "Comma", keyCode: 188 }, "<": { code: "Comma", keyCode: 188, needShift: true },
+    ".": { code: "Period", keyCode: 190 }, ">": { code: "Period", keyCode: 190, needShift: true },
+    "/": { code: "Slash", keyCode: 191 }, "?": { code: "Slash", keyCode: 191, needShift: true },
+    " ": { code: "Space", keyCode: 32 },
+  };
+  // The type path duplicates the shift decision as /^[A-Z]$/ || "~!@#$%^&*()_+{}|:\"<>?".includes(ch)
+  // in both cdpTypeChar and the DOM-event typeCharacter fallback. Pin it here so the
+  // duplication cannot silently diverge from the layout tables again.
+  const typePathNeedsShift = (ch) => /^[A-Z]$/.test(ch) || "~!@#$%^&*()_+{}|:\"<>?".includes(ch);
+  const expectedLayout = (ch) => {
+    if (/^[a-z]$/.test(ch)) return { code: `Key${ch.toUpperCase()}`, keyCode: ch.toUpperCase().charCodeAt(0), needShift: false };
+    if (/^[A-Z]$/.test(ch)) return { code: `Key${ch}`, keyCode: ch.charCodeAt(0), needShift: true };
+    if (/^[0-9]$/.test(ch)) return { code: `Digit${ch}`, keyCode: ch.charCodeAt(0), needShift: false };
+    if (SHIFT_DIGIT_SPEC[ch]) { const d = SHIFT_DIGIT_SPEC[ch]; return { code: `Digit${d}`, keyCode: d.charCodeAt(0), needShift: true }; }
+    const p = PUNCT_SPEC[ch];
+    if (p) return { code: p.code, keyCode: p.keyCode, needShift: !!p.needShift };
+    throw new Error(`no expected layout for ${JSON.stringify(ch)}`);
+  };
+  let layoutBad = 0;
+  for (let i = 0x20; i <= 0x7e; i++) {
+    const ch = String.fromCharCode(i);
+    const exp = expectedLayout(ch);
+    const got = usKeyLayoutForChar(ch);
+    if (got.code !== exp.code || got.keyCode !== exp.keyCode || got.needShift !== exp.needShift) {
+      layoutBad++;
+      ok(false, `keylayout: ${JSON.stringify(ch)} -> ${JSON.stringify(got)} expected ${JSON.stringify(exp)}`);
+    }
+  }
+  ok(layoutBad === 0, "keylayout: all 95 ASCII printables resolve per US-layout spec");
+  // Pin the historical charCodeAt() collisions explicitly so a regression is obvious.
   const period = usKeyLayoutForChar(".");
-  ok(period.code === "Period" && period.keyCode === 190 && !period.needShift, "keylayout: '.' -> Period/190 (not 46)");
+  ok(period.code === "Period" && period.keyCode === 190 && !period.needShift, "keylayout: '.' -> Period/190 (not 46/VK_DELETE)");
   const dash = usKeyLayoutForChar("-");
-  ok(dash.code === "Minus" && dash.keyCode === 189, "keylayout: '-' -> Minus/189 (not 45)");
+  ok(dash.code === "Minus" && dash.keyCode === 189 && !dash.needShift, "keylayout: '-' -> Minus/189 (not 45/VK_INSERT)");
   const slash = usKeyLayoutForChar("/");
-  ok(slash.code === "Slash" && slash.keyCode === 191, "keylayout: '/' -> Slash/191");
-  const at = usKeyLayoutForChar("@");
-  ok(at.code === "Digit2" && at.keyCode === 50 && at.needShift, "keylayout: '@' -> Digit2/50 + shift");
-  const A = usKeyLayoutForChar("A");
-  ok(A.code === "KeyA" && A.keyCode === 65 && A.needShift, "keylayout: 'A' -> KeyA/65 + shift");
-  const a = usKeyLayoutForChar("a");
-  ok(a.code === "KeyA" && a.keyCode === 65 && !a.needShift, "keylayout: 'a' -> KeyA/65 no shift");
-  const dot = cdpKeyInfo(".");
-  ok(dot.code === "Period" && dot.windowsVirtualKeyCode === 190 && dot.text === ".", "cdpKeyInfo: '.' -> Period/190 with text");
+  ok(slash.code === "Slash" && slash.keyCode === 191 && !slash.needShift, "keylayout: '/' -> Slash/191");
+  // Shifted digit symbols must land on their digit's physical key (code/keyCode) with shift.
+  let shiftDigitBad = 0;
+  for (const sym of Object.keys(SHIFT_DIGIT_SPEC)) {
+    const exp = expectedLayout(sym);
+    const got = usKeyLayoutForChar(sym);
+    if (got.code !== exp.code || got.keyCode !== exp.keyCode || got.needShift !== true) {
+      shiftDigitBad++;
+      ok(false, `keylayout: shift-digit ${JSON.stringify(sym)} -> ${JSON.stringify(got)} expected ${exp.code}/${exp.keyCode}+shift`);
+    }
+  }
+  ok(shiftDigitBad === 0, `keylayout: every SHIFT_DIGIT symbol (${Object.keys(SHIFT_DIGIT_SPEC).length}) maps to its digit key + shift`);
+  // The type path's duplicated shift predicate must agree with the layout tables for every char.
+  let shiftAgreeBad = 0;
+  for (let i = 0x20; i <= 0x7e; i++) {
+    const ch = String.fromCharCode(i);
+    if (typePathNeedsShift(ch) !== usKeyLayoutForChar(ch).needShift) {
+      shiftAgreeBad++;
+      ok(false, `keylayout: type-path shift predicate disagrees with layout for ${JSON.stringify(ch)}`);
+    }
+  }
+  ok(shiftAgreeBad === 0, "keylayout: type-path shift predicate agrees with layout tables for all ASCII printables");
+  // Unknown (non-ASCII) chars must fall back to text-driven insertion, not a bogus keyCode.
+  const unicode = usKeyLayoutForChar("é");
+  ok(unicode.code === "é" && unicode.keyCode === 0 && !unicode.needShift, "keylayout: non-ASCII char falls back to text-driven (keyCode 0)");
+  // cdpKeyInfo must delegate single chars to the same layout and keep named keys untouched.
+  let cdpInfoBad = 0;
+  for (let i = 0x20; i <= 0x7e; i++) {
+    const ch = String.fromCharCode(i);
+    const info = cdpKeyInfo(ch);
+    const layout = usKeyLayoutForChar(ch);
+    if (info.code !== layout.code || info.windowsVirtualKeyCode !== layout.keyCode || info.text !== ch) {
+      cdpInfoBad++;
+      ok(false, `cdpKeyInfo: ${JSON.stringify(ch)} -> ${JSON.stringify(info)} expected code ${layout.code} vk ${layout.keyCode} text ${JSON.stringify(ch)}`);
+    }
+  }
+  ok(cdpInfoBad === 0, "cdpKeyInfo: all ASCII printables keep code/vk/text consistent with the layout");
   const ent = cdpKeyInfo("Enter");
   ok(ent.code === "Enter" && ent.windowsVirtualKeyCode === 13, "cdpKeyInfo: named key 'Enter' unaffected");
 

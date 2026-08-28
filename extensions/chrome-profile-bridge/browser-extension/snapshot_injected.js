@@ -103,14 +103,15 @@
     return candidates;
   }
 
+  // Pure visibility predicate: an element is "visible" when it is rendered and has
+  // non-zero size, regardless of whether it is currently inside the viewport. Below-fold
+  // content must stay samplable or the agent is forced into blind scroll+re-snapshot loops.
   function isElementVisible(element) {
     if (!element || !element.getBoundingClientRect) return false;
     const style = getComputedStyle(element);
     if (style.visibility === "hidden" || style.display === "none") return false;
     const rect = element.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return false;
-    if (rect.bottom < 0 || rect.right < 0) return false;
-    if (rect.top > innerHeight || rect.left > innerWidth) return false;
     return true;
   }
 
@@ -149,17 +150,24 @@
     return (element?.innerText || element?.textContent || "").replace(/\s+/g, " ").trim().slice(0, max || 500);
   }
 
+  function rootOf(element) {
+    return element && typeof element.getRootNode === "function" ? element.getRootNode() : document;
+  }
+
   function accessibleLabel(element) {
     if (!element) return "";
+    // aria-labelledby and label[for] references only resolve within the element's own
+    // shadow root (when it lives in one); document-scoped lookups are shadow-blind.
+    const root = rootOf(element);
     const labelledBy = element.getAttribute("aria-labelledby");
     if (labelledBy) {
-      const text = labelledBy.split(/\s+/).map((id) => document.getElementById(id)?.innerText || "").join(" ").trim();
+      const text = labelledBy.split(/\s+/).map((id) => (root.getElementById ? root.getElementById(id) : document.getElementById(id))?.innerText || "").join(" ").trim();
       if (text) return text;
     }
     const id = element.id;
     if (id) {
       try {
-        const label = document.querySelector(`label[for="${cssEscape(id)}"]`);
+        const label = root.querySelector ? root.querySelector(`label[for="${cssEscape(id)}"]`) : document.querySelector(`label[for="${cssEscape(id)}"]`);
         if (label?.innerText) return label.innerText;
       } catch {}
     }
@@ -318,34 +326,57 @@
   }
 
   function selectorFor(element) {
-    const unique = (selector) => {
-      try { return document.querySelectorAll(selector).length === 1; } catch { return false; }
+    const scopedUnique = (root, selector) => {
+      try { return root.querySelectorAll(selector).length === 1; } catch { return false; }
     };
-    if (element.id && unique("#" + cssEscape(element.id))) return "#" + cssEscape(element.id);
-    const attr = ["aria-label", "name", "placeholder", "data-testid", "role"].find((name) => element.getAttribute(name));
-    if (attr) {
-      const candidate = element.tagName.toLowerCase() + "[" + attr + "=" + JSON.stringify(element.getAttribute(attr)) + "]";
-      if (unique(candidate)) return candidate;
-    }
-    const parts = [];
+    // Uniqueness is resolved inside `root` (the element's own shadow root or the document)
+    // because document.querySelectorAll cannot pierce shadow boundaries.
+    const innerSelectorFor = (el, root) => {
+      if (el.id && scopedUnique(root, "#" + cssEscape(el.id))) return "#" + cssEscape(el.id);
+      const attr = ["aria-label", "name", "placeholder", "data-testid", "role"].find((name) => el.getAttribute(name));
+      if (attr) {
+        const candidate = el.tagName.toLowerCase() + "[" + attr + "=" + JSON.stringify(el.getAttribute(attr)) + "]";
+        if (scopedUnique(root, candidate)) return candidate;
+      }
+      const parts = [];
+      let current = el;
+      while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 5) {
+        let part = current.tagName.toLowerCase();
+        if (current.classList.length > 0) part += "." + Array.from(current.classList).slice(0, 2).map(cssEscape).join(".");
+        const siblings = Array.from(current.parentElement?.children ?? []).filter((sibling) => sibling.tagName === current.tagName);
+        if (siblings.length > 1) part += ":nth-of-type(" + (siblings.indexOf(current) + 1) + ")";
+        parts.unshift(part);
+        const candidate = parts.join(" > ");
+        if (scopedUnique(root, candidate)) return candidate;
+        current = current.parentElement;
+      }
+      return parts.join(" > ");
+    };
+
+    // Shadow-DOM elements cannot be addressed by a document-scoped CSS selector. Walk up
+    // through every shadow boundary and emit a host-prefixed path ("host >>> inner") that
+    // marks the selector as shadow-scoped; consumers must resolve such targets by uid.
+    const chain = [];
     let current = element;
-    while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 5) {
-      let part = current.tagName.toLowerCase();
-      if (current.classList.length > 0) part += "." + Array.from(current.classList).slice(0, 2).map(cssEscape).join(".");
-      const siblings = Array.from(current.parentElement?.children ?? []).filter((sibling) => sibling.tagName === current.tagName);
-      if (siblings.length > 1) part += ":nth-of-type(" + (siblings.indexOf(current) + 1) + ")";
-      parts.unshift(part);
-      const candidate = parts.join(" > ");
-      if (unique(candidate)) return candidate;
-      current = current.parentElement;
+    let depth = 0;
+    while (current && current.nodeType === Node.ELEMENT_NODE && depth++ < 8) {
+      const root = rootOf(current);
+      if (root && root.nodeType === Node.DOCUMENT_FRAGMENT_NODE && root.host) {
+        chain.unshift(innerSelectorFor(current, root));
+        current = root.host;
+      } else {
+        chain.unshift(innerSelectorFor(current, document));
+        break;
+      }
     }
-    return parts.join(" > ");
+    return chain.join(" >>> ");
   }
 
   function directHeadingText(element) {
+    const root = rootOf(element);
     const labelledBy = element.getAttribute?.("aria-labelledby");
     if (labelledBy) {
-      const text = labelledBy.split(/\s+/).map((id) => document.getElementById(id)?.innerText || "").join(" ").replace(/\s+/g, " ").trim();
+      const text = labelledBy.split(/\s+/).map((id) => (root.getElementById ? root.getElementById(id) : document.getElementById(id))?.innerText || "").join(" ").replace(/\s+/g, " ").trim();
       if (text) return text.slice(0, 180);
     }
     const aria = element.getAttribute?.("aria-label");
@@ -409,8 +440,8 @@
     return context;
   }
 
-  function summarizeElement(element, index) {
-    const rect = element.getBoundingClientRect();
+  function summarizeElement(element, index, measured) {
+    const rect = measured && measured.rect ? measured.rect : element.getBoundingClientRect();
     const style = getComputedStyle(element);
     const cx = rect.left + rect.width / 2;
     const cy = rect.top + rect.height / 2;
@@ -421,6 +452,8 @@
     const sensitive = isSensitiveField(element);
     const value = rawValue && !sensitive ? rawValue.slice(0, 120) : undefined;
     const checked = "checked" in element ? Boolean(element.checked) : undefined;
+    const root = rootOf(element);
+    const inShadowRoot = root && root.nodeType === Node.DOCUMENT_FRAGMENT_NODE && root.host ? true : false;
     return {
       index,
       uid: rememberElement(element),
@@ -441,28 +474,55 @@
       occluded: occluded || undefined,
       context: contextForElement(element),
       rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+      inViewport: rect.bottom >= 0 && rect.right >= 0 && rect.top <= innerHeight && rect.left <= innerWidth,
+      shadowPath: inShadowRoot ? true : undefined,
     };
   }
 
-  function isInViewport(element) {
+  // Single layout pass per element: visibility + viewport membership + rect together,
+  // so capped collections can prioritize on-screen content without re-reading layout.
+  function measureElement(element) {
+    const style = getComputedStyle(element);
     const rect = element.getBoundingClientRect();
-    return rect.bottom >= 0 && rect.right >= 0 && rect.top <= innerHeight && rect.left <= innerWidth;
+    const visible = style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+    const inViewport = rect.bottom >= 0 && rect.right >= 0 && rect.top <= innerHeight && rect.left <= innerWidth;
+    return { el: element, rect, style, visible, inViewport };
+  }
+
+  // Visible elements ordered in-viewport-first (then by top/left), capped at `limit`.
+  // Below-fold elements are still sampled afterwards so long pages do not hide content;
+  // the cap keeps every caller bounded.
+  function visibleElementsInOrder(selector, limit) {
+    const inView = [];
+    const offView = [];
+    for (const el of Array.from(document.querySelectorAll(selector))) {
+      const measured = measureElement(el);
+      if (!measured.visible) continue;
+      (measured.inViewport ? inView : offView).push(measured);
+    }
+    const byPosition = (a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left;
+    inView.sort(byPosition);
+    offView.sort(byPosition);
+    const ordered = [];
+    for (const bucket of [inView, offView]) {
+      for (const measured of bucket) {
+        if (ordered.length >= limit) break;
+        ordered.push(measured.el);
+      }
+    }
+    return ordered;
   }
 
   function formSummaries() {
-    const fields = Array.from(document.querySelectorAll('input, textarea, select, [contenteditable="true"]'))
-      .filter(isElementVisible)
-      .slice(0, 80)
+    const fields = visibleElementsInOrder('input, textarea, select, [contenteditable="true"]', 80)
       .map((element, index) => ({
         ...summarizeElement(element, index),
         required: Boolean(element.required || element.getAttribute("aria-required") === "true"),
         invalid: Boolean(element.matches?.(":invalid") || element.getAttribute("aria-invalid") === "true"),
         autocomplete: element.getAttribute("autocomplete") || undefined,
       }));
-    const submits = Array.from(document.querySelectorAll('button, input[type="submit"], [role="button"]'))
-      .filter(isElementVisible)
+    const submits = visibleElementsInOrder('button, input[type="submit"], [role="button"]', 30)
       .filter((element) => /submit|save|continue|next|send|sign in|log in|create|update|done/i.test(accessibleLabel(element) + " " + (element.getAttribute("type") || "")))
-      .slice(0, 30)
       .map((element, index) => summarizeElement(element, index));
     return { fields, submits };
   }
@@ -479,7 +539,7 @@
     ];
     const regions = [];
     for (const [kind, selector] of landmarkSelectors) {
-      for (const element of Array.from(document.querySelectorAll(selector)).filter(isElementVisible).slice(0, 12)) {
+      for (const element of visibleElementsInOrder(selector, 12)) {
         const headings = Array.from(element.querySelectorAll("h1,h2,h3,[role='heading']")).filter(isElementVisible).slice(0, 6).map((h) => textOf(h, 120));
         const actions = Array.from(element.querySelectorAll('a, button, input, textarea, select, [role="button"], [role="link"], [tabindex]:not([tabindex="-1"])')).filter(isElementVisible).slice(0, 8).map((a) => {
           const summary = summarizeElement(a, 0);
@@ -557,7 +617,7 @@
       if (score > 0) candidates.push({ score, kind: "element", ...element });
     }
     const textNodes = [];
-    for (const block of Array.from(document.querySelectorAll("h1,h2,h3,h4,p,li,td,th,label,summary,[role='alert']")).filter(isElementVisible).slice(0, 300)) {
+    for (const block of visibleElementsInOrder("h1,h2,h3,h4,p,li,td,th,label,summary,[role='alert']", 300)) {
       const text = textOf(block, 300);
       const score = tokenScore(text, query);
       if (score > 0) textNodes.push({ score, kind: "text", uid: rememberElement(block), tag: block.tagName.toLowerCase(), role: roleOf(block), text, rect: rectSummary(block) });
@@ -624,16 +684,17 @@
 
   function visibleTextSnippets(maxChars) {
     const snippets = [];
-    const blocks = Array.from(document.querySelectorAll("h1,h2,h3,h4,p,li,td,th,label,summary,[role='alert']")).filter(isElementVisible);
+    // In-viewport blocks first (then by position), with below-fold blocks filling the
+    // remaining budget so long pages do not hide their text from the agent.
+    const blocks = visibleElementsInOrder("h1,h2,h3,h4,p,li,td,th,label,summary,[role='alert']");
     let used = 0;
     for (const block of blocks) {
-      if (!isInViewport(block) && snippets.length > 12) continue;
+      if (used >= maxChars || snippets.length >= 40) break;
       const text = textOf(block, 500);
       if (!text || snippets.some((s) => s.text === text)) continue;
       const next = { uid: rememberElement(block), tag: block.tagName.toLowerCase(), text, rect: rectSummary(block) };
       snippets.push(next);
       used += text.length;
-      if (used >= maxChars || snippets.length >= 40) break;
     }
     return snippets;
   }
@@ -651,40 +712,66 @@
       const wanted = String(roleFilter).toLowerCase();
       candidates = candidates.filter((element) => roleOf(element) === wanted || element.tagName.toLowerCase() === wanted);
     }
+
+    // One layout pass per candidate (rect + visibility + viewport membership), then sort
+    // the cached records — avoids forced-layout reads inside the sort comparator.
+    const measured = [];
+    for (const element of candidates) {
+      if (!element || !element.getBoundingClientRect) continue;
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      measured.push({
+        el: element,
+        rect,
+        visible: style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0,
+        inViewport: rect.bottom >= 0 && rect.right >= 0 && rect.top <= innerHeight && rect.left <= innerWidth,
+      });
+    }
+    const visibleRecords = measured.filter((record) => record.visible);
     let near;
     if (nearUid) near = getPiChromeState().elements[nearUid];
     if (near) {
       const nearRect = near.getBoundingClientRect();
       const cx = nearRect.left + nearRect.width / 2;
       const cy = nearRect.top + nearRect.height / 2;
-      candidates.sort((a, b) => {
-        const ra = a.getBoundingClientRect();
-        const rb = b.getBoundingClientRect();
+      visibleRecords.sort((a, b) => {
+        const ra = a.rect;
+        const rb = b.rect;
         const da = Math.hypot(ra.left + ra.width / 2 - cx, ra.top + ra.height / 2 - cy);
         const db = Math.hypot(rb.left + rb.width / 2 - cx, rb.top + rb.height / 2 - cy);
         return da - db;
       });
     } else {
-      candidates.sort((a, b) => {
-        const ar = a.getBoundingClientRect();
-        const br = b.getBoundingClientRect();
-        const avis = isInViewport(a) ? 0 : 1;
-        const bvis = isInViewport(b) ? 0 : 1;
-        return avis - bvis || ar.top - br.top || ar.left - br.left;
-      });
+      visibleRecords.sort((a, b) => (a.inViewport === b.inViewport ? a.rect.top - b.rect.top || a.rect.left - b.rect.left : a.inViewport ? -1 : 1));
     }
-    const visibleCandidates = candidates.filter(isElementVisible);
-    const elements = visibleCandidates.slice(0, maxElements).map((element, index) => summarizeElement(element, index));
+    const elements = visibleRecords.slice(0, maxElements).map((record, index) => summarizeElement(record.el, index, record));
     const queryElements = query
-      ? visibleCandidates.slice(0, Math.max(maxElements, 500)).map((element, index) => summarizeElement(element, index))
+      ? visibleRecords.slice(0, Math.max(maxElements, 500)).map((record, index) => summarizeElement(record.el, index, record))
       : elements;
-    const map = pageMap();
-    const forms = formSummaries();
-    const layout = layoutSections(elements, forms);
+
+    // Mode-specific element set; summary counters below stay consistent with what is returned.
+    let finalElements = elements;
+    if (mode === "forms") finalElements = elements.filter((el) => ["textbox", "checkbox", "radio", "combobox", "button"].includes(el.role));
+    else if (mode === "pageMap" || mode === "text") finalElements = elements.slice(0, 20);
+
+    // Compute heavy payloads lazily: only what the requested mode actually keeps. pageMap
+    // is additionally needed for queryMatches region candidates whenever a query is set.
+    const needMap = ["auto", "forms", "pageMap", "text", "full"].includes(mode) || Boolean(query);
+    const needText = ["auto", "text", "full"].includes(mode);
+    const needForms = mode !== "changes";
+    const map = needMap ? pageMap() : undefined;
+    const forms = needForms ? formSummaries() : undefined;
+    const layout = mode === "changes" ? undefined : layoutSections(elements, forms);
     const focused = activeElementSummary();
     const modal = modalSummary();
-    const bodyText = document.body ? document.body.innerText.replace(/\s+\n/g, "\n").trim() : "";
+    const bodyText = needText && document.body ? document.body.innerText.replace(/\s+\n/g, "\n").trim() : "";
     const text = bodyText.slice(0, fullTextLimit);
+    const inViewportCount = finalElements.filter((el) => el.inViewport).length;
+    // The preview keeps innerText semantics in modes that already read it; modes that skip
+    // the big innerText pass fall back to textContent so no full-document layout is forced.
+    const visibleText = needText
+      ? textOf(document.body, 500)
+      : (document.body ? (document.body.textContent || "").replace(/\s+/g, " ").trim().slice(0, 500) : "");
     const snapshot = {
       title: document.title,
       url: location.href,
@@ -692,62 +779,44 @@
       query: query || undefined,
       viewport: { width: innerWidth, height: innerHeight, scrollX, scrollY },
       summary: {
-        visibleText: textOf(document.body, 500),
-        visibleInteractiveCount: elements.filter((el) => el.rect.y >= 0 && el.rect.y <= innerHeight).length,
-        totalInteractiveSampled: elements.length,
-        totalInteractiveVisible: visibleCandidates.length,
+        visibleText,
+        visibleInteractiveCount: inViewportCount,
+        totalInteractiveSampled: finalElements.length,
+        totalInteractiveVisible: visibleRecords.length,
+        offViewportSampled: finalElements.length - inViewportCount,
+        offViewportTotal: visibleRecords.filter((record) => !record.inViewport).length,
         focused: focused ? { uid: focused.uid, role: focused.role, label: focused.label } : undefined,
         modal: modal ? { uid: modal.uid, label: modal.label } : undefined,
         hints: [],
       },
       focused: focused || undefined,
       modal: modal || undefined,
-      text,
-      textTruncated: bodyText.length > text.length,
-      textSnippets: visibleTextSnippets(mode === "text" ? 12000 : 3000),
-      elements,
-      forms,
-      layout,
-      pageMap: map,
       matches: queryMatches(query, queryElements, map),
       filter: { containingText: containingText || undefined, roleFilter: roleFilter || undefined, nearUid: nearUid || undefined },
     };
+    if (mode !== "changes") snapshot.elements = finalElements;
+    if (needForms) snapshot.forms = forms;
+    if (mode !== "changes") snapshot.layout = layout;
+    if (needText) {
+      snapshot.text = text;
+      snapshot.textTruncated = bodyText.length > text.length;
+      snapshot.textSnippets = visibleTextSnippets(mode === "text" ? 12000 : 3000);
+    }
+    if (["auto", "forms", "pageMap", "text", "full"].includes(mode)) snapshot.pageMap = map;
+
     if (snapshot.modal) snapshot.summary.hints.push("A modal/dialog is visible; interact with it before the underlying page.");
-    const disabledImportant = elements.find((el) => el.disabled && /submit|save|merge|continue|next|send|approve|login|sign in/i.test(el.label || ""));
+    const disabledImportant = finalElements.find((el) => el.disabled && /submit|save|merge|continue|next|send|approve|login|sign in/i.test(el.label || ""));
     if (disabledImportant) snapshot.summary.hints.push(`${disabledImportant.uid} '${disabledImportant.label}' is disabled.`);
-    const occluded = elements.find((el) => el.occluded);
+    const occluded = finalElements.find((el) => el.occluded);
     if (occluded) snapshot.summary.hints.push(`${occluded.uid} '${occluded.label || occluded.role}' appears occluded by ${occluded.occluded.tag}.`);
+    if (snapshot.summary.offViewportSampled > 0) {
+      snapshot.summary.hints.push(`${snapshot.summary.offViewportSampled} sampled element(s) below the fold (${snapshot.summary.offViewportTotal} total); scroll and re-snapshot to inspect further content.`);
+    }
 
     const state = getPiChromeState();
     const currentDigest = digestFor(snapshot);
     snapshot.diff = diffSnapshot(state.lastSnapshotDigest, currentDigest);
     state.lastSnapshotDigest = currentDigest;
-
-    if (mode === "interactive") {
-      delete snapshot.text;
-      delete snapshot.textSnippets;
-      delete snapshot.pageMap;
-    } else if (mode === "forms") {
-      delete snapshot.text;
-      delete snapshot.textSnippets;
-      snapshot.elements = elements.filter((el) => ["textbox", "checkbox", "radio", "combobox", "button"].includes(el.role));
-    } else if (mode === "pageMap") {
-      delete snapshot.text;
-      delete snapshot.textSnippets;
-      snapshot.elements = elements.slice(0, 20);
-    } else if (mode === "changes") {
-      delete snapshot.text;
-      delete snapshot.textSnippets;
-      delete snapshot.elements;
-      delete snapshot.forms;
-      delete snapshot.layout;
-      delete snapshot.pageMap;
-    } else if (mode === "text") {
-      snapshot.elements = elements.slice(0, 20);
-    } else if (mode !== "full") {
-      snapshot.elements = elements.slice(0, Math.min(maxElements, 40));
-      snapshot.text = text.slice(0, Math.min(text.length, 6000));
-    }
     return snapshot;
   }
 

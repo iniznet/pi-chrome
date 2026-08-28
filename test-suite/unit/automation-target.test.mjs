@@ -29,6 +29,10 @@ async function throwsWith(fn, re, msg) {
   try { await fn(); ok(false, `${msg} (expected throw)`); }
   catch (e) { ok(re.test(String(e.message || e)), `${msg} (got: ${e.message})`); }
 }
+async function errorOf(fn) {
+  try { await fn(); return null; }
+  catch (e) { return e; }
+}
 
 // ---- stateful Chrome mock. `state` (tabs/windows/storage) can be shared to simulate a
 // service-worker restart: the browser keeps its tabs/windows/session-storage, the worker memory
@@ -386,6 +390,126 @@ async function run() {
     for (const [tid, tab] of [...state.tabs]) if (tab.windowId === t.windowId) state.tabs.delete(tid);
     const stale = await w.cleanupAutomationTarget(SK);
     ok(stale.closedWindowId === null && stale.closedTabId === null, "cleanup: robust when owned window was already closed");
+  }
+
+  // ===== getTabByParams resolution: urlIncludes ambiguity is an error, never a silent first match. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    // Seed two distinct tabs sharing one urlIncludes fragment.
+    const tabA = { id: state.alloc.tab(), windowId: state.userWindowId, url: "https://news.example.com/breaking", active: false, groupId: -1 };
+    const tabB = { id: state.alloc.tab(), windowId: state.userWindowId, url: "https://news.example.com/analysis", active: false, groupId: -1 };
+    state.tabs.set(tabA.id, tabA);
+    state.tabs.set(tabB.id, tabB);
+    const windowsBefore = state.windows.size;
+
+    const err = await errorOf(() => w.dispatch("page.navigate", {
+      url: "https://pi.test/never", urlIncludes: "news.example.com", waitUntilLoad: false, sessionKey: SK,
+    }));
+    ok(/2 tabs match urlIncludes "news.example.com"/.test(err?.message || ""), "ambiguity: two urlIncludes matches raise ambiguityError");
+    ok((err?.message || "").includes("pass targetId or a more specific urlIncludes"), "ambiguity: error tells the caller how to re-target");
+    ok((err?.message || "").includes(String(tabA.id)) && (err?.message || "").includes(String(tabB.id)), "ambiguity: error lists both candidate tabs");
+    ok(tabA.url === "https://news.example.com/breaking" && tabB.url === "https://news.example.com/analysis", "ambiguity: neither matching tab was driven");
+    ok(state.windows.size === windowsBefore, "ambiguity: no automation window/tab was created for an ambiguous target");
+
+    // Single-match urlIncludes still resolves (no over-broad regression).
+    state.tabs.delete(tabB.id);
+    const resolved = await w.dispatch("page.navigate", {
+      url: "https://pi.test/single-match", urlIncludes: "news.example.com", waitUntilLoad: false, sessionKey: SK,
+    });
+    ok(resolved.id === tabA.id && tabA.url === "https://pi.test/single-match", "ambiguity: a single urlIncludes match resolves and navigates");
+  }
+
+  // ===== getTabByParams resolution: a stale targetId errors and lists the current tabs. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const windowsBefore = state.windows.size;
+
+    const err = await errorOf(() => w.dispatch("page.navigate", {
+      url: "https://pi.test/never", targetId: "999999", waitUntilLoad: false, sessionKey: SK,
+    }));
+    ok(/No Chrome tab with id 999999/.test(err?.message || ""), "stale-id: an unknown targetId surfaces an error naming the id");
+    ok((err?.message || "").includes("Current tabs:"), "stale-id: the error enumerates the current tabs");
+    ok((err?.message || "").includes(String(state.userArticle.id)), "stale-id: listing includes the active user tab");
+    ok((err?.message || "").includes(String(state.userGmail.id)), "stale-id: listing includes the other user tab");
+    ok(state.userArticle.url === "https://example.com/research-article" && state.userGmail.url === "https://mail.google.com/", "stale-id: no tab was navigated");
+    ok(state.windows.size === windowsBefore, "stale-id: no automation window/tab was created for a stale id");
+  }
+
+  // ===== getTabByParams resolution: chrome-extension:// targets are refused as protected URLs. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const extTab = { id: state.alloc.tab(), windowId: state.userWindowId, url: "chrome-extension://abcabcabcabcabcabcabcabcabcabc/options.html", active: false, groupId: -1 };
+    state.tabs.set(extTab.id, extTab);
+
+    const err = await errorOf(() => w.dispatch("page.navigate", {
+      url: "https://pi.test/never", targetId: String(extTab.id), waitUntilLoad: false, sessionKey: SK,
+    }));
+    ok(/Chrome blocks extension automation on protected URL/.test(err?.message || ""), "protected: a chrome-extension:// tab is refused");
+    ok((err?.message || "").includes(String(extTab.id)) && (err?.message || "").includes("chrome-extension://"), "protected: the error names the offending tab and URL");
+    ok(extTab.url.startsWith("chrome-extension://"), "protected: the extension tab was never navigated");
+  }
+
+  // ===== getTabByParams resolution: joinSessionGroup adopts only ungrouped tabs. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const groupTitle = "Pi Session: alpha";
+
+    // A user-grouped tab (the user already organized it) and an ungrouped user tab.
+    const userGroupId = state.alloc.group();
+    state.groups.set(userGroupId, { id: userGroupId, title: "User Work", color: "blue", collapsed: false, windowId: state.userWindowId });
+    const groupedTab = { id: state.alloc.tab(), windowId: state.userWindowId, url: "https://example.com/ticket-42", active: false, groupId: userGroupId };
+    const ungroupedTab = { id: state.alloc.tab(), windowId: state.userWindowId, url: "https://example.com/todo", active: false, groupId: -1 };
+    state.tabs.set(groupedTab.id, groupedTab);
+    state.tabs.set(ungroupedTab.id, ungroupedTab);
+
+    // page.* action on the already-grouped tab: adoption is skipped, the user's group is untouched.
+    await w.dispatch("page.navigate", {
+      url: "https://example.com/ticket-42-updated", targetId: String(groupedTab.id), waitUntilLoad: false,
+      sessionKey: SK, joinSessionGroup: true, sessionGroupTitle: groupTitle,
+    });
+    ok(groupedTab.groupId === userGroupId, "group-adopt: an already-grouped tab stays in its user group");
+    ok(state.groups.get(userGroupId).title === "User Work", "group-adopt: the user group title is never renamed");
+    ok(state.groups.size === 1, "group-adopt: no extra group was created for the already-grouped tab");
+
+    // page.* action on the ungrouped tab: it IS adopted into this session's titled group.
+    await w.dispatch("page.navigate", {
+      url: "https://example.com/todo-done", targetId: String(ungroupedTab.id), waitUntilLoad: false,
+      sessionKey: SK, joinSessionGroup: true, sessionGroupTitle: groupTitle,
+    });
+    ok(typeof ungroupedTab.groupId === "number" && ungroupedTab.groupId >= 0, "group-adopt: an ungrouped tab is adopted into a group");
+    const adoptedGroup = state.groups.get(ungroupedTab.groupId);
+    ok(adoptedGroup && adoptedGroup.title === groupTitle, "group-adopt: the adopted group carries the session title");
+  }
+
+  // ===== A page.* action on a grouped tab must not rename the group (groupTab rename hazard). =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const groupTitle = "Pi Session: alpha";
+
+    // The session creates its automation target and joins its titled group.
+    const nav = await w.dispatch("page.navigate", {
+      url: "https://pi.test/work", waitUntilLoad: false, sessionKey: SK, joinSessionGroup: true, sessionGroupTitle: groupTitle,
+    });
+    const piGroupId = state.tabs.get(nav.id).groupId;
+    ok(state.groups.get(piGroupId).title === groupTitle, "grouped-tab: automation tab starts in the session group");
+
+    // The user takes over: drags the automation tab into their own group.
+    const userGroupId = state.alloc.group();
+    state.groups.set(userGroupId, { id: userGroupId, title: "User Work", color: "red", collapsed: false, windowId: nav.windowId });
+    state.tabs.get(nav.id).groupId = userGroupId;
+
+    // The next page.* action must NOT rename the user's group back to the Pi title.
+    await w.dispatch("page.navigate", {
+      url: "https://pi.test/work-2", targetId: String(nav.id), waitUntilLoad: false,
+      sessionKey: SK, joinSessionGroup: true, sessionGroupTitle: groupTitle,
+    });
+    ok(state.tabs.get(nav.id).groupId === userGroupId, "grouped-tab: the tab stays in the user's group after the action");
+    ok(state.groups.get(userGroupId).title === "User Work", "grouped-tab: the user's group title survives the page.* action");
   }
 
   console.log(`\n${passes} passed, ${failures} failed`);
