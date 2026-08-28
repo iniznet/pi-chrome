@@ -1684,9 +1684,23 @@ Usage rules:
 			}
 			const result = await authorizedBridgeSend(`tab.${params.action}`, forwarded, DEFAULT_TIMEOUT_MS, signal);
 			if (params.action === "list") {
-				const tabs = result as Array<{ id: number; title: string; url: string; active: boolean; windowId: number; group?: { title?: string } | null }>;
-				const text = tabs.map((tab) => `${tab.id}\t${tab.active ? "*" : " "}\t${tab.group?.title ? `[${tab.group.title}] ` : ""}${tab.title || "(untitled)"}\t${tab.url}`).join("\n") || "No tabs.";
-				return { content: [{ type: "text", text }], details: { tabs } };
+				// tab.list returns the named-handle registry ({ handles: [...] }) per the documented
+				// contract. Accept both that shape and a bare tab array (older companion extension)
+				// so a shape mismatch never crashes the tool (regression: "tabs.map is not a function").
+				type Handle = { name?: string; tabId?: number; windowId?: number; url?: string; title?: string; ownerSessionKey?: string; savedAt?: number };
+				type TabRow = { id?: number; title?: string; url?: string; active?: boolean; group?: { title?: string } | null };
+				const handles = (result as { handles?: Handle[] | undefined })?.handles;
+				const isRegistry = Array.isArray(handles);
+				const rows: Array<Handle | TabRow> = isRegistry ? handles! : Array.isArray(result) ? (result as TabRow[]) : [];
+				const text =
+					rows
+						.map((row) =>
+							isRegistry
+								? `${(row as Handle).name ?? "(unnamed)"}\t${(row as Handle).tabId ?? ""}\t${(row as Handle).title || "(untitled)"}\t${(row as Handle).url || ""}`
+								: `${(row as TabRow).id}\t${(row as TabRow).active ? "*" : " "}\t${(row as TabRow).group?.title ? `[${(row as TabRow).group!.title}] ` : ""}${(row as TabRow).title || "(untitled)"}\t${(row as TabRow).url}`,
+						)
+						.join("\n") || "No named handles saved.";
+				return { content: [{ type: "text", text }], details: { result } };
 			}
 			return { content: [{ type: "text", text: safeJson(result) }], details: { result: result as Json } };
 		},
