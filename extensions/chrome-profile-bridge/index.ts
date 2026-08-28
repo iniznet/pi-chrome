@@ -4,6 +4,25 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
+import {
+	AuthState,
+	BridgeProtocol,
+	CommandClaim,
+	MAX_ELEMENTS,
+	type BridgeCommand,
+	type BridgeResult,
+	type HistoryEntry,
+	type PendingEntry,
+	type SnapshotDigest,
+	diffDigests,
+	formatChromeInspect,
+	formatChromeSnapshot,
+	formatIncludedSnapshotText,
+	recordHistory,
+	safeJson,
+	summarizeParams,
+	truncateText,
+} from "./commands";
 
 /**
  * Existing-profile Chrome bridge for pi.
@@ -26,75 +45,8 @@ type ToolTextResult = {
 	details: Record<string, unknown>;
 };
 
-type BridgeCommand = {
-	id: string;
-	action: string;
-	params: Record<string, unknown>;
-};
-
-type PendingCommand = {
-	command: BridgeCommand;
-	resolve: (value: unknown) => void;
-	reject: (error: Error) => void;
-	timer: NodeJS.Timeout;
-	deliveredAt?: number;
-	// Exactly-once state machine (S1.2): "pending" = served but not yet acked, "received" =
-	// acked by the extension but no result posted, "completed" = /result resolved/rejected it.
-	state: "pending" | "received" | "completed";
-	ackedAt?: number;
-};
-
-type OrphanedCommand = {
-	id: string;
-	action: string;
-	ackedAt: number;
-};
-
-type BridgeResult = {
-	id: string;
-	ok: boolean;
-	result?: unknown;
-	error?: string;
-};
-
-type HistoryEntry = {
-	at: number;
-	action: string;
-	paramsSummary: string;
-	ok: boolean;
-	error?: string;
-	durationMs: number;
-	sessionKey?: string;
-	// Full wire params retained ONLY for `chrome history replay`; never rendered (S4).
-	params: Record<string, unknown>;
-};
-
-const CHROME_HISTORY_CAP = 200;
 // Per-instance ring buffer of every chrome_* action this bridge sent (S4). Trimmed to the cap.
 const chromeHistory: HistoryEntry[] = [];
-
-// Wire-only params authorizedBridgeSend injects; noise in the history summary.
-const HISTORY_PARAMS_SKIP = new Set(["sessionKey", "groupTitle", "sessionGroupTitle", "joinSessionGroup", "foreground"]);
-
-function summarizeParams(params: Record<string, unknown>): string {
-	const parts: string[] = [];
-	for (const [key, value] of Object.entries(params)) {
-		if (HISTORY_PARAMS_SKIP.has(key) || value === undefined) continue;
-		let rendered: string;
-		if (typeof value === "string") rendered = `"${compactLine(value, 40)}"`;
-		else if (typeof value === "object" && value !== null) {
-			const json = safeJson(value);
-			rendered = json.length > 48 ? `${json.slice(0, 47)}…` : json;
-		} else rendered = String(value);
-		parts.push(`${key}=${rendered}`);
-	}
-	return parts.join(" ") || "(no params)";
-}
-
-function recordHistory(entry: Omit<HistoryEntry, "at" | "durationMs">, startedAt: number): void {
-	chromeHistory.push({ ...entry, at: Date.now(), durationMs: Date.now() - startedAt });
-	if (chromeHistory.length > CHROME_HISTORY_CAP) chromeHistory.splice(0, chromeHistory.length - CHROME_HISTORY_CAP);
-}
 
 const PI_CHROME_PKG_PATH = resolve(__dirname, "..", "..", "package.json");
 function readPiChromeVersion(): string {
@@ -113,147 +65,47 @@ const PI_CHROME_AUTH_KEY = "__piChromeProfileBridgeAuth__";
 const DEFAULT_HOST = process.env.PI_CHROME_BRIDGE_HOST ?? "127.0.0.1";
 const DEFAULT_PORT = Number(process.env.PI_CHROME_BRIDGE_PORT ?? "17318");
 const DEFAULT_TIMEOUT_MS = 30_000;
-const MAX_TEXT_CHARS = 30_000;
-const MAX_ELEMENTS = 80;
-
-function truncateText(text: string, maxChars = MAX_TEXT_CHARS): string {
-	if (text.length <= maxChars) return text;
-	return `${text.slice(0, maxChars)}\n\n[truncated ${text.length - maxChars} characters]`;
-}
-
-function safeJson(value: unknown): string {
-	return JSON.stringify(value, null, 2);
-}
+// Loopback endpoint limits (endpoint-limits): bounded request bodies, a wire timeout clamp,
+// and a concurrent /next waiter cap so a runaway client cannot amplify host memory or pile
+// up unbounded long-polls. /result gets a dedicated, larger cap because it legitimately
+// carries snapshot/screenshot payloads; oversized results are degraded with a marker.
+const MAX_COMMAND_BODY_BYTES = 1024 * 1024; // 1MB — /command carries only action+params
+const MAX_CONTROL_BODY_BYTES = 256 * 1024; // 256KB — /ack and /heartbeat are tiny control posts
+const MAX_RESULT_BODY_BYTES = 8 * 1024 * 1024; // 8MB — above this /result is degraded, not buffered
+const MIN_WIRE_TIMEOUT_MS = 1_000;
+const MAX_WIRE_TIMEOUT_MS = 5 * 60_000;
+const MAX_NEXT_WAITERS = 4;
 
 const snapshotModeValues = ["auto", "interactive", "forms", "pageMap", "text", "changes", "full"] as const;
 
-function compactLine(value: unknown, max = 140): string {
-	const text = String(value ?? "").replace(/\s+/g, " ").trim();
-	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+// Compact one-line rendering of the chrome_storage auth-state summary (feat-storage).
+// Summaries only ever contain names/counts — never values.
+function formatStorageSummary(summary: Record<string, unknown>): string {
+	const parts: string[] = [];
+	if (typeof summary.origin === "string" && summary.origin) parts.push(`origin=${summary.origin}`);
+	if (typeof summary.cookieCount === "number") {
+		parts.push(`${summary.cookieCount} cookie(s)`);
+		if (typeof summary.sessionCookieCount === "number") parts.push(`${summary.sessionCookieCount} session cookie(s)`);
+		if (Array.isArray(summary.cookieNames) && (summary.cookieNames as unknown[]).length) {
+			const names = (summary.cookieNames as string[]).slice(0, 10).join(", ");
+			parts.push(`names: ${names}${summary.namesTruncated ? "…" : ""}`);
+		}
+	}
+	if (typeof summary.keyCount === "number") {
+		parts.push(`${summary.keyCount} key(s)`);
+		if (Array.isArray(summary.keys) && (summary.keys as unknown[]).length) {
+			parts.push(`keys: ${(summary.keys as string[]).slice(0, 10).join(", ")}`);
+		}
+	}
+	if (Array.isArray(summary.databases) && (summary.databases as unknown[]).length) parts.push(`databases: ${(summary.databases as string[]).join(", ")}`);
+	return `Summary — ${parts.join(" · ")}`;
 }
 
-function rectText(rect: any): string {
-	if (!rect) return "?";
-	return `${rect.x},${rect.y} ${rect.width}x${rect.height}`;
-}
-
-function formatChromeSnapshot(snapshot: any): string {
-	if (!snapshot || typeof snapshot !== "object") return safeJson(snapshot);
-	if (snapshot.mode === "full") return truncateText(safeJson(snapshot));
-	const lines: string[] = [];
-	lines.push(`# Chrome snapshot${snapshot.mode ? ` (${snapshot.mode})` : ""}`);
-	lines.push(`${snapshot.title || "(untitled)"}`);
-	if (snapshot.url) lines.push(`${snapshot.url}`);
-	if (snapshot.viewport) lines.push(`viewport=${snapshot.viewport.width}x${snapshot.viewport.height} scroll=${snapshot.viewport.scrollX || 0},${snapshot.viewport.scrollY || 0}`);
-	if (snapshot.summary?.modal) lines.push(`modal: ${snapshot.summary.modal.uid} ${compactLine(snapshot.summary.modal.label)}`);
-	if (snapshot.summary?.focused) lines.push(`focused: ${snapshot.summary.focused.uid} ${snapshot.summary.focused.role || ""} ${compactLine(snapshot.summary.focused.label)}`);
-	if (Array.isArray(snapshot.summary?.hints) && snapshot.summary.hints.length) {
-		lines.push("\n## Hints");
-		for (const hint of snapshot.summary.hints.slice(0, 6)) lines.push(`- ${hint}`);
-	}
-	if (snapshot.diff && !snapshot.diff.firstSnapshot) {
-		const changed = [
-			...(snapshot.diff.changes || []).map((c: any) => c.kind === "textChanged" ? "text changed" : `${c.kind}: ${compactLine(c.before, 50)} → ${compactLine(c.after, 50)}`),
-			...(snapshot.diff.added || []).slice(0, 4).map((e: any) => `added ${e.uid} ${e.role || ""} ${compactLine(e.label)}`),
-			...(snapshot.diff.updated || []).slice(0, 4).map((u: any) => `updated ${u.uid} ${compactLine(u.after?.label || u.before?.label)}`),
-		];
-		if (changed.length) {
-			lines.push("\n## Changed since last snapshot");
-			for (const item of changed.slice(0, 10)) lines.push(`- ${item}`);
-		}
-	}
-	if (Array.isArray(snapshot.matches) && snapshot.matches.length) {
-		lines.push(`\n## Matches for "${snapshot.query}"`);
-		for (const match of snapshot.matches.slice(0, 12)) {
-			if (match.kind === "text") lines.push(`- ${match.uid} text ${compactLine(match.text)} @ ${rectText(match.rect)}`);
-			else if (match.kind === "region") lines.push(`- ${match.uid} region ${compactLine(match.label)} headings=${(match.headings || []).map((h: string) => compactLine(h, 50)).join(" | ")}`);
-			else lines.push(`- ${match.uid} ${match.role || match.tag || "element"}${match.disabled ? " disabled" : ""} ${compactLine(match.label || match.selector)} @ ${rectText(match.rect)}`);
-		}
-	}
-	if (snapshot.mode === "pageMap" && snapshot.pageMap) {
-		lines.push("\n## Page map");
-		for (const region of (snapshot.pageMap.regions || []).slice(0, 18)) {
-			lines.push(`- ${region.uid} ${region.kind}: ${compactLine(region.label)}`);
-			for (const action of (region.actions || []).slice(0, 5)) lines.push(`  - ${action.uid} ${action.role || ""}${action.disabled ? " disabled" : ""} ${compactLine(action.label)}`);
-		}
-		if (snapshot.pageMap.headings?.length) {
-			lines.push("\nHeadings:");
-			for (const h of snapshot.pageMap.headings.slice(0, 20)) lines.push(`- ${h.uid} h${h.level || ""} ${compactLine(h.text)}`);
-		}
-	}
-	if (Array.isArray(snapshot.layout) && snapshot.layout.length && snapshot.mode !== "changes") {
-		lines.push("\n## Layout / context");
-		for (const section of snapshot.layout.slice(0, snapshot.mode === "pageMap" ? 18 : 8)) {
-			const bits = [`${section.uid}`, section.role || section.tag, compactLine(section.label || section.text || "(unnamed section)", 110), `@ ${rectText(section.rect)}`];
-			lines.push(`- ${bits.filter(Boolean).join(" ")}`);
-			const fieldLabels = (section.fields || []).slice(0, 4).map((f: any) => `${f.uid} ${compactLine(f.label || f.role, 40)}`);
-			const actionLabels = (section.actions || []).slice(0, 5).map((a: any) => `${a.uid}${a.disabled ? " disabled" : ""} ${compactLine(a.label || a.role, 40)}`);
-			if (fieldLabels.length) lines.push(`  fields: ${fieldLabels.join("; ")}`);
-			if (actionLabels.length) lines.push(`  actions: ${actionLabels.join("; ")}`);
-		}
-	}
-	if ((snapshot.mode === "forms" || snapshot.forms?.fields?.length) && snapshot.mode !== "pageMap") {
-		const fields = snapshot.forms?.fields || [];
-		const submits = snapshot.forms?.submits || [];
-		if (fields.length || submits.length) lines.push("\n## Forms");
-		for (const field of fields.slice(0, snapshot.mode === "forms" ? 40 : 12)) {
-			const bits = [field.uid, field.role || field.tag, field.required ? "required" : "", field.invalid ? "invalid" : "", field.disabled ? "disabled" : "", compactLine(field.label || field.selector, 90)];
-			if (field.value) bits.push(`value=${compactLine(field.value, 50)}`);
-			else if (field.valueRedacted) bits.push("value=[redacted]");
-			lines.push(`- ${bits.filter(Boolean).join(" ")} @ ${rectText(field.rect)}`);
-		}
-		for (const submit of submits.slice(0, 8)) lines.push(`- ${submit.uid} submit/action${submit.disabled ? " disabled" : ""} ${compactLine(submit.label || submit.selector)} @ ${rectText(submit.rect)}`);
-	}
-	if (Array.isArray(snapshot.elements) && snapshot.mode !== "pageMap") {
-		lines.push("\n## Visible actions");
-		for (const el of snapshot.elements.slice(0, snapshot.mode === "interactive" ? 60 : 25)) {
-			const flags = [el.disabled ? "disabled" : "", el.occluded ? `occluded-by-${el.occluded.tag}` : ""].filter(Boolean).join(",");
-			const context = el.context?.label ? ` in ${el.context.uid} ${compactLine(el.context.label, 60)}` : "";
-			lines.push(`- ${el.uid} ${el.role || el.tag}${flags ? ` [${flags}]` : ""} ${compactLine(el.label || el.selector)}${context} @ ${rectText(el.rect)}`);
-		}
-		if (snapshot.elements.length > (snapshot.mode === "interactive" ? 60 : 25)) lines.push(`- … ${snapshot.elements.length - (snapshot.mode === "interactive" ? 60 : 25)} more; retry with maxElements or mode=interactive`);
-	}
-	if ((snapshot.mode === "text" || snapshot.mode === "auto") && Array.isArray(snapshot.textSnippets) && snapshot.textSnippets.length) {
-		lines.push("\n## Text snippets");
-		for (const snip of snapshot.textSnippets.slice(0, snapshot.mode === "text" ? 40 : 14)) lines.push(`- ${snip.uid} ${compactLine(snip.text, snapshot.mode === "text" ? 240 : 160)}`);
-		if (snapshot.textTruncated) lines.push("- … page text truncated; retry with mode=text or maxTextChars for more");
-	}
-	lines.push("\nTip: use chrome_snapshot({query:'...', mode:'interactive|forms|pageMap|text|changes|full'}) or nearUid to zoom in.");
-	return truncateText(lines.join("\n"));
-}
-
-function formatIncludedSnapshotText(raw: unknown, text: string): string {
-	const snapshot = raw && typeof raw === "object" ? (raw as { snapshot?: unknown }).snapshot : undefined;
-	return snapshot ? `${text}\n\n${formatChromeSnapshot(snapshot)}` : text;
-}
-
-function formatChromeInspect(inspect: any): string {
-	if (!inspect || typeof inspect !== "object") return safeJson(inspect);
-	const t = inspect.target || {};
-	const lines: string[] = [];
-	lines.push(`# Chrome inspect ${t.uid || ""}`.trim());
-	lines.push(`${t.role || t.tag || "element"}${t.disabled ? " disabled" : ""}${t.occluded ? ` occluded-by-${t.occluded.tag}` : ""} ${compactLine(t.label || t.selector)}`);
-	if (t.selector) lines.push(`selector: ${t.selector}`);
-	if (t.rect) lines.push(`rect: ${rectText(t.rect)}`);
-	if (inspect.clickSuggestion) lines.push(`suggested click: chrome_click({ uid: "${inspect.clickSuggestion.uid}" }) or x=${inspect.clickSuggestion.x}, y=${inspect.clickSuggestion.y}`);
-	if (Array.isArray(inspect.nearbyText) && inspect.nearbyText.length) {
-		lines.push("\n## Nearby text");
-		for (const item of inspect.nearbyText.slice(0, 12)) lines.push(`- ${item.uid} ${compactLine(item.text, 180)}`);
-	}
-	if (inspect.formContext) {
-		lines.push("\n## Form context");
-		for (const field of (inspect.formContext.fields || []).slice(0, 20)) lines.push(`- ${field.uid} ${field.role || field.tag}${field.disabled ? " disabled" : ""} ${compactLine(field.label || field.selector)}${field.value ? ` value=${compactLine(field.value, 60)}` : field.valueRedacted ? " value=[redacted]" : ""}`);
-		for (const action of (inspect.formContext.actions || []).slice(0, 10)) lines.push(`- ${action.uid} action${action.disabled ? " disabled" : ""} ${compactLine(action.label || action.selector)}`);
-	}
-	if (Array.isArray(inspect.nearbyActions) && inspect.nearbyActions.length) {
-		lines.push("\n## Nearby actions");
-		for (const action of inspect.nearbyActions.slice(0, 18)) lines.push(`- ${action.uid} ${action.role || action.tag}${action.disabled ? " disabled" : ""} ${compactLine(action.label || action.selector)} @ ${rectText(action.rect)}`);
-	}
-	if (Array.isArray(inspect.ancestors) && inspect.ancestors.length) {
-		lines.push("\n## Ancestors");
-		for (const a of inspect.ancestors.slice(0, 6)) lines.push(`- ${a.uid} ${a.role || a.tag} ${compactLine(a.label || a.selector, 120)}`);
-	}
-	return truncateText(lines.join("\n"));
+// Human-friendly rendering of one CDP Performance metric value (feat-perf-metrics): heap
+// sizes read better in KB, counters stay as raw counts.
+function formatMetricValue(name: string, value: number): string {
+	if (/Heap/i.test(name)) return `${Math.round(value / 1024)} KB`;
+	return String(Math.round(value * 100) / 100);
 }
 
 function extensionRoot(): string {
@@ -306,13 +158,42 @@ function summarizeActionResult(result: unknown): string | undefined {
 	return parts.length ? parts.join("; ") : undefined;
 }
 
-function readRequestBody(request: IncomingMessage): Promise<string> {
+// Read the request body up to maxBytes. The data listener stays attached past the cap so the
+// stream keeps draining (discarding) instead of buffering in the socket — no memory growth —
+// while the caller gets a structured rejection it can surface as a size-limit response.
+function readRequestBody(request: IncomingMessage, maxBytes: number): Promise<string> {
 	return new Promise((resolveBody, rejectBody) => {
 		const chunks: Buffer[] = [];
-		request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-		request.on("end", () => resolveBody(Buffer.concat(chunks).toString("utf8")));
+		let received = 0;
+		let oversized = false;
+		request.on("data", (chunk: Buffer) => {
+			received += chunk.length;
+			if (oversized) return; // keep draining, discard payload
+			if (received > maxBytes) {
+				oversized = true;
+				const partial = Buffer.concat(chunks).toString("utf8");
+				chunks.length = 0;
+				const error = new Error(`Request body exceeds the ${maxBytes}-byte limit`);
+				(error as { bodyExceedsLimit?: boolean; partialText?: string }).bodyExceedsLimit = true;
+				(error as { partialText?: string }).partialText = partial.slice(0, 4096);
+				rejectBody(error);
+				return;
+			}
+			chunks.push(Buffer.from(chunk));
+		});
+		request.on("end", () => {
+			if (!oversized) resolveBody(Buffer.concat(chunks).toString("utf8"));
+		});
 		request.on("error", rejectBody);
 	});
+}
+
+// Clamp the wire-provided timeoutMs to [1s, 5min] (endpoint-limits): a client cannot ask the
+// server to hold a command (or a /next long-poll equivalent) for unbounded time, and a tiny
+// timeout that races its own delivery is worse than the 1s floor.
+function clampWireTimeoutMs(value: number | undefined): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_TIMEOUT_MS;
+	return Math.min(MAX_WIRE_TIMEOUT_MS, Math.max(MIN_WIRE_TIMEOUT_MS, value));
 }
 
 function corsHeadersFor(request: IncomingMessage): Record<string, string> {
@@ -356,102 +237,15 @@ function mintClientCommandId(): string {
 	return `${process.pid}:${clientCommandSeq}`;
 }
 
-// ---- chrome_diff digest comparison (S3.1; host-side pure function, no bridge call) ----
-// The digest shape mirrors `digestFor()` in snapshot_injected.js.
-type DigestLabel = {
-	uid: string;
-	role?: string;
-	label?: string;
-	disabled?: boolean;
-	value?: string;
-	checked?: boolean;
-};
-
-type SnapshotDigest = {
-	url?: string;
-	title?: string;
-	textHash?: string;
-	focusedUid?: string | null;
-	modalUid?: string | null;
-	labels?: DigestLabel[];
-};
-
-function digestChanged(before: string | null | undefined, after: string | null | undefined): boolean {
-	return (before ?? "") !== (after ?? "");
-}
-
-function digestLabelFieldChanges(a: DigestLabel, b: DigestLabel): string[] {
-	const changes: string[] = [];
-	for (const field of ["role", "label", "disabled", "value", "checked"] as const) {
-		if (a[field] !== b[field]) changes.push(field);
-	}
-	return changes;
-}
-
-function diffDigests(before: SnapshotDigest, after: SnapshotDigest): { lines: string[]; diff: Record<string, unknown> } {
-	const lines: string[] = [];
-	const diff: Record<string, unknown> = {};
-	if (digestChanged(before.url, after.url)) {
-		lines.push(`URL changed: ${before.url ?? ""} -> ${after.url ?? ""}`);
-		diff.url = { before: before.url ?? "", after: after.url ?? "" };
-	}
-	if (digestChanged(before.title, after.title)) {
-		lines.push(`Title changed: ${before.title ?? ""} -> ${after.title ?? ""}`);
-		diff.title = { before: before.title ?? "", after: after.title ?? "" };
-	}
-	if (digestChanged(before.textHash, after.textHash)) {
-		lines.push("Text content changed");
-		diff.textHash = { before: before.textHash ?? "", after: after.textHash ?? "" };
-	}
-	if (digestChanged(before.focusedUid, after.focusedUid)) {
-		lines.push(`Focused element changed: ${before.focusedUid ?? "none"} -> ${after.focusedUid ?? "none"}`);
-		diff.focusedUid = { before: before.focusedUid ?? null, after: after.focusedUid ?? null };
-	}
-	if (digestChanged(before.modalUid, after.modalUid)) {
-		lines.push(`Modal changed: ${before.modalUid ?? "none"} -> ${after.modalUid ?? "none"}`);
-		diff.modalUid = { before: before.modalUid ?? null, after: after.modalUid ?? null };
-	}
-
-	const beforeLabels = new Map((before.labels ?? []).map((label) => [label.uid, label]));
-	const afterLabels = new Map((after.labels ?? []).map((label) => [label.uid, label]));
-	const added: DigestLabel[] = [];
-	const removed: DigestLabel[] = [];
-	const updated: Array<{ before: DigestLabel; after: DigestLabel; fields: string[] }> = [];
-	for (const label of after.labels ?? []) {
-		if (!beforeLabels.has(label.uid)) added.push(label);
-		else {
-			const previous = beforeLabels.get(label.uid) as DigestLabel;
-			const fields = digestLabelFieldChanges(previous, label);
-			if (fields.length > 0) updated.push({ before: previous, after: label, fields });
-		}
-	}
-	for (const label of before.labels ?? []) {
-		if (!afterLabels.has(label.uid)) removed.push(label);
-	}
-	for (const label of added) lines.push(`+ ${label.role ?? "element"} "${label.label ?? ""}" (${label.uid})`);
-	for (const label of removed) lines.push(`- ${label.role ?? "element"} "${label.label ?? ""}" (${label.uid})`);
-	for (const entry of updated) lines.push(`~ ${entry.after.role ?? "element"} "${entry.after.label ?? ""}" (${entry.after.uid})`);
-
-	if (lines.length === 0) lines.push("No changes detected between the two snapshots.");
-	diff.added = added;
-	diff.removed = removed;
-	diff.updated = updated.map((entry) => ({ before: entry.before, after: entry.after, fields: entry.fields }));
-	return { lines, diff };
-}
-
 class ChromeProfileBridge {
 	private server: Server | undefined;
-	private pending = new Map<string, PendingCommand>();
-	private queue: BridgeCommand[] = [];
-	private waiters: Array<(command: BridgeCommand | undefined) => void> = [];
+	// Exactly-once command protocol state (queue, pending, orphans, waiters, heartbeats) — the
+	// host-free state machine in commands.ts, unit-tested by bridge-protocol.test.mjs.
+	private protocol = new BridgeProtocol();
 	private lastSeenAt: number | undefined;
 	private clientName: string | undefined;
 	private mode: "server" | "client" | undefined;
 	private seq = 0; // server-side monotonic command id counter (S1.1: pid:seq, no Date.now/Math.random)
-	private orphaned: OrphanedCommand[] = [];
-	// S5.1: extension liveness signals, keyed by the session key the SW sends (its default key
-	// when no pi session is bound). Pruned aggressively so it cannot grow unbounded.
-	private heartbeats = new Map<string, number>();
 
 	constructor(
 		private readonly host: string,
@@ -476,24 +270,15 @@ class ChromeProfileBridge {
 			connected: this.connected,
 			lastSeenAt: this.lastSeenAt,
 			clientName: this.clientName,
-			queuedCommands: this.queue.length,
-			pendingCommands: this.pending.size,
+			queuedCommands: this.protocol.queue.length,
+			pendingCommands: this.protocol.pending.size,
 			// S5.1: age of the newest extension heartbeat (undefined when none yet).
 			heartbeatAgeMs: this.heartbeatAgeMs(),
 		};
 	}
 
 	private heartbeatAgeMs(): number | undefined {
-		let newest = -Infinity;
-		for (const at of this.heartbeats.values()) if (at > newest) newest = at;
-		if (newest === -Infinity) return undefined;
-		this.pruneHeartbeats();
-		return Math.max(0, Date.now() - newest);
-	}
-
-	private pruneHeartbeats(): void {
-		const cutoff = Date.now() - 2 * 60_000;
-		for (const [key, at] of this.heartbeats) if (at < cutoff) this.heartbeats.delete(key);
+		return this.protocol.newestHeartbeatAt(Date.now());
 	}
 
 	async start(): Promise<void> {
@@ -502,8 +287,9 @@ class ChromeProfileBridge {
 	}
 
 	// Try to own the bridge port. On success we are the server; on EADDRINUSE another Pi
-	// session owns it and we run as a client that forwards commands to that owner.
-	private async bindServerOrClient(): Promise<void> {
+	// session owns it and we run as a client that forwards commands to that owner. Returns
+	// the resulting mode so callers (tryPromoteToServer) don't fight stale type narrowing.
+	private async bindServerOrClient(): Promise<"server" | "client"> {
 		const server = createServer((request, response) => {
 			void this.handle(request, response).catch((error) => {
 				sendJson(response, 500, { error: (error as Error).message });
@@ -519,12 +305,14 @@ class ChromeProfileBridge {
 			});
 			this.server = server;
 			this.mode = "server";
+			return "server";
 		} catch (error) {
 			server.close();
 			if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
 			// Another Pi session already owns the bridge port. Use it as the shared
 			// machine-local broker so multiple Pi sessions can control Chrome at once.
 			this.mode = "client";
+			return "client";
 		}
 	}
 
@@ -533,17 +321,18 @@ class ChromeProfileBridge {
 	// server ourselves so chrome_* tools recover without a manual restart.
 	private async tryPromoteToServer(): Promise<boolean> {
 		if (this.mode !== "client") return this.mode === "server";
-		this.mode = undefined;
-		// EADDRINUSE self-heal: another session may be grabbing the freed port at the same
-		// moment. Retry a couple of times with a short delay before giving up (audit S2).
+		// Stay in client mode (tentative) while probing for the freed port (takeover-transient):
+		// concurrent sends keep the owner path (sendViaOwner), which re-verifies reachability
+		// per send, instead of routing into a local queue nothing will serve if promotion fails.
 		for (let attempt = 0; attempt < 3; attempt++) {
-			await this.bindServerOrClient();
-			if (this.mode === "server") return true;
-			this.mode = undefined;
+			const currentMode = await this.bindServerOrClient();
+			if (currentMode === "server") return true;
+			// EADDRINUSE — another session may be grabbing the freed port at the same moment.
+			// bindServerOrClient already restored mode="client"; retry a couple of times with a
+			// short delay before giving up (audit S2).
 			if (attempt < 2) await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
 		}
-		// Could not take over; stay in client mode so later sends keep retrying the owner path.
-		this.mode = "client";
+		// Could not take over; mode is still "client", so later sends keep retrying the owner.
 		return false;
 	}
 
@@ -552,15 +341,9 @@ class ChromeProfileBridge {
 			this.mode = undefined;
 			return;
 		}
-		for (const pending of this.pending.values()) {
-			clearTimeout(pending.timer);
-			pending.reject(new Error("Chrome profile bridge stopped"));
-		}
-		this.pending.clear();
-		this.queue = [];
-		this.orphaned = [];
-		for (const waiter of this.waiters) waiter(undefined);
-		this.waiters = [];
+		// Rejects every pending command, clears the queue, serves `undefined` to all waiters
+		// (releasing long-poll /next handlers) and drops orphan notices.
+		this.protocol.stop();
 		this.server?.close();
 		this.server = undefined;
 		this.mode = undefined;
@@ -584,32 +367,28 @@ class ChromeProfileBridge {
 			};
 			const onAbort = () => {
 				clearTimeout(timer);
-				this.pending.delete(id);
-				this.queue = this.queue.filter((queued) => queued.id !== id);
+				// orphan-abort: a user-aborted command that was already acked by the extension may
+				// have executed. drop() surfaces it as an orphan notice on the next /next, mirroring
+				// the timer path, instead of deleting the entry silently.
+				this.protocol.drop(id);
 				cleanupAbort();
 				rejectCommand(new Error("Chrome command aborted"));
 			};
 			const timer = setTimeout(() => {
-				const entry = this.pending.get(id);
-				this.pending.delete(id);
-				this.queue = this.queue.filter((queued) => queued.id !== id);
+				// Acknowledged but never resolved: the action MAY have executed, so drop() pushes an
+				// orphan notice the next /next poll surfaces instead of dropping it silently (S1.2).
+				const outcome = this.protocol.drop(id);
 				cleanupAbort();
-				// Acknowledged but never resolved: the action MAY have executed, so surface it as
-				// an orphan notice on the next /next poll instead of dropping it silently (S1.2).
-				if (entry?.state === "received" && entry.ackedAt !== undefined) {
-					this.orphaned.push({ id, action, ackedAt: entry.ackedAt });
-				}
-				rejectCommand(new Error(this.timeoutMessage(entry, timeoutMs)));
+				rejectCommand(new Error(this.timeoutMessage(outcome.entry, timeoutMs)));
 			}, timeoutMs);
-			this.pending.set(id, {
+			this.protocol.track(
 				command,
-				resolve: (value) => { cleanupAbort(); resolveCommand(value); },
-				reject: (err) => { cleanupAbort(); rejectCommand(err); },
+				(value) => { cleanupAbort(); resolveCommand(value); },
+				(err) => { cleanupAbort(); rejectCommand(err); },
 				timer,
-				state: "pending",
-			});
+			);
 			if (signal) signal.addEventListener("abort", onAbort, { once: true });
-			this.enqueue(command);
+			this.protocol.enqueue(command);
 		});
 	}
 
@@ -620,7 +399,7 @@ class ChromeProfileBridge {
 	// 4-way timeout classification (S1.5) so the agent knows whether the command may have
 	// executed: never polled, polled but never picked up, picked up but never acked, or
 	// acked but never returned a result (the dangerous case — the action MAY have run).
-	private timeoutMessage(entry: PendingCommand | undefined, timeoutMs: number): string {
+	private timeoutMessage(entry: PendingEntry | undefined, timeoutMs: number): string {
 		const pollAgeMs = this.lastSeenAt === undefined ? undefined : Date.now() - this.lastSeenAt;
 		if (pollAgeMs === undefined || pollAgeMs > 60_000) {
 			return `Timed out after ${timeoutMs}ms: the Chrome extension is not polling (last seen ${pollAgeMs === undefined ? "never" : Math.round(pollAgeMs / 1000) + "s ago"}). Run /chrome onboard, then load the bundled browser-extension folder in your normal Chrome profile and keep that Chrome window open.`;
@@ -630,7 +409,11 @@ class ChromeProfileBridge {
 				return `Timed out after ${timeoutMs}ms: the Chrome extension received AND acknowledged the command but never returned a result. The action MAY have executed - verify page state before retrying.`;
 			}
 			if (entry.deliveredAt !== undefined) {
-				return `Timed out after ${timeoutMs}ms: the Chrome extension polled but never acknowledged the command before the deadline. Retry; a duplicate will not re-run (dedupe id ${entry.command.id}).`;
+				// deliveredAt is set only after the /next response actually flushed (lost-command-toctou),
+				// so the extension DID receive this command. Whether a same-id retry re-runs depends on
+				// whether the extension journaled the id before it stalled — warn instead of asserting
+				// "will not re-run", which was false for commands lost to the TOCTOU gap.
+				return `Timed out after ${timeoutMs}ms: the Chrome extension polled and received the command but never acknowledged it before the deadline. The command MAY have executed; a same-id retry may not re-run it (dedupe id ${entry.command.id}) - verify page state before retrying.`;
 			}
 		}
 		return `Timed out after ${timeoutMs}ms: the Chrome extension is polling (last seen ${Math.round(pollAgeMs / 1000)}s ago) but did not pick up this command in time. Retry; if it persists, reload 'Pi Chrome Connector' at chrome://extensions.`;
@@ -647,33 +430,56 @@ class ChromeProfileBridge {
 		// Mint the command id ONCE per sendViaOwner call and reuse it if we promote to server,
 		// so the SW journal dedupes the retried execution (S1.1/S1.6).
 		const id = mintClientCommandId();
+		// Client-mode timeout: the command was POSTed to the owner, so it may have started before
+		// the connection dropped — surface the may-have-executed warning (takeover-transient).
+		const timeoutError = (): Error =>
+			new Error(
+				`Timed out waiting for the shared Chrome bridge owner after ${timeoutMs}ms. The command may have been started by that Pi session and MAY have executed - verify page state before retrying.`,
+			);
+		const promoteToServerOrThrow = async (deadOwnerMessage: string): Promise<unknown> => {
+			const promoted = await this.tryPromoteToServer().catch(() => false);
+			if (promoted) return this.sendLocal(action, params, timeoutMs, signal, id);
+			throw new Error(deadOwnerMessage);
+		};
 		try {
-			const response = await fetch(`${this.url}/command`, {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ id, action, params, timeoutMs }),
-				signal: controller.signal,
-			});
-			const payload = (await response.json().catch(() => ({}))) as { ok?: boolean; result?: unknown; error?: string };
-			if (response.status === 404) {
-				throw new Error(
-					"A running Pi session owns the Chrome bridge but is using an older pi-chrome without multi-session support. Restart that Pi session after `pi update`, then retry.",
-				);
-			}
-			if (!response.ok || !payload.ok) throw new Error(payload.error ?? `Chrome bridge owner HTTP ${response.status}`);
-			return payload.result;
+			return await this.postCommandToOwner(action, params, timeoutMs, id, controller.signal);
 		} catch (error) {
 			if ((error as Error).name === "AbortError") {
 				if (signal?.aborted) throw new Error("Chrome command aborted");
-				throw new Error(`Timed out waiting for shared Chrome bridge owner after ${timeoutMs}ms`);
+				throw timeoutError();
 			}
-			// `fetch failed` / ECONNREFUSED means the Pi session that owned the bridge port is gone.
-			// Try to take over the port ourselves and re-run the command locally instead of staying
-			// stuck as a client pointed at a dead owner.
-			if (this.isOwnerUnreachable(error)) {
-				const promoted = await this.tryPromoteToServer().catch(() => false);
-				if (promoted) return this.sendLocal(action, params, timeoutMs, signal, id);
-				throw new Error(
+			// Transient reset (ECONNRESET / socket hang up / EPIPE): the owner may still be alive —
+			// a restart, a dropped keep-alive, or a busy event loop. Retry ONCE before any takeover;
+			// /command is idempotent by id, so the SW journal dedupes the retried execution.
+			if (this.isOwnerTransientError(error)) {
+				try {
+					return await this.postCommandToOwner(action, params, timeoutMs, id, controller.signal);
+				} catch (retryError) {
+					if ((retryError as Error).name === "AbortError") {
+						if (signal?.aborted) throw new Error("Chrome command aborted");
+						throw timeoutError();
+					}
+					// Two consecutive transport failures: attempt takeover. A still-live owner keeps
+					// the port (EADDRINUSE) and this session stays a client, so surface the real
+					// transport error rather than a dead-owner claim.
+					if (this.isOwnerTransientError(retryError)) {
+						const promoted = await this.tryPromoteToServer().catch(() => false);
+						if (promoted) return this.sendLocal(action, params, timeoutMs, signal, id);
+						throw retryError;
+					}
+					if (this.isOwnerHardDead(retryError)) {
+						return promoteToServerOrThrow(
+							"The Pi session that owned the Chrome bridge is unreachable and this session could not take over the bridge port. Restart this Pi session, or run /chrome doctor.",
+						);
+					}
+					throw retryError;
+				}
+			}
+			// Hard death: ECONNREFUSED / a fetch-level `fetch failed` with an ECONNREFUSED cause
+			// means the owning Pi session is gone. Take over the port and re-run the command locally
+			// instead of staying stuck as a client pointed at a dead owner.
+			if (this.isOwnerHardDead(error)) {
+				return promoteToServerOrThrow(
 					"The Pi session that owned the Chrome bridge is unreachable and this session could not take over the bridge port. Restart this Pi session, or run /chrome doctor.",
 				);
 			}
@@ -684,23 +490,67 @@ class ChromeProfileBridge {
 		}
 	}
 
-	private isOwnerUnreachable(error: unknown): boolean {
-		const message = (error as Error)?.message ?? "";
-		const code = (error as NodeJS.ErrnoException)?.code ?? "";
-		const cause = (error as { cause?: NodeJS.ErrnoException })?.cause;
-		const causeCode = cause?.code ?? "";
-		return (
-			/fetch failed|ECONNREFUSED|ECONNRESET|other side closed|socket hang up/i.test(message) ||
-			code === "ECONNREFUSED" ||
-			causeCode === "ECONNREFUSED" ||
-			causeCode === "ECONNRESET"
-		);
+	// POST one idempotent-by-id command to the owner session's /command endpoint.
+	private async postCommandToOwner(
+		action: string,
+		params: Record<string, unknown>,
+		timeoutMs: number,
+		id: string,
+		signal: AbortSignal,
+	): Promise<unknown> {
+		const response = await fetch(`${this.url}/command`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ id, action, params, timeoutMs }),
+			signal,
+		});
+		const payload = (await response.json().catch(() => ({}))) as { ok?: boolean; result?: unknown; error?: string };
+		if (response.status === 404) {
+			throw new Error(
+				"A running Pi session owns the Chrome bridge but is using an older pi-chrome without multi-session support. Restart that Pi session after `pi update`, then retry.",
+			);
+		}
+		if (!response.ok || !payload.ok) throw new Error(payload.error ?? `Chrome bridge owner HTTP ${response.status}`);
+		return payload.result;
 	}
 
-	private enqueue(command: BridgeCommand): void {
-		const waiter = this.waiters.shift();
-		if (waiter) waiter(command);
-		else this.queue.push(command);
+	// Collect {code, message} signals from the full error chain so classification is precise even
+	// when undici wraps the real socket error in a top-level `fetch failed` TypeError whose `cause`
+	// is an AggregateError (errors[] list) or another nested cause. Without this, a socket hang-up
+	// under `fetch failed` would look like owner death.
+	private ownerTransportSignals(error: unknown): { codes: string[]; messages: string[] } {
+		const codes: string[] = [];
+		const messages: string[] = [];
+		const visit = (err: unknown): void => {
+			if (!err || typeof err !== "object") return;
+			const e = err as NodeJS.ErrnoException;
+			if (typeof e.code === "string") codes.push(e.code);
+			if (typeof e.message === "string") messages.push(e.message);
+			const aggregate = err as { errors?: unknown[] };
+			if (Array.isArray(aggregate.errors)) for (const nested of aggregate.errors) visit(nested);
+			const cause = (err as { cause?: unknown })?.cause;
+			if (cause !== undefined && cause !== err) visit(cause);
+		};
+		visit(error);
+		return { codes, messages };
+	}
+
+	// Hard owner death: the port is not listening at all (ECONNREFUSED, including inside a
+	// fetch-level `fetch failed` cause). Taking over is safe because no server could possibly
+	// have started the command.
+	private isOwnerHardDead(error: unknown): boolean {
+		const { codes, messages } = this.ownerTransportSignals(error);
+		return codes.includes("ECONNREFUSED") || messages.some((message) => /ECONNREFUSED|fetch failed/i.test(message));
+	}
+
+	// Transient transport failure: connection reset / socket hang up mid-request. The owner
+	// process may still be alive — never treat these as owner death without a retry first.
+	private isOwnerTransientError(error: unknown): boolean {
+		const { codes, messages } = this.ownerTransportSignals(error);
+		return (
+			codes.includes("ECONNRESET") ||
+			messages.some((message) => /ECONNRESET|other side closed|socket hang up|EPIPE/i.test(message))
+		);
 	}
 
 	private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -723,7 +573,20 @@ class ChromeProfileBridge {
 				sendJson(response, 403, { ok: false, error: "Chrome commands are accepted only from local Pi processes" });
 				return;
 			}
-			const body = JSON.parse(await readRequestBody(request)) as {
+			let bodyText: string;
+			try {
+				bodyText = await readRequestBody(request, MAX_COMMAND_BODY_BYTES);
+			} catch (error) {
+				// endpoint-limits: an oversized /command is a client error, not a server failure — a
+				// 413 tells the sending Pi session the payload was rejected instead of triggering the
+				// transient-retry paths that 5xx statuses imply.
+				if ((error as { bodyExceedsLimit?: boolean }).bodyExceedsLimit) {
+					sendJson(response, 413, { ok: false, error: (error as Error).message });
+					return;
+				}
+				throw error;
+			}
+			const body = JSON.parse(bodyText) as {
 				action?: string;
 				params?: Record<string, unknown>;
 				timeoutMs?: number;
@@ -735,8 +598,9 @@ class ChromeProfileBridge {
 			}
 			try {
 				// Accept an optional client-minted id (S1.1) so a promoted sendViaOwner retry reuses
-				// the same id and the SW journal dedupes it; otherwise mint server-side.
-				const result = await this.sendLocal(body.action, body.params ?? {}, body.timeoutMs ?? DEFAULT_TIMEOUT_MS, undefined, body.id);
+				// the same id and the SW journal dedupes it; otherwise mint server-side. The wire
+				// timeout is clamped to [1s, 5min] (endpoint-limits).
+				const result = await this.sendLocal(body.action, body.params ?? {}, clampWireTimeoutMs(body.timeoutMs), undefined, body.id);
 				sendJson(response, 200, { ok: true, result });
 			} catch (error) {
 				sendJson(response, 504, { ok: false, error: (error as Error).message });
@@ -750,68 +614,74 @@ class ChromeProfileBridge {
 			}
 			this.lastSeenAt = Date.now();
 			this.clientName = url.searchParams.get("name") ?? undefined;
-			// Serve ONE orphan notice before any command: an acked-but-resultless command may have
-			// executed, so surface it to the extension (which logs it and keeps polling). The
-			// command itself is never re-served (S1.2).
-			if (this.orphaned.length > 0) {
-				const orphan = this.orphaned.shift() as OrphanedCommand;
+			// protocol.poll() serves ONE orphan notice before any command: an acked-but-resultless
+			// command may have executed, so surface it to the extension (which logs it and keeps
+			// polling). The command itself is never re-served (S1.2).
+			const poll = this.protocol.poll();
+			if (poll.type === "orphan") {
 				const currentVersion = readPiChromeVersion();
 				sendJson(
 					response,
 					200,
-					{
-						type: "orphan",
-						orphan: {
-							...orphan,
-							note: "delivered and acknowledged but never returned a result - the action MAY have executed. Verify state before repeating.",
-						},
-						expectedExtensionVersion: currentVersion,
-					},
+					{ type: "orphan", orphan: poll.orphan, expectedExtensionVersion: currentVersion },
 					{ ...corsHeaders, "x-pi-chrome-version": currentVersion },
 				);
 				return;
 			}
 			let aborted = false;
 			let activeWaiter: ((command: BridgeCommand | undefined) => void) | undefined;
+			// The claim owned by THIS poll. Only protocol.poll()/protocol.claim() sets it, and
+			// CommandClaim.requeue() returns it to the queue exactly once — so at most one handler
+			// ever owns a given command id, and a delivered-but-acked command is never re-served
+			// (S1.2).
+			let claim: CommandClaim | undefined = poll.type === "command" ? poll.claim : undefined;
 			request.once("close", () => {
 				aborted = true;
-				if (activeWaiter) this.waiters = this.waiters.filter((entry) => entry !== activeWaiter);
+				if (activeWaiter) this.protocol.removeWaiter(activeWaiter);
+				// lost-command-toctou: the client may abort after the `if (aborted)` check but before
+				// the response bytes reach the socket. writableFinished is true only once the data was
+				// handed to the kernel, so a reset inside that window leaves it false and the SW never
+				// saw the payload — requeue the claimed command so the next live /next serves it. If
+				// the SW DID receive it, its journal dedupes the re-served copy (idempotent by id).
+				if (claim !== undefined && !response.writableFinished) claim.requeue(this.protocol);
 			});
-			// Serve ONLY commands still in "pending" state — a requeued command that has since been
-			// acked ("received") must never be re-served (S1.2).
-			let command: BridgeCommand | undefined;
-			const servableIndex = this.queue.findIndex((queued) => {
-				const entry = this.pending.get(queued.id);
-				return entry === undefined || entry.state === "pending";
-			});
-			if (servableIndex >= 0) command = this.queue.splice(servableIndex, 1)[0];
-			if (!command) {
-				command = await this.waitForCommand(25_000, (waiter) => {
+			if (!claim && this.protocol.waiters.length >= MAX_NEXT_WAITERS) {
+				// Concurrent /next waiter cap (endpoint-limits): under contention, answer type:none
+				// immediately instead of piling up unbounded long-polls; the SW re-polls shortly.
+				claim = undefined;
+			} else if (!claim) {
+				const command = await this.waitForCommand(25_000, (waiter) => {
 					activeWaiter = waiter;
 				});
+				if (command !== undefined) claim = this.protocol.claim(command);
 			}
 			if (aborted) {
-				// Long-poll connection died before we could deliver. Requeue any command we pulled
-				// so the next live /next picks it up instead of dropping it on the floor.
-				if (command) this.queue.unshift(command);
+				// Long-poll connection died before we could deliver. Requeue any claimed command so
+				// the next live /next picks it up instead of dropping it on the floor. The close
+				// handler may already have requeued it — CommandClaim.requeue is idempotent.
+				claim?.requeue(this.protocol);
 				return;
 			}
-			// Mark the command as delivered so a later timeout can distinguish "extension never
-			// picked it up" from "extension is running it / failed to post a result".
-			if (command) {
-				const entry = this.pending.get(command.id);
-				if (entry) entry.deliveredAt = Date.now();
+			// Mark delivered only once the write actually flushed (lost-command-toctou): the response
+			// 'finish' event fires after end() handed the bytes to the kernel, so deliveredAt is never
+			// set for a payload that died in the socket — the close handler requeues that command
+			// while the claim is still unsettled, and a later timeout then reports it as never picked
+			// up instead of claiming a delivery that never landed.
+			if (claim !== undefined) {
+				response.once("finish", () => claim?.markFlushed(this.protocol, Date.now()));
 			}
 			// Re-read version on every /next so bumping package.json takes effect without pi restart.
 			const currentVersion = readPiChromeVersion();
 			sendJson(
 				response,
 				200,
-				command
-					? { type: "command", command, expectedExtensionVersion: currentVersion }
+				claim
+					? { type: "command", command: claim.command, expectedExtensionVersion: currentVersion }
 					: { type: "none", expectedExtensionVersion: currentVersion },
 				{ ...corsHeaders, "x-pi-chrome-version": currentVersion },
 			);
+			// If the connection dies before the write flushes, the close handler requeues the claim
+			// (writableFinished stays false) — the command is never lost and never double-served.
 			return;
 		}
 		if (request.method === "POST" && url.pathname === "/ack") {
@@ -820,14 +690,10 @@ class ChromeProfileBridge {
 				return;
 			}
 			this.lastSeenAt = Date.now();
-			const body = JSON.parse(await readRequestBody(request)) as { id?: string };
-			const pending = body.id !== undefined ? this.pending.get(body.id) : undefined;
-			if (pending && pending.state === "pending") {
-				pending.state = "received";
-				pending.ackedAt = Date.now();
-			}
+			const body = JSON.parse(await readRequestBody(request, MAX_CONTROL_BODY_BYTES)) as { id?: string };
 			// Idempotent by design (S1.3): an unknown id or a duplicate ack is a no-op success —
 			// the SW retries acks, and a late ack after timeout must never surface as an error.
+			if (body.id !== undefined) this.protocol.ack(body.id, Date.now());
 			sendJson(response, 200, { ok: true }, corsHeaders);
 			return;
 		}
@@ -837,19 +703,45 @@ class ChromeProfileBridge {
 				return;
 			}
 			this.lastSeenAt = Date.now();
-			const result = JSON.parse(await readRequestBody(request)) as BridgeResult;
-			const pending = this.pending.get(result.id);
-			if (!pending) {
+			let result: BridgeResult;
+			try {
+				result = JSON.parse(await readRequestBody(request, MAX_RESULT_BODY_BYTES)) as BridgeResult;
+			} catch (error) {
+				// endpoint-limits: degrade an oversized /result with a structured marker instead of
+				// buffering + parsing a multi-hundred-MB body. The id field always precedes the result
+				// payload, so it can be extracted from the buffered prefix to fail the pending command
+				// cleanly; accepted:false keeps the SW from retrying the oversized post.
+				const marker = error as { bodyExceedsLimit?: boolean; partialText?: string };
+				if (!marker.bodyExceedsLimit) throw error;
+				let oversizedId: string | undefined;
+				try {
+					oversizedId = (JSON.parse(marker.partialText ?? "{}") as { id?: string }).id;
+				} catch {
+					// The partial prefix may be truncated mid-token; fall back to a prefix scan.
+					oversizedId = /"id"\s*:\s*"([^"]+)"/.exec(marker.partialText ?? "")?.[1];
+				}
+				const outcome = oversizedId !== undefined
+					? this.protocol.settle(oversizedId)
+					: ({ accepted: false } as { accepted: false });
+				if (outcome.accepted) {
+					const tooLarge = new Error(
+						"The Chrome extension returned a result larger than the bridge limit; retry with a smaller output (lower maxElements, mode=interactive, or format=jpeg).",
+					);
+					(tooLarge as { resultTooLarge?: boolean }).resultTooLarge = true;
+					outcome.entry.reject(tooLarge);
+				}
+				sendJson(response, 200, { ok: true, accepted: false, resultTooLarge: true }, corsHeaders);
+				return;
+			}
+			const outcome = this.protocol.settle(result.id);
+			if (!outcome.accepted) {
 				// Late result after timeout/owner-switch: ack silently so the SW never retries it.
 				// accepted:false signals nothing was resolved (S1.3 — NOT a 404).
 				sendJson(response, 200, { ok: true, accepted: false }, corsHeaders);
 				return;
 			}
-			clearTimeout(pending.timer);
-			pending.state = "completed";
-			this.pending.delete(result.id);
-			if (result.ok) pending.resolve(result.result);
-			else pending.reject(new Error(result.error ?? "Chrome extension command failed"));
+			if (result.ok) outcome.entry.resolve(result.result);
+			else outcome.entry.reject(new Error(result.error ?? "Chrome extension command failed"));
 			sendJson(response, 200, { ok: true }, corsHeaders);
 			return;
 		}
@@ -860,9 +752,9 @@ class ChromeProfileBridge {
 			}
 			this.lastSeenAt = Date.now();
 			// S5.1: the SW posts {sessionKey} every 30s; track liveness and prune stale keys.
-			const body = JSON.parse(await readRequestBody(request)) as { sessionKey?: string };
-			if (body.sessionKey) this.heartbeats.set(body.sessionKey, Date.now());
-			this.pruneHeartbeats();
+			const body = JSON.parse(await readRequestBody(request, MAX_CONTROL_BODY_BYTES)) as { sessionKey?: string };
+			if (body.sessionKey) this.protocol.heartbeat(body.sessionKey, Date.now());
+			this.protocol.pruneHeartbeats(Date.now());
 			sendJson(response, 200, { ok: true }, corsHeaders);
 			return;
 		}
@@ -879,11 +771,11 @@ class ChromeProfileBridge {
 				if (settled) return;
 				settled = true;
 				clearTimeout(timer);
-				this.waiters = this.waiters.filter((entry) => entry !== waiter);
+				this.protocol.removeWaiter(waiter);
 				resolveWait(command);
 			};
 			const timer = setTimeout(() => waiter(undefined), timeoutMs);
-			this.waiters.push(waiter);
+			this.protocol.addWaiter(waiter);
 			registerWaiter?.(waiter);
 		});
 	}
@@ -891,7 +783,13 @@ class ChromeProfileBridge {
 
 const tabActionValues = ["list", "new", "activate", "close", "group", "ungroup", "version", "save"] as const;
 const imageFormatValues = ["png", "jpeg"] as const;
-const waitForValues = ["selector", "expression"] as const;
+const waitForValues = ["selector", "expression", "navigation", "networkIdle"] as const;
+const downloadActionValues = ["list", "wait", "clear"] as const;
+const dialogTypeValues = ["alert", "confirm", "prompt", "beforeunload", "any"] as const;
+const emulateActionValues = ["set", "clear"] as const;
+const storageKindValues = ["cookies", "localStorage", "sessionStorage", "indexedDB"] as const;
+const storageActionValues = ["get", "set", "delete", "clear", "summary"] as const;
+const cookieSameSiteValues = ["no_restriction", "lax", "strict", "unspecified"] as const;
 const CHROME_TOOL_NAMES = [
 	"chrome_launch",
 	"chrome_tab",
@@ -904,11 +802,20 @@ const CHROME_TOOL_NAMES = [
 	"chrome_click",
 	"chrome_type",
 	"chrome_fill",
+	"chrome_fill_form",
 	"chrome_key",
 	"chrome_wait_for",
+	"chrome_downloads",
+	"chrome_dialog",
+	"chrome_emulate",
+	"chrome_storage",
+	"chrome_perf_metrics",
 	"chrome_list_console_messages",
 	"chrome_list_network_requests",
 	"chrome_get_network_request",
+	"chrome_network_capture",
+	"chrome_network_block",
+	"chrome_network_export",
 	"chrome_screenshot",
 	"chrome_hover",
 	"chrome_drag",
@@ -943,22 +850,16 @@ export default function (pi: ExtensionAPI): void {
 
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
 	let backgroundDefault = true;
-	let chromeAuthorizedUntil: number | "indefinite" | undefined;
-	// Session key the persisted grant belongs to; used to refuse a stale-session inheritance (S5.2).
-	let persistedAuthSessionKey: string | undefined;
-	// Restore an authorization that survived a /reload. Drop it if it already expired.
+	// Authorization grant + the session key it belongs to (pure AuthState from commands.ts). The
+	// session key refuses stale-session inheritance (S5.2).
 	const persistedAuth = globalState[PI_CHROME_AUTH_KEY];
-	if (persistedAuth) {
-		if (persistedAuth.until === "indefinite" || persistedAuth.until > Date.now()) {
-			chromeAuthorizedUntil = persistedAuth.until;
-			persistedAuthSessionKey = persistedAuth.sessionKey;
-		} else {
-			delete globalState[PI_CHROME_AUTH_KEY];
-		}
-	}
+	const grantValid = persistedAuth !== undefined && (persistedAuth.until === "indefinite" || persistedAuth.until > Date.now());
+	// Restore an authorization that survived a /reload. Drop it if it already expired.
+	const authState = new AuthState(grantValid ? persistedAuth.until : undefined, grantValid ? persistedAuth.sessionKey : undefined);
+	if (persistedAuth && !grantValid) delete globalState[PI_CHROME_AUTH_KEY];
 	const persistAuth = (): void => {
-		if (chromeAuthorizedUntil === undefined) delete globalState[PI_CHROME_AUTH_KEY];
-		else globalState[PI_CHROME_AUTH_KEY] = { until: chromeAuthorizedUntil, sessionKey: sessionKeyFor(sessionCtx) };
+		if (authState.until === undefined) delete globalState[PI_CHROME_AUTH_KEY];
+		else globalState[PI_CHROME_AUTH_KEY] = { until: authState.until, sessionKey: sessionKeyFor(sessionCtx) };
 	};
 	let chromeToolsRegistered = false;
 	let chromeToolsUsable = false;
@@ -1035,25 +936,25 @@ export default function (pi: ExtensionAPI): void {
 		deactivateChromeTools();
 		chromeToolsUsable = false;
 		if (logAction && wasUsable) logChromeToolChange(logAction, { authorizedUntil: undefined });
-		chromeAuthorizedUntil = undefined;
+		authState.revoke();
 		persistAuth();
 		// Revoking control ends pi-chrome's automation for this session; tidy up the target we own.
 		cleanupAutomationTargetBestEffort();
 	};
 
 	const authSummary = (): string => {
-		if (chromeAuthorizedUntil === "indefinite") return "authorized indefinitely";
-		if (typeof chromeAuthorizedUntil === "number") {
-			const remainingMs = chromeAuthorizedUntil - Date.now();
+		if (authState.until === "indefinite") return "authorized indefinitely";
+		if (typeof authState.until === "number") {
+			const remainingMs = authState.until - Date.now();
 			if (remainingMs > 0) return `authorized for ~${Math.ceil(remainingMs / 60_000)}m`;
 		}
 		return "locked";
 	};
 
 	const chromeControlAuthorized = (): boolean => {
-		if (chromeAuthorizedUntil === "indefinite") return true;
-		if (typeof chromeAuthorizedUntil === "number" && chromeAuthorizedUntil > Date.now()) return true;
-		if (chromeAuthorizedUntil !== undefined) lockChromeControl("expired");
+		if (authState.isActive(Date.now())) return true;
+		// A set-but-expired grant transitions to locked exactly once (auth-state expiry).
+		if (authState.checkExpiry(Date.now())) lockChromeControl("expired");
 		return false;
 	};
 
@@ -1072,9 +973,9 @@ export default function (pi: ExtensionAPI): void {
 	};
 
 	const authCountdownLabel = (): string => {
-		if (chromeAuthorizedUntil === "indefinite") return " (indefinite)";
-		if (typeof chromeAuthorizedUntil === "number") {
-			const remainingMs = chromeAuthorizedUntil - Date.now();
+		if (authState.until === "indefinite") return " (indefinite)";
+		if (typeof authState.until === "number") {
+			const remainingMs = authState.until - Date.now();
 			if (remainingMs > 0) {
 				const mins = Math.ceil(remainingMs / 60_000);
 				return mins >= 1 ? ` (${mins}m)` : " (<1m)";
@@ -1103,7 +1004,7 @@ export default function (pi: ExtensionAPI): void {
 	// Ticks every 60 s while a timed authorization is active to keep the countdown current.
 	const startCountdownTicker = (ctx: ExtensionContext): void => {
 		clearCountdownInterval();
-		if (chromeAuthorizedUntil === "indefinite" || typeof chromeAuthorizedUntil !== "number") return;
+		if (authState.until === "indefinite" || typeof authState.until !== "number") return;
 		countdownInterval = setInterval(() => {
 			if (!chromeControlAuthorized()) {
 				clearCountdownInterval();
@@ -1118,7 +1019,7 @@ export default function (pi: ExtensionAPI): void {
 		startCountdownTicker(ctx);
 		if (until === "indefinite") return;
 		authExpiryTimer = setTimeout(() => {
-			if (chromeAuthorizedUntil !== until) return;
+			if (authState.until !== until) return;
 			try {
 				lockChromeControl("expired");
 				ctx.ui.notify("Chrome control authorization expired. Run /chrome authorize to allow chrome_* tools again.", "info");
@@ -1144,6 +1045,13 @@ export default function (pi: ExtensionAPI): void {
 		if ((action === "tab.new" || action === "tab.group") && sessionTitle !== undefined) {
 			wireParams = { ...wireParams, groupTitle: sessionTitle };
 		}
+		// The session background setting must also reach tab.* actions (background-mode): the SW's
+		// tab.new/tab.activate honor a wire `foreground` flag, and chrome_tab never goes through
+		// withBackground() like the page.* tools do. Default to the session setting unless the
+		// caller already supplied the flag explicitly.
+		if (action.startsWith("tab.") && wireParams.foreground === undefined) {
+			wireParams = { ...wireParams, foreground: !backgroundDefault };
+		}
 		// Any tab Pi *uses* (page.* interactions) should join this session's group, mirroring the
 		// auto-grouping that tab.new already does. Tagging the wire params lets getTabByParams pull
 		// the resolved tab into the session group on the service-worker side. We skip tab.* actions:
@@ -1156,11 +1064,11 @@ export default function (pi: ExtensionAPI): void {
 		const startedAt = Date.now();
 		return bridge.send(action, wireParams, timeoutMs, signal).then(
 			(result) => {
-				recordHistory({ action, paramsSummary: summarizeParams(wireParams), ok: true, sessionKey, params: wireParams }, startedAt);
+				recordHistory(chromeHistory, { action, paramsSummary: summarizeParams(wireParams, action), ok: true, sessionKey, params: wireParams }, startedAt);
 				return result;
 			},
 			(error) => {
-				recordHistory({ action, paramsSummary: summarizeParams(wireParams), ok: false, error: (error as Error).message, sessionKey, params: wireParams }, startedAt);
+				recordHistory(chromeHistory, { action, paramsSummary: summarizeParams(wireParams, action), ok: false, error: (error as Error).message, sessionKey, params: wireParams }, startedAt);
 				throw error;
 			},
 		);
@@ -1187,17 +1095,15 @@ export default function (pi: ExtensionAPI): void {
 		// session is starting (anything but a /reload of the same session), discard the persisted
 		// grant so a stale session never inherits control (audit 9). /reload keeps it: sessionKeyFor
 		// is stable across reloads, and this handler still holds the same session id.
-		if (persistedAuthSessionKey !== undefined && persistedAuthSessionKey !== sessionKeyFor(ctx) && _event?.reason !== "reload") {
+		if (authState.rejectStaleSession(sessionKeyFor(ctx), _event?.reason)) {
 			delete globalState[PI_CHROME_AUTH_KEY];
-			persistedAuthSessionKey = undefined;
-			chromeAuthorizedUntil = undefined;
 		}
-		// Reestablish in-memory state after a /reload restored chromeAuthorizedUntil from globalThis.
+		// Reestablish in-memory state after a /reload restored the grant on globalThis.
 		if (chromeControlAuthorized()) {
 			activateChromeTools();
 			chromeToolsUsable = true;
-			if (typeof chromeAuthorizedUntil === "number") scheduleAuthExpiry(ctx, chromeAuthorizedUntil);
-			else if (chromeAuthorizedUntil === "indefinite") startCountdownTicker(ctx);
+			if (typeof authState.until === "number") scheduleAuthExpiry(ctx, authState.until);
+			else if (authState.until === "indefinite") startCountdownTicker(ctx);
 		} else {
 			deactivateChromeTools();
 			chromeToolsUsable = false;
@@ -1221,8 +1127,7 @@ export default function (pi: ExtensionAPI): void {
 			// the persisted grant (and in-memory grant) alongside the automation target. /reload
 			// keeps both — the same session continues and sessionKeyFor stays unchanged.
 			delete globalState[PI_CHROME_AUTH_KEY];
-			persistedAuthSessionKey = undefined;
-			chromeAuthorizedUntil = undefined;
+			authState.revoke();
 		}
 		bridge.stop();
 		if (globalState[PI_CHROME_GLOBAL_KEY]?.token === instanceToken) {
@@ -1363,7 +1268,7 @@ Usage rules:
 			return;
 		}
 		const wasUsable = chromeToolsUsable;
-		chromeAuthorizedUntil = until;
+		authState.authorize(until, sessionKeyFor(sessionCtx));
 		persistAuth();
 		activateChromeTools();
 		chromeToolsUsable = true;
@@ -1625,6 +1530,93 @@ Usage rules:
 	function registerChromeTools(pi: ExtensionAPI): void {
 		if (chromeToolsRegistered) return;
 		chromeToolsRegistered = true;
+
+	pi.registerTool({
+		name: "chrome_storage",
+		label: "Chrome Storage & Auth State",
+		description:
+			"Read/write browser storage in the user's existing Chrome profile via the companion extension: cookies (get/set/delete/clear with domain/path/secure/httpOnly flags, sameSite, expiry), localStorage/sessionStorage for the resolved tab's origin (get/set/delete/clear), and IndexedDB (list databases, read object stores, delete a database) via CDP. Every response includes a compact auth-state summary (logged-in origins, cookie counts, key/database names) whose values are always redacted; get returns the raw values unless redact=true. Values written via set are redacted from the /chrome action history. Cookie ops are browser-global and never create or touch a tab.",
+		promptSnippet: "Inspect or modify cookies / localStorage / sessionStorage / IndexedDB and read an auth-state summary (which origins hold session cookies).",
+		parameters: Type.Object({
+			kind: StringEnum(storageKindValues),
+			action: Type.Optional(StringEnum(storageActionValues)),
+			name: Type.Optional(Type.String({ description: "Cookie name (cookies get/set/delete) or web-storage key alias for key." })),
+			key: Type.Optional(Type.String({ description: "Web-storage key (localStorage/sessionStorage get/set/delete)." })),
+			value: Type.Optional(Type.String({ description: "Cookie value (cookies set) or web-storage value (set). Redacted from the /chrome action history." })),
+			url: Type.Optional(Type.String({ description: "Cookies: the URL the cookie belongs to — required for set/delete unless domain is given; also a get/clear filter. localStorage/sessionStorage/IndexedDB always act on the resolved tab's current origin." })),
+			domain: Type.Optional(Type.String({ description: "Cookies: domain filter for get/clear, or the domain to set the cookie on when url is omitted (https://<domain>/ is assumed)." })),
+			path: Type.Optional(Type.String({ description: "Cookies: cookie path (default /)." })),
+			secure: Type.Optional(Type.Boolean({ description: "Cookies: Secure flag when setting." })),
+			httpOnly: Type.Optional(Type.Boolean({ description: "Cookies: HttpOnly flag when setting." })),
+			sameSite: Type.Optional(StringEnum(cookieSameSiteValues)),
+			expirationDate: Type.Optional(Type.Number({ description: "Cookies: expiry in seconds since epoch; omit for a session cookie." })),
+			database: Type.Optional(Type.String({ description: "IndexedDB: database name — get reads its stores (add objectStore to read records); clear deletes the whole database." })),
+			objectStore: Type.Optional(Type.String({ description: "IndexedDB: object store name to read records from (with database)." })),
+			limit: Type.Optional(Type.Number({ description: "IndexedDB: max records to read (default 50, max 200)." })),
+			redact: Type.Optional(Type.Boolean({ description: "get: return values as [redacted] (default false; summaries are always redacted)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("storage.op", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as {
+				kind?: string;
+				action?: string;
+				summary?: Record<string, unknown>;
+				cookies?: unknown[];
+				cookie?: unknown;
+				databases?: unknown[];
+				stores?: unknown[];
+				entryCount?: number;
+				entry?: unknown;
+				entries?: unknown[];
+				origin?: string;
+				removed?: number;
+				cleared?: number;
+			};
+			const lines: string[] = [`Storage ${result.kind ?? params.kind} ${result.action ?? params.action}.`];
+			if (result.summary) lines.push(formatStorageSummary(result.summary));
+			if (Array.isArray(result.cookies)) lines.push(`• ${result.cookies.length} cookie(s) returned.`);
+			if (Array.isArray(result.databases)) lines.push(`• ${result.databases.length} database(s).`);
+			if (Array.isArray(result.stores)) lines.push(`• ${result.stores.length} object store(s).`);
+			if (typeof result.entryCount === "number") lines.push(`• ${result.entryCount} record(s) returned.`);
+			if (typeof result.removed === "number") lines.push(`• Removed ${result.removed} cookie(s).`);
+			if (typeof result.cleared === "number") lines.push(`• Cleared ${result.cleared} ${params.kind} value(s).`);
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_perf_metrics",
+		label: "Chrome Performance Metrics",
+		description:
+			"Read one-shot performance counters from the session automation tab via CDP Performance.getMetrics: TaskDuration, JSHeapUsedSize/JSHeapTotalSize, LayoutCount, Nodes, Documents, Frames, JSEventListeners, and more. Cheap and non-persistent — the metrics are collected on demand and no tracing or persistent instrumentation is left attached.",
+		promptSnippet: "Read page-performance counters (heap size, task time, layout count) from the Chrome tab.",
+		parameters: Type.Object({
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.perfMetrics", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as {
+				metrics?: Array<{ name: string; value: number }>;
+				tab?: unknown;
+			};
+			const metrics = Array.isArray(result.metrics) ? result.metrics : [];
+			const FRIENDLY = new Set(["TaskDuration", "JSHeapUsedSize", "JSHeapTotalSize", "LayoutCount", "LayoutDuration", "StyleAndLayoutCount", "Nodes", "Documents", "Frames", "JSEventListeners"]);
+			const interesting = metrics.filter((m) => FRIENDLY.has(m.name));
+			const text = interesting.length
+				? `Performance metrics:\n${interesting.map((m) => `${m.name}=${formatMetricValue(m.name, m.value)}`).join("\n")}`
+				: `Performance metrics (${metrics.length} total): ${metrics.map((m) => `${m.name}=${m.value}`).join(", ")}`;
+			return { content: [{ type: "text", text }], details: { result: result as Json } };
+		},
+	});
 
 	pi.registerTool({
 		name: "chrome_launch",
@@ -1967,6 +1959,41 @@ Usage rules:
 	});
 
 	pi.registerTool({
+		name: "chrome_fill_form",
+		label: "Chrome Fill Form",
+		description:
+			"Fill many form fields in ONE bridge call (collapse round trips for signup/checkout forms) with per-field verification. Each field uses the same real-input CDP fill path as chrome_fill (triple-click select, type, best-effort value read-back). Fields fill sequentially within the call to avoid focus races; the whole form is one call either way.",
+		promptSnippet: "Fill a whole Chrome form (many fields) in one call.",
+		parameters: Type.Object({
+			fields: Type.Array(
+				Type.Object({
+					uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot. Prefer uid over selector." })),
+					selector: Type.Optional(Type.String({ description: "CSS selector for the field." })),
+					text: Type.String({ description: "Text to type into the field." }),
+					insertText: Type.Optional(Type.Boolean({ description: "Use fast whole-string insertion instead of per-character typing." })),
+					delayScale: Type.Optional(Type.Number({ description: "Typing pacing scale, 0 (fast) to 4 (slow)." })),
+					domFallback: Type.Optional(Type.Boolean({ description: "Allow the DOM-input fallback for this field when CDP input fails. Default true." })),
+				}),
+				{ description: "Fields to fill, each with uid or selector plus text." },
+			),
+			submit: Type.Optional(Type.Boolean({ description: "Press Enter in the last field after filling, submitting the form if the page maps it to submit." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("page.fillForm", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			return {
+				content: [{ type: "text", text: `Filled ${params.fields.length} field(s)${params.submit ? " and submitted" : ""}` }],
+				details: { result: result as Json },
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "chrome_key",
 		label: "Chrome Key",
 		description:
@@ -2004,11 +2031,12 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_wait_for",
 		label: "Chrome Wait For",
-		description: "Poll an existing Chrome tab until a selector exists or a JavaScript expression returns truthy.",
+		description:
+			"Poll an existing Chrome tab until a condition holds. kind=selector waits for a CSS selector to exist; kind=expression waits until a JavaScript expression is truthy; kind=navigation waits until location.href changes (or, when value is set, includes that substring); kind=networkIdle waits until no fetch/XHR has been in-flight for `value` milliseconds (instrumentation tags in-flight requests 'pending').",
 		promptSnippet: "Wait for page state in Chrome before further automation.",
 		parameters: Type.Object({
 			kind: StringEnum(waitForValues),
-			value: Type.String({ description: "CSS selector when kind=selector; JavaScript expression when kind=expression." }),
+			value: Type.Optional(Type.String({ description: "CSS selector when kind=selector; JavaScript expression when kind=expression; a URL substring when kind=navigation (omit to wait for any URL change); idle milliseconds when kind=networkIdle (e.g. \"800\")." })),
 			timeoutMs: Type.Optional(Type.Number({ default: 10_000 })),
 			intervalMs: Type.Optional(Type.Number({ default: 250 })),
 			targetId: Type.Optional(Type.String()),
@@ -2019,7 +2047,104 @@ Usage rules:
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const result = await authorizedBridgeSend("page.waitFor", params, (params.timeoutMs ?? 10_000) + 2_000, signal);
-			return { content: [{ type: "text", text: `Observed ${params.kind}: ${params.value}` }], details: { result: result as Json } };
+			const observed =
+				params.kind === "networkIdle"
+					? `network idle for ${params.value || 500}ms`
+					: params.kind === "navigation"
+						? `navigation to ${params.value || "a new URL"}`
+						: `${params.kind}: ${params.value ?? ""}`;
+			return { content: [{ type: "text", text: `Observed ${observed} (${(result as { elapsedMs?: number })?.elapsedMs ?? ""}ms)` }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_downloads",
+		label: "Chrome Downloads",
+		description:
+			"Track and await browser downloads (browser-global, not tab-scoped). list shows recent downloads with their resolved final paths (incl. auto-rename); wait blocks until a matching download completes (or is interrupted) and returns its final path — use it after clicking an Export/CSV button; clear erases matching downloads from Chrome's history and optionally removes their files. The `downloads` permission was added to the companion extension for this tool.",
+		promptSnippet: "List, await, or clear Chrome downloads and get resolved file paths.",
+		parameters: Type.Object({
+			action: StringEnum(downloadActionValues),
+			id: Type.Optional(Type.Number({ description: "Exact download id to filter by (from a previous list/wait)." })),
+			filenameRegex: Type.Optional(Type.String({ description: "Regex matched against the download's filename (e.g. \"report.*\.csv$\")." })),
+			urlRegex: Type.Optional(Type.String({ description: "Regex matched against the download's URL." })),
+			state: Type.Optional(Type.String({ description: "Filter by state for list: in_progress, complete, interrupted." })),
+			limit: Type.Optional(Type.Number({ description: "Max downloads to list (default 50, newest first)." })),
+			timeoutMs: Type.Optional(Type.Number({ description: "Max ms to wait for a download to settle when action=wait (default 60000)." })),
+			removeFiles: Type.Optional(Type.Boolean({ description: "action=clear: also delete the downloaded files from disk." })),
+			background: Type.Optional(Type.Boolean({ description: "If true, suppress the download shelf and run silently. Defaults to the session background setting." })),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const action = params.action ?? "list";
+			const timeoutMs = action === "wait" ? Math.min((params.timeoutMs ?? 60_000) + 5_000, 200_000) : DEFAULT_TIMEOUT_MS;
+			const result = await authorizedBridgeSend(`downloads.${action}`, withBackground(params), timeoutMs, signal);
+			return { content: [{ type: "text", text: truncateText(safeJson(result)) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_dialog",
+		label: "Chrome Dialog",
+		description:
+			"Accept, dismiss, or answer a JavaScript dialog (alert/confirm/prompt/beforeunload) that is blocking the page. Dialogs are surfaced through the attached CDP debugger; alert() dialogs are auto-dismissed immediately so they never wedge an action chain, while confirm/prompt/beforeunload wait for this tool. Use after an action that likely triggered a dialog, or to unblock a chain stuck on one. The benchmark challenge 'dialog-handling' drives prompt()/confirm() and expects this tool to accept them (pass promptText for the prompt).",
+		promptSnippet: "Handle an alert/confirm/prompt/beforeunload dialog in Chrome.",
+		parameters: Type.Object({
+			type: Type.Optional(StringEnum(dialogTypeValues)),
+			accept: Type.Optional(Type.Boolean({ description: "true (default) = OK/Confirm; false = Cancel/Dismiss." })),
+			promptText: Type.Optional(Type.String({ description: "Text to return for a prompt() dialog." })),
+			timeoutMs: Type.Optional(Type.Number({ description: "Max ms to wait for the dialog to appear (default 10000)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("page.dialog", withBackground(params), (params.timeoutMs ?? 10_000) + 5_000, signal);
+			const r = result as { handled?: boolean; dialogType?: string; message?: string; promptText?: string | null };
+			return {
+				content: [
+					{
+						type: "text",
+						text: r.handled
+							? `Handled ${r.dialogType} dialog (${r.promptText !== null && r.promptText !== undefined ? `promptText: ${r.promptText}` : "no prompt"})`
+							: `Dialog result: ${safeJson(result)}`,
+					},
+				],
+				details: { result: result as Json },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_emulate",
+		label: "Chrome Emulate Device",
+		description:
+			"Set or clear CDP device emulation on the session automation tab: viewport size, device scale factor, mobile flag, user-agent override, and touch emulation. Touch emulation is enabled by default when setting metrics — the touch benchmark requires the renderer to synthesize real TouchEvents, which only happens while touch emulation is on. Emulation persists while the debugger stays attached (kept alive for this tab).",
+		promptSnippet: "Emulate a device viewport, UA, and touch on the Chrome automation tab.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(emulateActionValues)),
+			width: Type.Optional(Type.Number({ description: "Viewport width in CSS px (default 1280)." })),
+			height: Type.Optional(Type.Number({ description: "Viewport height in CSS px (default 800)." })),
+			deviceScaleFactor: Type.Optional(Type.Number({ description: "Device scale factor (default 1)." })),
+			mobile: Type.Optional(Type.Boolean({ description: "Emit mobile viewport semantics (default false)." })),
+			touch: Type.Optional(Type.Boolean({ description: "Enable touch emulation (default true when action=set)." })),
+			ua: Type.Optional(Type.String({ description: "User-agent override (also applied at the network layer)." })),
+			platform: Type.Optional(Type.String({ description: "Platform override accompanying ua (e.g. 'Linux armv81' / 'iPhone')." })),
+			acceptLanguage: Type.Optional(Type.String({ description: "Accept-Language override accompanying ua." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("page.emulate", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			return { content: [{ type: "text", text: truncateText(safeJson(result)) }], details: { result: result as Json } };
 		},
 	});
 
@@ -2048,7 +2173,7 @@ Usage rules:
 		name: "chrome_list_network_requests",
 		label: "Chrome Network Requests",
 		description:
-			"List fetch/XMLHttpRequest activity captured in the page by the companion extension. Capture starts after instrumentation is installed by snapshot/evaluate/network/console tools; browser document/static asset requests are not captured. Use includePreservedRequests=true to keep requests from earlier same-tab navigations that were captured before navigation.",
+			"List fetch/XMLHttpRequest activity captured in the page by the companion extension plus (when CDP network capture is on, see chrome_network_capture) document/static-asset requests captured through the CDP Network domain. In-page capture starts after instrumentation is installed by snapshot/evaluate/network/console tools. CDP-captured entries (including document loads, scripts, stylesheets, images) appear in the cdpEntries field with source:cdp, request/response headers, status, and timings; their response bodies are fetched on demand by chrome_network_export or chrome_get_network_request. Use includePreservedRequests=true to keep requests from earlier same-tab navigations that were captured before navigation.",
 		promptSnippet: "List captured XHR/fetch requests from the active Chrome page before doing DOM-heavy debugging.",
 		parameters: Type.Object({
 			includePreservedRequests: Type.Optional(Type.Boolean({ description: "Include captured requests from earlier locations in the same tab/session." })),
@@ -2069,7 +2194,8 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_get_network_request",
 		label: "Chrome Network Request",
-		description: "Retrieve one captured fetch/XMLHttpRequest entry, including response body when available, by requestId from chrome_list_network_requests.",
+		description:
+			"Retrieve one captured network entry by requestId from chrome_list_network_requests, including response body when available. Resolves in-page fetch/XMLHttpRequest entries first, then falls back to CDP Network-domain entries (requestId from the cdpEntries field, e.g. a document/static request); CDP fallback bodies are fetched on demand for text-like responses.",
 		promptSnippet: "Fetch captured request details and response body by requestId.",
 		parameters: Type.Object({
 			requestId: Type.String({ description: "Request id returned by chrome_list_network_requests." }),
@@ -2087,6 +2213,117 @@ Usage rules:
 	});
 
 	pi.registerTool({
+		name: "chrome_network_capture",
+		label: "Chrome Network Capture (CDP Network domain)",
+		description:
+			"Turn persistent CDP Network-domain capture on/off for the session automation tab. When enabled, the companion extension holds the debugger attach open (skipping the idle-detach), enables the CDP Network domain, and records document/static/fetch/XHR requests with request+response headers, status, timings, and redirect chains — closing the gap where chrome_list_network_requests only saw fetch/XHR. Off by default so the attach still idle-detaches; pass clear=true to drop previously captured CDP entries.",
+		promptSnippet: "Enable CDP Network-domain capture to see document/static requests, or disable it to restore the idle-detach attach model.",
+		parameters: Type.Object({
+			enabled: Type.Boolean({ description: "true = enable persistent CDP Network capture (attach stays open, Network domain enabled); false = disable and return to the idle-detach model." }),
+			clear: Type.Optional(Type.Boolean({ description: "If true, also drop the captured CDP entries for the resolved tab." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean({ description: "If true, run silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." })),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("network.mode", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			const r = result as { enabled?: boolean; capturedCdpEntries?: number; blockedUrls?: string[] };
+			const captured = r.capturedCdpEntries ?? 0;
+			const blockedCount = r.blockedUrls?.length ?? 0;
+			return {
+				content: [
+					{
+						type: "text",
+						text: r.enabled
+							? `Network capture on: ${captured} CDP entr${captured === 1 ? "y" : "ies"} retained${blockedCount ? `, ${blockedCount} blocked pattern(s)` : ""}.`
+							: `Network capture off (idle-detach model restored).`,
+					},
+				],
+				details: { result: result as Json },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_network_block",
+		label: "Chrome Network Block",
+		description:
+			"Block matching network requests on the session automation tab via CDP Network.setBlockedURLs (Chrome wildcard patterns, e.g. \"*://*.analytics.example/*\"). Enables the CDP Network attach on demand if capture mode is off. Pass an empty array to clear all blocked patterns. Blocked requests fail fast (net::ERR_BLOCKED_BY_CLIENT) and never reach the server.",
+		promptSnippet: "Block or unblock URL patterns at the network layer (CDP Network.setBlockedURLs).",
+		parameters: Type.Object({
+			urlPatterns: Type.Array(Type.String({ description: "Chrome URL patterns to block (e.g. \"*://*.ads.example/*\"). Empty array clears blocking." }), { description: "URL patterns to block." }),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean({ description: "If true, run silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." })),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("network.block", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			const r = result as { urlPatterns?: string[]; blocked?: boolean };
+			return {
+				content: [
+					{
+						type: "text",
+						text: r.blocked
+							? `Blocking ${(r.urlPatterns ?? []).length} URL pattern(s): ${(r.urlPatterns ?? []).join(", ")}`
+							: "Cleared all blocked URL patterns.",
+					},
+				],
+				details: { result: result as Json },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_network_export",
+		label: "Chrome Network Export (HAR)",
+		description:
+			"Serialize captured network traffic for the session automation tab into a HAR-format JSON file under .pi/chrome-network/ (customize with path) and return the file path. Combines CDP Network-domain entries (document/static/fetch/XHR — enable with chrome_network_capture) with the in-page fetch/XHR capture that already carries response bodies; response bodies for CDP entries are fetched on demand (text-like types only, size-capped). The file is a grep-able artifact for API debugging.",
+		promptSnippet: "Export captured Chrome network traffic as a HAR file for API debugging.",
+		parameters: Type.Object({
+			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-network/<timestamp>.har." })),
+			includeBodies: Type.Optional(Type.Boolean({ default: true, description: "Fetch response bodies for CDP-captured entries (text-like types, size-capped, budgeted). Set false for a metadata-only HAR." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean({ description: "If true, run silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." })),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
+			const cwd = workspaceCwd(ctx);
+			const defaultPath = join(cwd, ".pi", "chrome-network", `${new Date().toISOString().replace(/[:.]/g, "-")}.har`);
+			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
+			const result = (await authorizedBridgeSend("network.export", withBackground(params), 60_000, signal)) as {
+				har?: unknown;
+				count?: number;
+				pageEntries?: number;
+				cdpEntries?: number;
+				truncated?: boolean;
+				mode?: boolean;
+			};
+			if (!result.har) throw new Error("Network export returned no HAR payload");
+			await mkdir(dirname(outputPath), { recursive: true });
+			await writeFile(outputPath, JSON.stringify(result.har, null, 2));
+			const count = result.count ?? 0;
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Exported ${count} network entr${count === 1 ? "y" : "ies"} to ${outputPath} (${result.pageEntries ?? 0} in-page, ${result.cdpEntries ?? 0} CDP${result.truncated ? ", truncated" : ""}).`,
+					},
+				],
+				details: { path: outputPath, count, pageEntries: result.pageEntries, cdpEntries: result.cdpEntries, truncated: result.truncated, captureMode: result.mode } as unknown as Record<string, unknown>,
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "chrome_screenshot",
 		label: "Chrome Screenshot",
 		description:
@@ -2096,7 +2333,9 @@ Usage rules:
 			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-screenshots/<timestamp>.<format>." })),
 			format: Type.Optional(StringEnum(imageFormatValues)),
 			quality: Type.Optional(Type.Number({ description: "JPEG quality 0-100." })),
-			fullPage: Type.Optional(Type.Boolean({ description: "Not supported by the extension bridge yet; viewport screenshots are captured." })),
+			uid: Type.Optional(Type.String({ description: "Snapshot uid (el-...) of the element to capture. Resolves the element's bounding rect and crops the capture to it via CDP; works on inactive tabs without focusing Chrome." })),
+			selector: Type.Optional(Type.String({ description: "CSS selector of the element to capture (alternative to uid)." })),
+			fullPage: Type.Optional(Type.Boolean({ description: "Not supported by the extension bridge yet; viewport screenshots are captured. Cannot be combined with uid/selector." })),
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
