@@ -784,6 +784,71 @@ function cdpExceptionText(details) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Restricted-scheme fallback
+// ---------------------------------------------------------------------------
+// chrome.scripting.executeScript cannot inject into browser-internal / opaque origins (about:,
+// chrome:, edge:, devtools:, view-source:, chrome-extension:, file:) even with <all_urls>. But
+// chrome.debugger/CDP Runtime.evaluate is NOT subject to that host-permission check and works on
+// those origins, so for such pages we drive injection and invocation over CDP instead. This fixes
+// "Cannot access contents of url about:blank" on a freshly created automation tab.
+function isScriptingRestrictedUrl(url) {
+  return /^(about:|chrome:|edge:|devtools:|view-source:|chrome-extension:)/i.test(url || "") || /^file:/i.test(url || "");
+}
+
+// Fetch the packaged snapshot_injected.js source once so restricted pages can inject it over CDP
+// (the scripting files: path is unavailable to them).
+let snapshotSourceCache = null;
+async function snapshotSourceText() {
+  if (snapshotSourceCache === null) {
+    snapshotSourceCache = await (await fetch(chrome.runtime.getURL("snapshot_injected.js"))).text();
+  }
+  return snapshotSourceCache;
+}
+
+// Evaluate `expression` in the MAIN (default) world of the given frame. Frame 0 (top) uses the
+// default execution context; sub-frames resolve their context via Runtime.enable/executionContexts.
+// Returns the raw CDP response (caller reads .exceptionDetails / .result.value).
+async function cdpEvalInFrame(tab, frameId, expression, opts) {
+  await attachDebugger(tab.id);
+  if (!frameId || frameId === 0) {
+    return cdp(tab.id, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true, userGesture: false, ...(opts || {}) });
+  }
+  await cdp(tab.id, "Runtime.enable", {}).catch(() => {});
+  const { contexts = [] } = await cdp(tab.id, "Runtime.executionContexts", {}).catch(() => ({}));
+  const ctx = (contexts || []).find(
+    (c) => c.auxData && String(c.auxData.frameId) === String(frameId) && (c.auxData.type === "default" || c.auxData.type === undefined),
+  );
+  return cdp(tab.id, "Runtime.evaluate", {
+    expression, returnByValue: true, awaitPromise: true, userGesture: false,
+    ...(ctx && typeof ctx.id === "number" ? { contextId: ctx.id } : {}),
+    ...(opts || {}),
+  });
+}
+
+// Wrap a snapshot invocation so its outcome serializes as { ok, value } | { ok, error }, matching
+// the func-form wrapper used by scripting.executeScript and preserving the evicted-uid / nearUid
+// surfacing that the executeScript path applies to the returned snapshot.
+function cdpSnapshotInvoke() {
+  return `(async()=>{try{const snapshotPage=globalThis.__piChromeSnapshotPage;if(typeof snapshotPage!=="function")throw new Error("snapshot_injected.js did not install __piChromeSnapshotPage");const invocationArgs=__piArgs;const value=await snapshotPage(...invocationArgs);if(value&&typeof value==="object"){const pageState=globalThis.__PI_CHROME_STATE__;if(pageState&&Array.isArray(pageState.evictedUids)&&pageState.evictedUids.length){if(!value.summary)value.summary={};value.summary.evictedUids=pageState.evictedUids.slice(-20);}if(Array.isArray(invocationArgs)&&typeof invocationArgs[3]==="string"){const resolved=pageState&&pageState.elements?pageState.elements[invocationArgs[3]]:null;if(!resolved||!resolved.isConnected){if(!value.filter)value.filter={};value.filter.nearUidResolved=false;}}}return {ok:true,value};}catch(error){return {ok:false,error:error&&error.stack?String(error.stack):String(error&&error.message||error)};}})()`;
+}
+
+function cdpInspectInvoke() {
+  return `(async()=>{try{const inspectTarget=globalThis.__piChromeInspectTarget;if(typeof inspectTarget!=="function")throw new Error("snapshot_injected.js did not install __piChromeInspectTarget");return {ok:true,value:await inspectTarget(...__piArgs)};}catch(error){return {ok:false,error:error&&error.stack?String(error.stack):String(error&&error.message||error)};}})()`;
+}
+
+// Normalize a CDP invoke response into the same { value } | { error } | { missingGlobal } shape that
+// unpackFrameInvoke produces, so the snapshot/inspect callers share one re-inject-on-missing path.
+function unpackCdpInvoke(res, fallbackError) {
+  if (res && res.exceptionDetails) {
+    return { missingGlobal: /did not install/.test(cdpExceptionText(res.exceptionDetails)), error: `${fallbackError}: ${cdpExceptionText(res.exceptionDetails) || "unknown"}` };
+  }
+  const envelope = res && res.result && res.result.value;
+  if (envelope && envelope.ok === false) return { missingGlobal: /did not install/.test(String(envelope.error)), error: envelope.error || fallbackError };
+  if (envelope && envelope.ok === true) return { value: envelope.value };
+  return { error: fallbackError };
+}
+
 function cdpIsSyntaxError(details) {
   if (!details) return false;
   const className = String(details.exception?.className || "");
@@ -2812,10 +2877,23 @@ async function executeInTab(params, func, args) {
     throw new Error(`Failed to inject Chrome page helpers: ${cdpExceptionText(defineRes.exceptionDetails) || "unknown error"}`);
   }
 
-  // Phase 2: run the action via chrome.scripting.executeScript. The `func:` form is
-  // injected by Chrome itself (not `new Function`), so it is CSP-safe, and it lets Chrome
-  // serialize the invocation args. The wrapper references window.__piChromeHelpers.__piAction
-  // defined above.
+  // Phase 2: run the action. chrome.scripting.executeScript (the `func:` form) is injected by
+  // Chrome itself (not `new Function`), so it is CSP-safe and lets Chrome serialize the args —
+  // but it can't reach restricted-scheme origins (about:blank etc.), where we fall back to CDP.
+  if (isScriptingRestrictedUrl(tab.url || "")) {
+    // Predefine the args under __piArgs, then call the action over CDP in the MAIN world. The
+    // wrapper references window.__piChromeHelpers.__piAction defined in Phase 1 above.
+    await cdpEvalInFrame(tab, 0, `window.__piArgs=${JSON.stringify(args || [])};`, {});
+    const res = await cdpEvalInFrame(tab, 0,
+      `(async()=>{try{return {ok:true,value:await window.__piChromeHelpers.__piAction(...window.__piArgs)};}catch(error){return {ok:false,error:error?.stack||error?.message||String(error)};}})()`,
+      { awaitPromise: true });
+    if (res && res.exceptionDetails) {
+      throw new Error(`Failed to execute page action: ${cdpExceptionText(res.exceptionDetails) || "unknown error"}`);
+    }
+    const envelope = res && res.result && res.result.value;
+    if (envelope && envelope.ok === false) throw new Error(envelope.error || "Chrome page script failed");
+    return envelope && envelope.ok === true ? envelope.value : undefined;
+  }
   const results = await executeScriptTimed({
     target: { tabId: tab.id },
     world: "MAIN",
@@ -2954,11 +3032,19 @@ function parseFrameUid(uid) {
 // webNavigation.onCommitted and when a tab closes.
 const snapshotScriptFrames = new Map(); // tabId -> Set<frameId>
 async function injectSnapshotFile(tabId, frameId) {
-  await executeScriptTimed({
-    target: { tabId, frameIds: [frameId] },
-    world: "MAIN",
-    files: ["snapshot_injected.js"],
-  }, `inject snapshot script in tab ${tabId} frame ${frameId}`);
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  const restricted = isScriptingRestrictedUrl((tab && tab.url) || "");
+  if (restricted) {
+    // scripting.executeScript cannot reach restricted origins (about:blank etc.); inject the
+    // snapshot source over CDP instead (the scripting files: path is unavailable there).
+    await cdpEvalInFrame({ id: tabId }, frameId, await snapshotSourceText(), {});
+  } else {
+    await executeScriptTimed({
+      target: { tabId, frameIds: [frameId] },
+      world: "MAIN",
+      files: ["snapshot_injected.js"],
+    }, `inject snapshot script in tab ${tabId} frame ${frameId}`);
+  }
   let set = snapshotScriptFrames.get(tabId);
   if (!set) { set = new Set(); snapshotScriptFrames.set(tabId, set); }
   set.add(frameId);
@@ -2981,6 +3067,11 @@ function clearSnapshotScriptInstalled(tabId, frameId) {
 // the tab navigated between injection and invocation (missing global).
 async function runSnapshotPageInFrame(tab, frameId, args) {
   const invoke = async () => {
+    if (isScriptingRestrictedUrl(tab.url || "")) {
+      const res = await cdpEvalInFrame(tab, frameId, `window.__piArgs=${JSON.stringify(args || [])}; ${cdpSnapshotInvoke()}`, { awaitPromise: true });
+      const outcome = unpackCdpInvoke(res, "Chrome snapshot script failed");
+      return outcome;
+    }
     const results = await executeScriptTimed({
       target: { tabId: tab.id, frameIds: [frameId] },
       world: "MAIN",
@@ -3026,6 +3117,11 @@ async function runSnapshotPageInFrame(tab, frameId, args) {
 // Invoke the installed inspect target function inside one frame (same re-inject-once policy).
 async function runInspectPageInFrame(tab, frameId, args) {
   const invoke = async () => {
+    if (isScriptingRestrictedUrl(tab.url || "")) {
+      const res = await cdpEvalInFrame(tab, frameId, `window.__piArgs=${JSON.stringify(args || [])}; ${cdpInspectInvoke()}`, { awaitPromise: true });
+      const outcome = unpackCdpInvoke(res, "Chrome inspect script failed");
+      return outcome;
+    }
     const results = await executeScriptTimed({
       target: { tabId: tab.id, frameIds: [frameId] },
       world: "MAIN",
