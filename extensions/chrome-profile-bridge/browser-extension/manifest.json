@@ -11,7 +11,9 @@
     "activeTab",
     "alarms",
     "webNavigation",
-    "debugger"
+    "debugger",
+    "downloads",
+    "cookies"
   ],
   "host_permissions": [
     "<all_urls>",
