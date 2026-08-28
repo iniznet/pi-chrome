@@ -112,7 +112,14 @@ async function run() {
     ok(f("https://example.com/") === false, "allowed: https");
     ok(f("http://127.0.0.1:17318/") === false, "allowed: loopback http");
     ok(f("data:text/html,hi") === false, "allowed: data (scripting-reachable)");
-    ok(f("") === false, "allowed: empty url");
+    ok(f("") === false, "allowed: empty url (leaf sees empty)");
+
+    // tabScriptingRestricted normalizes an empty/absent tab url to blank, so a freshly created
+    // automation tab with no populated url STILL routes to the CDP fallback (the regression that
+    // kept chrome_snapshot failing on about:blank even after the first fallback landed).
+    ok((await sandbox.tabScriptingRestricted({ url: "about:blank" })) === true, "tab-restricted: about:blank object");
+    ok((await sandbox.tabScriptingRestricted({})) === true, `tab-restricted: url-less tab resolves to blank -> restricted`);
+    ok((await sandbox.tabScriptingRestricted({ url: "https://example.com/" })) === false, "tab-restricted: https not restricted");
   }
 
   // ===== 2. executeInTab on about:blank runs the action over CDP (not scripting.executeScript) =====

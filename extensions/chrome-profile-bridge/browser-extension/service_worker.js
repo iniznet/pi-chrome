@@ -796,6 +796,23 @@ function isScriptingRestrictedUrl(url) {
   return /^(about:|chrome:|edge:|devtools:|view-source:|chrome-extension:)/i.test(url || "") || /^file:/i.test(url || "");
 }
 
+// Resolve whether a tab can be reached by scripting.executeScript. The passed tab object may carry
+// an empty/absent url (e.g. an automation target), while the REAL current URL is about:blank for a
+// freshly created blank tab — an empty url must not fall through to scripting.executeScript, which
+// errors on the actual blank destination. Fetch the authoritative url and treat empty as blank
+// (blank is scripting-restricted, so it always routes to the CDP fallback).
+async function tabScriptingRestricted(tab) {
+  let url = tab && tab.url;
+  if (!url && tab && tab.id != null) {
+    const fresh = await chrome.tabs.get(tab.id).catch(() => null);
+    url = (fresh && fresh.url) || "";
+  }
+  // Treat empty/absent as blank: a freshly created automation tab has no scriptable URL, and an
+  // unknown URL must never fall through to scripting.executeScript (it errors on the real blank
+  // destination).
+  return isScriptingRestrictedUrl(url ? url : "about:blank");
+}
+
 // Fetch the packaged snapshot_injected.js source once so restricted pages can inject it over CDP
 // (the scripting files: path is unavailable to them).
 let snapshotSourceCache = null;
@@ -2880,7 +2897,7 @@ async function executeInTab(params, func, args) {
   // Phase 2: run the action. chrome.scripting.executeScript (the `func:` form) is injected by
   // Chrome itself (not `new Function`), so it is CSP-safe and lets Chrome serialize the args —
   // but it can't reach restricted-scheme origins (about:blank etc.), where we fall back to CDP.
-  if (isScriptingRestrictedUrl(tab.url || "")) {
+  if (await tabScriptingRestricted(tab)) {
     // Predefine the args under __piArgs, then call the action over CDP in the MAIN world. The
     // wrapper references window.__piChromeHelpers.__piAction defined in Phase 1 above.
     await cdpEvalInFrame(tab, 0, `window.__piArgs=${JSON.stringify(args || [])};`, {});
@@ -3033,7 +3050,7 @@ function parseFrameUid(uid) {
 const snapshotScriptFrames = new Map(); // tabId -> Set<frameId>
 async function injectSnapshotFile(tabId, frameId) {
   const tab = await chrome.tabs.get(tabId).catch(() => null);
-  const restricted = isScriptingRestrictedUrl((tab && tab.url) || "");
+  const restricted = await tabScriptingRestricted(tab || { id: tabId });
   if (restricted) {
     // scripting.executeScript cannot reach restricted origins (about:blank etc.); inject the
     // snapshot source over CDP instead (the scripting files: path is unavailable there).
@@ -3067,7 +3084,7 @@ function clearSnapshotScriptInstalled(tabId, frameId) {
 // the tab navigated between injection and invocation (missing global).
 async function runSnapshotPageInFrame(tab, frameId, args) {
   const invoke = async () => {
-    if (isScriptingRestrictedUrl(tab.url || "")) {
+    if (await tabScriptingRestricted(tab)) {
       const res = await cdpEvalInFrame(tab, frameId, `window.__piArgs=${JSON.stringify(args || [])}; ${cdpSnapshotInvoke()}`, { awaitPromise: true });
       const outcome = unpackCdpInvoke(res, "Chrome snapshot script failed");
       return outcome;
@@ -3117,7 +3134,7 @@ async function runSnapshotPageInFrame(tab, frameId, args) {
 // Invoke the installed inspect target function inside one frame (same re-inject-once policy).
 async function runInspectPageInFrame(tab, frameId, args) {
   const invoke = async () => {
-    if (isScriptingRestrictedUrl(tab.url || "")) {
+    if (await tabScriptingRestricted(tab)) {
       const res = await cdpEvalInFrame(tab, frameId, `window.__piArgs=${JSON.stringify(args || [])}; ${cdpInspectInvoke()}`, { awaitPromise: true });
       const outcome = unpackCdpInvoke(res, "Chrome inspect script failed");
       return outcome;

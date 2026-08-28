@@ -2,6 +2,10 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.47 — 2026-08-28
+
+- **Snapshot/inspect work on restricted-scheme URLs.** `chrome_snapshot` (and `chrome_evaluate`, console/network, `chrome_wait_for`) previously failed on a freshly created automation tab with `Cannot access contents of url "about:blank"` — `chrome.scripting.executeScript` cannot inject into browser-internal/opaque origins (`about:`, `chrome:`, `edge:`, `devtools:`, `view-source:`, `file:`) even with `<all_urls>`. These pages now fall back to the CDP debugger path (`Runtime.evaluate`, which bypasses the host-permission check), so the agent can snapshot/inspect a blank automation tab. The restricted detection resolves the authoritative tab URL, so an automation target with an empty `url` is still routed through the fallback instead of failing.
+
 ## 0.15.46 — 2026-08-04
 
 - **Exactly-once command delivery.** The bridge now mints a monotonic command id per send (`pid:seq`), tracks every command through a 3-state machine (pending → received → completed), and deduplicates retries, so a timed-out command can never silently double-execute. The companion extension records executed command ids in an in-memory journal (10-minute TTL, 200-entry cap) and answers duplicate deliveries from it.
