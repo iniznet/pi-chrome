@@ -50,12 +50,13 @@ function makeChromeState() {
   // Seed a user window with two real user tabs (Gmail + a research article, the active one).
   const userWindowId = alloc.window();
   windows.set(userWindowId, { id: userWindowId });
-  const userGmail = { id: alloc.tab(), windowId: userWindowId, url: "https://mail.google.com/", active: false, groupId: -1 };
-  const userArticle = { id: alloc.tab(), windowId: userWindowId, url: "https://example.com/research-article", active: true, groupId: -1 };
+  const userGmail = { id: alloc.tab(), windowId: userWindowId, url: "https://mail.google.com/", title: "Gmail", active: false, groupId: -1 };
+  const userArticle = { id: alloc.tab(), windowId: userWindowId, url: "https://example.com/research-article", title: "Research Article", active: true, groupId: -1 };
   tabs.set(userGmail.id, userGmail);
   tabs.set(userArticle.id, userArticle);
 
-  return { tabs, windows, groups, storage, alloc, userWindowId, userGmail, userArticle };
+  // Last-focused window override for the tab.active path; defaults to the seeded user window.
+  return { tabs, windows, groups, storage, alloc, userWindowId, userGmail, userArticle, lastFocusedWindowId: null };
 }
 
 function makeChrome(state, { withWindows = true, withStorage = true, withTabGroups = false } = {}) {
@@ -64,12 +65,48 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
   const listener = { addListener: noop, removeListener: noop };
 
   const chrome = {
-    runtime: { id: "unittestextension", getManifest: () => ({ version: "0.0.0" }), onInstalled: listener, onStartup: listener, lastError: null },
+    runtime: { id: "unittestextension", getManifest: () => ({ version: "0.0.0" }), getURL: (p) => `chrome-extension://unittestextension/${String(p || "").replace(/^\/+/, "")}`, onInstalled: listener, onStartup: listener, lastError: null },
     alarms: { onAlarm: listener, create: noop, clear: noop, clearAll: noop },
     action: { onClicked: listener },
-    debugger: { sendCommand: noop, attach: async () => {}, detach: async () => {}, getTargets: (cb) => cb([]), onDetach: listener },
-    scripting: { executeScript: async () => [{ result: undefined }], registerContentScripts: async () => {}, unregisterContentScripts: async () => {} },
-    webNavigation: { onCommitted: listener },
+    // CDP sendCommand responds to the calls the snapshot/inspect paths make on a blank
+    // (restricted-scheme) automation tab: Page.enable is fire-and-forget, the snapshot
+    // source injection is unobserved, and the Runtime.evaluate invocations return a fake
+    // MAIN-world result envelope (mirrors what the real snapshot_injected.js would answer).
+    debugger: {
+      sendCommand: (debuggee, method, params, callback) => {
+        const cb = typeof callback === "function" ? callback : () => {};
+        if (method === "Runtime.evaluate") {
+          const expression = String(params && params.expression || "");
+          if (expression.includes("__piChromeSnapshotPage")) {
+            // CDP Runtime.evaluate returns { result: <RemoteObject> }; the SW reads res.result.value.
+            cb({ result: { type: "object", value: { ok: true, value: { elements: [], summary: {} } } } });
+            return;
+          }
+          if (expression.includes("__piChromeInspectTarget")) {
+            cb({ result: { type: "object", value: { ok: true, value: { uid: "el-1", tag: "BUTTON", text: "" } } } });
+            return;
+          }
+        }
+        cb({});
+      },
+      attach: async () => {},
+      detach: async () => {},
+      getTargets: (cb) => cb([]),
+      onDetach: listener,
+    },
+    // executeScript runs the service worker's own func-form in the sandbox (a real MAIN-world
+    // run on the http(s) path), so snapshot/inspect invocations resolve to the fakes below.
+    scripting: {
+      executeScript: async (options) => {
+        if (typeof options.func === "function") {
+          const value = await options.func(...(options.args || []));
+          return [{ result: value }];
+        }
+        return [{ result: undefined }]; // files-form injection reports success without running
+      },
+      registerContentScripts: async () => {},
+      unregisterContentScripts: async () => {},
+    },
     tabs: {
       onUpdated: listener,
       query: async (q = {}) => {
@@ -123,6 +160,13 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
         tabs.set(tab.id, tab);
         return { id, focused, tabs: [{ ...tab }] };
       },
+      getLastFocused: async () => {
+        // tab.active resolves the last-focused window; tests override state.lastFocusedWindowId.
+        const id = typeof state.lastFocusedWindowId === "number" ? state.lastFocusedWindowId : userWindowId;
+        const win = windows.get(id);
+        if (!win) throw new Error(`No window with id ${id}`);
+        return { ...win };
+      },
       get: async (id) => { const w = windows.get(id); if (!w) throw new Error(`No window with id ${id}`); return { ...w }; },
       remove: async (id) => { windows.delete(id); for (const [tid, t] of [...tabs]) if (t.windowId === id) tabs.delete(tid); },
       update: async () => {},
@@ -140,11 +184,20 @@ function loadWorker(chrome) {
     console, JSON, Date, Math, Promise, Array, Object, String, Number, Boolean,
     Error, TypeError, Map, Set, BigInt, Symbol, structuredClone,
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval: noop,
-    fetch: async () => { throw new Error("no network in unit test"); },
+    fetch: async (url) => {
+      // snapshotSourceText() fetches the packaged snapshot_injected.js for restricted pages.
+      if (String(url).includes("snapshot_injected.js")) return { text: async () => "/* unit-test snapshot source */" };
+      throw new Error("no network in unit test");
+    },
     navigator: { userAgent: "unit-test" },
     WebSocket: function () {},
     chrome,
   };
+  // Fake MAIN-world entry points so the real snapshotInTab/inspectInTab invocation paths resolve
+  // (the real snapshot_injected.js is not loaded into the vm). snapshotInTab asserts on the
+  // returned object's _blankAutomationTab flag, not on element content.
+  sandbox.__piChromeSnapshotPage = async () => ({ elements: [], summary: {} });
+  sandbox.__piChromeInspectTarget = async () => ({ uid: "el-1", tag: "BUTTON", text: "" });
   sandbox.globalThis = sandbox;
   sandbox.self = sandbox;
   vm.createContext(sandbox);
@@ -510,6 +563,97 @@ async function run() {
     });
     ok(state.tabs.get(nav.id).groupId === userGroupId, "grouped-tab: the tab stays in the user's group after the action");
     ok(state.groups.get(userGroupId).title === "User Work", "grouped-tab: the user's group title survives the page.* action");
+  }
+
+  // ===== QoL discoverability: tab.list enumerates open tabs + named handles. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    // Group the research article so tab.list surfaces group info.
+    const gid = state.alloc.group();
+    state.groups.set(gid, { id: gid, title: "User Work", color: "blue", collapsed: false, windowId: state.userWindowId });
+    state.userArticle.groupId = gid;
+
+    const saved = await w.dispatch("tab.save", { name: "inbox", targetId: String(state.userGmail.id), sessionKey: SK });
+    ok(saved.ok === true && saved.handle.name === "inbox", "tab.list: seeded a named handle for the list test");
+    // A handle owned by another session must stay filtered out per-session.
+    await w.dispatch("tab.save", { name: "other-session", targetId: String(state.userGmail.id), sessionKey: "session:beta" });
+
+    const listed = await w.dispatch("tab.list", { sessionKey: SK });
+    ok(Array.isArray(listed.tabs) && Array.isArray(listed.handles), "tab.list: returns both a tabs array and the handles registry");
+    ok(listed.tabs.length === state.tabs.size, "tab.list: tabs enumerates every open tab");
+
+    const byId = new Map(listed.tabs.map((t) => [t.id, t]));
+    const gmail = byId.get(state.userGmail.id);
+    const article = byId.get(state.userArticle.id);
+    ok(!!gmail && gmail.url === "https://mail.google.com/" && gmail.active === false, "tab.list: inactive user tab carries url + active=false");
+    ok(!!article && article.active === true && article.windowId === state.userWindowId, "tab.list: active user tab carries the active flag + windowId");
+    ok(typeof gmail.groupId === "number" && gmail.groupId === -1, "tab.list: ungrouped tab reports groupId -1");
+    ok(article.groupId === gid, "tab.list: grouped tab reports its groupId");
+    ok(article.group && article.group.title === "User Work" && article.group.color === "blue" && article.group.windowId === state.userWindowId, "tab.list: grouped tab carries group title/color/windowId");
+    ok(article.group.piGroup === false, "tab.list: a user group is not flagged as a Pi session group");
+    ok(typeof gmail.title === "string" && typeof article.title === "string", "tab.list: every tab carries a string title");
+
+    const handle = listed.handles.find((h) => h.name === "inbox");
+    ok(!!handle && handle.tabId === state.userGmail.id && handle.ownerSessionKey === SK && typeof handle.savedAt === "number", "tab.list: named handle carried through with its registry entry");
+    ok(!listed.handles.some((h) => h.name === "other-session"), "tab.list: handles stay filtered by the calling session");
+    const all = await w.dispatch("tab.list", {});
+    ok(all.handles.some((h) => h.name === "inbox") && all.handles.some((h) => h.name === "other-session"), "tab.list: with no sessionKey all sessions' handles are listed");
+  }
+
+  // ===== QoL: tab.active resolves the last-focused window's active tab (read-only). =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const windowsBefore = state.windows.size;
+
+    const focused = await w.dispatch("tab.active", { sessionKey: SK });
+    ok(focused.id === state.userArticle.id, "tab.active: resolves the last-focused window's active tab");
+    ok(focused.windowId === state.userWindowId && focused.active === true, "tab.active: returns windowId + active flag");
+    ok(focused.url === "https://example.com/research-article", "tab.active: returns the active tab's url");
+    ok(w.isPiChromeOwnedTarget(focused.id) === false, "tab.active: never resolves an automation tab");
+    ok(state.windows.size === windowsBefore, "tab.active: read-only — no automation window/tab is created");
+    const status = await w.dispatch("automation.status", { sessionKey: SK });
+    ok(status.tabId === null && status.windowId === null, "tab.active: no automation target is claimed");
+
+    // With an owned automation tab present, tab.active still returns the USER's focused tab.
+    const nav = await w.dispatch("page.navigate", { url: "https://pi.test/work", waitUntilLoad: false, sessionKey: SK });
+    const focused2 = await w.dispatch("tab.active", { sessionKey: SK });
+    ok(focused2.id === state.userArticle.id && focused2.id !== nav.id, "tab.active: ignores the owned automation tab when a user tab is focused");
+
+    // No active tab in the focused window -> a clear error, not a silent fallback.
+    const deadWinId = state.alloc.window();
+    state.windows.set(deadWinId, { id: deadWinId });
+    const inertTab = { id: state.alloc.tab(), windowId: deadWinId, url: "https://example.com/inert", active: false, groupId: -1 };
+    state.tabs.set(inertTab.id, inertTab);
+    state.lastFocusedWindowId = deadWinId;
+    const err = await errorOf(() => w.dispatch("tab.active", { sessionKey: SK }));
+    ok(/no active tab/i.test(err?.message || ""), "tab.active: errors clearly when the focused window has no active tab");
+  }
+
+  // ===== QoL: _blankAutomationTab flags an owned blank automation target only. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const target = await w.getOrCreateAutomationTarget(SK);
+    ok(target.url === "about:blank", "blank-flag: owned automation target starts blank");
+    ok(w.isPiChromeOwnedTarget(target.id, SK) === true, "blank-flag: the target is owned by this session");
+
+    const snap = await w.dispatch("page.snapshot", { sessionKey: SK });
+    ok(snap && typeof snap === "object", "blank-flag: page.snapshot on the owned blank target returns a result");
+    ok(snap._blankAutomationTab === true, `blank-flag: snapshot of the owned blank target sets _blankAutomationTab (got keys: ${Object.keys(snap || {}).join(",") || "none"})`);
+
+    const insp = await w.dispatch("page.inspect", { uid: "el-1", sessionKey: SK });
+    ok(insp && typeof insp === "object" && insp._blankAutomationTab === true, `blank-flag: inspect of the owned blank target sets _blankAutomationTab (got keys: ${Object.keys(insp || {}).join(",") || "none"})`);
+
+    // Once the owned target is navigated to a real page the flag must clear.
+    await w.dispatch("page.navigate", { url: "https://pi.test/real", waitUntilLoad: false, sessionKey: SK });
+    const snap2 = await w.dispatch("page.snapshot", { sessionKey: SK });
+    ok(snap2 && snap2._blankAutomationTab !== true, "blank-flag: owned target on an http(s) page is NOT flagged");
+
+    // An explicitly targeted (user) http(s) tab is never flagged either.
+    const userSnap = await w.dispatch("page.snapshot", { targetId: String(state.userArticle.id), sessionKey: SK });
+    ok(userSnap && userSnap._blankAutomationTab !== true, "blank-flag: a user http(s) tab is never flagged");
   }
 
   console.log(`\n${passes} passed, ${failures} failed`);

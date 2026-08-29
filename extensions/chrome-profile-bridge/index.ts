@@ -6,18 +6,23 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { dirname, join, resolve } from "node:path";
 import {
 	AuthState,
+	appendBlankAutomationHint,
 	BridgeProtocol,
 	CommandClaim,
 	MAX_ELEMENTS,
 	type BridgeCommand,
 	type BridgeResult,
+	type ChromeTabRecord,
 	type HistoryEntry,
 	type PendingEntry,
 	type SnapshotDigest,
+	type TabListResult,
 	diffDigests,
 	formatChromeInspect,
 	formatChromeSnapshot,
 	formatIncludedSnapshotText,
+	formatTab,
+	formatTabList,
 	recordHistory,
 	safeJson,
 	summarizeParams,
@@ -781,7 +786,7 @@ class ChromeProfileBridge {
 	}
 }
 
-const tabActionValues = ["list", "new", "activate", "close", "group", "ungroup", "version", "save"] as const;
+const tabActionValues = ["list", "active", "new", "activate", "close", "group", "ungroup", "version", "save"] as const;
 const imageFormatValues = ["png", "jpeg"] as const;
 const waitForValues = ["selector", "expression", "navigation", "networkIdle"] as const;
 const downloadActionValues = ["list", "wait", "clear"] as const;
@@ -1658,7 +1663,7 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_tab",
 		label: "Chrome Tab",
-		description: "List, create, activate, close, group, ungroup, inspect, or save named handles for tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab. action=save registers a named handle (name) for the resolved tab so a subagent can find or close its own tabs later; action=list returns the named-handle registry.",
+		description: "List, create, activate, close, group, ungroup, inspect, or save named handles for tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab. action=save registers a named handle (name) for the resolved tab so a subagent can find or close its own tabs later; action=list returns all open tabs (active marker, tabId, [group] title, url) plus the named-handle registry; action=active resolves the user's currently focused tab (never the automation tab).",
 		promptSnippet: "List/open/activate/close/group existing Chrome tabs through the companion extension.",
 		parameters: Type.Object({
 			action: StringEnum(tabActionValues),
@@ -1684,23 +1689,19 @@ Usage rules:
 			}
 			const result = await authorizedBridgeSend(`tab.${params.action}`, forwarded, DEFAULT_TIMEOUT_MS, signal);
 			if (params.action === "list") {
-				// tab.list returns the named-handle registry ({ handles: [...] }) per the documented
-				// contract. Accept both that shape and a bare tab array (older companion extension)
-				// so a shape mismatch never crashes the tool (regression: "tabs.map is not a function").
-				type Handle = { name?: string; tabId?: number; windowId?: number; url?: string; title?: string; ownerSessionKey?: string; savedAt?: number };
-				type TabRow = { id?: number; title?: string; url?: string; active?: boolean; group?: { title?: string } | null };
-				const handles = (result as { handles?: Handle[] | undefined })?.handles;
-				const isRegistry = Array.isArray(handles);
-				const rows: Array<Handle | TabRow> = isRegistry ? handles! : Array.isArray(result) ? (result as TabRow[]) : [];
-				const text =
-					rows
-						.map((row) =>
-							isRegistry
-								? `${(row as Handle).name ?? "(unnamed)"}\t${(row as Handle).tabId ?? ""}\t${(row as Handle).title || "(untitled)"}\t${(row as Handle).url || ""}`
-								: `${(row as TabRow).id}\t${(row as TabRow).active ? "*" : " "}\t${(row as TabRow).group?.title ? `[${(row as TabRow).group!.title}] ` : ""}${(row as TabRow).title || "(untitled)"}\t${(row as TabRow).url}`,
-						)
-						.join("\n") || "No named handles saved.";
-				return { content: [{ type: "text", text }], details: { result } };
+				// tab.list returns BOTH the user's open tabs and the named-handle registry
+				// ({ tabs, handles }). formatTabList also tolerates a bare tab array (older companion
+				// extension) or a { handles }-only registry, so a shape mismatch never crashes the
+				// tool (regression: "tabs.map is not a function").
+				return { content: [{ type: "text", text: formatTabList(result as TabListResult) }], details: { result } };
+			}
+			if (params.action === "active") {
+				// tab.active resolves the user's currently FOCUSED tab (never the automation tab) and
+				// returns a single tab record plus its windowId. Defensively unwrap a { tab } envelope
+				// in case an older companion extension wraps the record.
+				const envelope = result !== null && typeof result === "object" ? (result as { tab?: ChromeTabRecord }) : null;
+				const record = envelope !== null && envelope.tab !== undefined ? envelope.tab : result;
+				return { content: [{ type: "text", text: formatTab(record as ChromeTabRecord | null | undefined) }], details: { result: result as Json } };
 			}
 			return { content: [{ type: "text", text: safeJson(result) }], details: { result: result as Json } };
 		},
@@ -1736,7 +1737,8 @@ Usage rules:
 				DEFAULT_TIMEOUT_MS,
 				signal,
 			);
-			return { content: [{ type: "text", text: formatChromeSnapshot(snapshot) }], details: { snapshot } };
+			const text = appendBlankAutomationHint(formatChromeSnapshot(snapshot), snapshot);
+			return { content: [{ type: "text", text }], details: { snapshot } };
 		},
 	});
 
@@ -1868,7 +1870,7 @@ Usage rules:
 				: typeof value === "string"
 					? value
 					: safeJson(value) ?? "undefined";
-			return { content: [{ type: "text", text: truncateText(text) }], details: { value: value as Json } };
+			return { content: [{ type: "text", text: truncateText(appendBlankAutomationHint(text, value)) }], details: { value: value as Json } };
 		},
 	});
 

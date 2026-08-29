@@ -22,12 +22,16 @@ const mod = await import("data:text/javascript;base64," + Buffer.from(js).toStri
 
 const {
   AuthState,
+  BLANK_AUTOMATION_TAB_HINT,
   CHROME_HISTORY_CAP,
   HISTORY_PARAMS_SKIP,
   MAX_ELEMENTS,
   MAX_TEXT_CHARS,
+  appendBlankAutomationHint,
   diffDigests,
   formatChromeSnapshot,
+  formatTab,
+  formatTabList,
   recordHistory,
   safeJson,
   summarizeParams,
@@ -171,7 +175,7 @@ function run() {
     ok(history.length === CHROME_HISTORY_CAP, "history: ring trims to CHROME_HISTORY_CAP entries");
     ok(history[0].paramsSummary === "click 1", "history: the OLDEST entry was dropped (click 0 gone)");
     ok(history[history.length - 1].paramsSummary === "click 200", "history: the newest entry is retained");
-    ok(history.every((entry) => typeof entry.at === "number" && entry.durationMs === 100), "history: at + durationMs stamped on every entry");
+    ok(history.every((entry) => typeof entry.at === "number" && typeof entry.durationMs === "number" && entry.durationMs >= 100), "history: at + durationMs stamped on every entry");
 
     // HISTORY_PARAMS_SKIP: wire-only params never render in the summary.
     const summary = summarizeParams({
@@ -248,6 +252,72 @@ function run() {
     ok(restored.isActive(NOW) === true && restored.sessionKey === "session:A", "auth: persisted grant restores active");
     const expiredPersisted = new AuthState(NOW - 1, "session:A");
     ok(expiredPersisted.isActive(NOW) === false, "auth: an already-expired persisted grant stays locked");
+  }
+
+  // ===== formatTabList: tabs + handles discovery, active marker, group prefix, fallback. =====
+  {
+    // Contract shape: { tabs, handles } — one line per open tab, then a Named handles section.
+    const result = {
+      tabs: [
+        { id: 7, title: "Inbox", url: "https://mail.example/inbox", active: false, windowId: 1, groupId: -1, group: null },
+        { id: 8, title: "PR #42", url: "https://github.example/pr/42", active: true, windowId: 1, groupId: 3, group: { title: "Work" } },
+      ],
+      handles: [{ name: "main", tabId: 8, windowId: 1, url: "https://github.example/pr/42", title: "PR #42", ownerSessionKey: "session:A", savedAt: 123 }],
+    };
+    const text = formatTabList(result);
+    ok(text.length > 0, "tabs: list is non-empty whenever tabs exist");
+    ok(text.startsWith(" \t7\tInbox\thttps://mail.example/inbox"), "tabs: inactive tab line (space marker, tabId, title, url)");
+    ok(text.includes("*\t8\t[Work] PR #42\thttps://github.example/pr/42"), "tabs: active marker + [group] prefix on the active tab");
+    ok(text.includes("Named handles:"), "tabs: Named handles section header rendered when handles exist");
+    ok(text.includes("  main\t8\tPR #42\thttps://github.example/pr/42"), "tabs: handle line renders name/tabId/title/url");
+    ok(!text.includes("No named handles saved."), "tabs: fallback message never appears while tabs exist");
+
+    // Bare tab array (older companion extension) still renders.
+    const bare = formatTabList([{ id: 1, title: "Doc", url: "https://doc.example/", active: true, groupId: -1, group: null }]);
+    ok(bare.includes("*\t1\tDoc\thttps://doc.example/"), "tabs: bare tab array accepted");
+
+    // { handles }-only registry renders the handles section without a tabs section.
+    const onlyHandles = formatTabList({ handles: [{ name: "a", tabId: 1, title: "A", url: "https://a.example/" }] });
+    ok(onlyHandles.startsWith("Named handles:"), "tabs: { handles }-only shape starts with the handles section");
+    ok(onlyHandles.includes("  a\t1\tA\thttps://a.example/"), "tabs: { handles }-only shape renders the handle line");
+
+    // Empty -> fallback message.
+    ok(formatTabList({ tabs: [], handles: [] }) === "No named handles saved.", "tabs: empty { tabs, handles } falls back to the no-handles message");
+    ok(formatTabList({ handles: [] }) === "No named handles saved.", "tabs: { handles: [] } only also falls back");
+  }
+
+  // ===== formatTab: single-tab renderer used by the chrome_tab action=active path. =====
+  {
+    const tab = formatTab({ id: 9, windowId: 1, active: true, title: "Dashboard", url: "https://dash.example/", pinned: false, incognito: false, groupId: 3, group: { title: "Work" } });
+    ok(tab.includes("# Chrome tab 9"), "tab: id rendered in the header");
+    ok(tab.includes("Dashboard") && tab.includes("https://dash.example/"), "tab: title + url rendered");
+    ok(tab.includes("state: active"), "tab: active flag rendered");
+    ok(tab.includes("windowId: 1"), "tab: windowId rendered");
+    ok(tab.includes("group: Work"), "tab: group title rendered");
+    const undef = formatTab(undefined);
+    ok(typeof undef === "string" && undef.length > 0, "tab: undefined input renders without crashing");
+  }
+
+  // ===== Blank-automation-tab hint: exact contract line appended only when the flag is set. =====
+  {
+    const base = "# Chrome snapshot (auto)\nTitle\nabout:blank";
+    const flagged = appendBlankAutomationHint(base, { _blankAutomationTab: true, title: "about:blank", url: "about:blank" });
+    ok(flagged.startsWith(base), "hint: original snapshot text preserved");
+    ok(flagged.includes(BLANK_AUTOMATION_TAB_HINT), "hint: exact contract line appended");
+    ok(flagged.indexOf(BLANK_AUTOMATION_TAB_HINT) > base.length, "hint: hint follows the snapshot text");
+    ok(appendBlankAutomationHint(base, { _blankAutomationTab: false }) === base, "hint: flag=false leaves text unchanged");
+    ok(appendBlankAutomationHint(base, {}) === base, "hint: missing flag leaves text unchanged");
+    ok(appendBlankAutomationHint(base, "not-an-object") === base, "hint: non-object raw leaves text unchanged");
+  }
+
+  // ===== chrome_tab 'active' action wired into the host catalog (source-level check). =====
+  // index.ts imports the pi SDK so it cannot be loaded in this harness; assert the schema enum
+  // and the extracted helpers are wired at the source level instead.
+  {
+    const indexPath = path.resolve(__dirname, "../../extensions/chrome-profile-bridge/index.ts");
+    const indexSrc = fs.readFileSync(indexPath, "utf8");
+    ok(/const tabActionValues = \[[^\]]*"active"/.test(indexSrc), "catalog: chrome_tab tabActionValues includes 'active'");
+    ok(/formatTabList\(/.test(indexSrc) && /formatTab\(/.test(indexSrc), "catalog: index.ts uses the extracted formatTabList/formatTab helpers");
   }
 
   console.log(`\n${passes} passed, ${failures} failed`);

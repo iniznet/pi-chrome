@@ -158,6 +158,18 @@ function isPiChromeOwnedTarget(tabId, sessionKey) {
   return false;
 }
 
+// QoL blank-automation-tab flag: true when the resolved target is this session's OWNED
+// automation tab (came via the implicit automation-target path, never an explicit targetId) and
+// its page is blank (about:blank / '' / chrome://newtab). The host appends a hint telling the
+// agent to run chrome_tab list instead of being stuck on pi-chrome's empty dedicated tab.
+function isBlankAutomationTarget(tab, params, resolution) {
+  if (!tab || typeof tab.id !== "number") return false;
+  if (!resolution || !resolution.viaAutomationTarget) return false;
+  if (!isPiChromeOwnedTarget(tab.id, sessionKeyOf(params))) return false;
+  const url = String(tab.url || "");
+  return url === "" || url === "about:blank" || url === "chrome://newtab";
+}
+
 // Create a fresh automation target for `sessionKey`. If this session already has a tab group,
 // create the tab inside that group's window so one Pi session keeps one Chrome tab group (Chrome
 // groups cannot span windows). If no group exists yet, prefer an isolated window; fall back to a
@@ -2421,15 +2433,58 @@ async function dispatch(action, params) {
       return { ok: true, handle: { ...entry } };
     }
     case "tab.list": {
-      // Named handles registry (S2.1). When a sessionKey is given, only that session's handles
-      // are returned; with none, all handles across sessions are listed.
+      // QoL discoverability: return BOTH the user's open tabs and the named-handle registry.
+      // tabs[] enumerates every open tab (including pi-chrome automation tabs) with group info
+      // so an agent asked to "see my tab" can target a real page; handles[] keeps the existing
+      // per-session named registry (owner filtering unchanged). When a sessionKey is given, only
+      // that session's handles are returned; with none, all handles across sessions are listed.
       await hydrateTabRegistry();
       const owner = params && typeof params.sessionKey === "string" && params.sessionKey ? params.sessionKey : null;
       const handles = [];
       for (const entry of tabRegistry.values()) {
         if (owner === null || entry.ownerSessionKey === owner) handles.push({ ...entry });
       }
-      return { handles };
+      // Dedupe group lookups per groupId: many tabs share a handful of groups, and each
+      // groupRecord call is a chrome.tabGroups.get round-trip.
+      const groupCache = new Map();
+      const openTabs = await chrome.tabs.query({}).catch(() => []);
+      const tabs = [];
+      for (const candidate of openTabs || []) {
+        if (!candidate || typeof candidate.id !== "number") continue;
+        const groupId = typeof candidate.groupId === "number" ? candidate.groupId : -1;
+        let group = null;
+        if (groupId >= 0) {
+          if (!groupCache.has(groupId)) groupCache.set(groupId, await groupRecord(groupId).catch(() => null));
+          group = groupCache.get(groupId) ?? null;
+        }
+        tabs.push({
+          id: candidate.id,
+          windowId: candidate.windowId,
+          active: Boolean(candidate.active),
+          title: candidate.title || "",
+          url: candidate.url || "",
+          groupId,
+          group,
+        });
+      }
+      return { tabs, handles };
+    }
+    case "tab.active": {
+      // Resolve the user's currently FOCUSED active tab (the tab the human is actually looking
+      // at), never pi-chrome's automation tab. Read-only: never creates an automation target.
+      if (!chrome.windows || typeof chrome.windows.getLastFocused !== "function") {
+        throw new Error("chrome.windows.getLastFocused is unavailable; cannot resolve the active tab");
+      }
+      const focused = await chrome.windows.getLastFocused();
+      if (!focused || typeof focused.id !== "number") {
+        throw new Error("No focused Chrome window found");
+      }
+      const activeTabs = await chrome.tabs.query({ windowId: focused.id, active: true });
+      const tab = Array.isArray(activeTabs) ? activeTabs[0] : undefined;
+      if (!tab || typeof tab.id !== "number") {
+        throw new Error(`No active tab found in the focused window (windowId=${focused.id})`);
+      }
+      return { ...(await formatTab(tab)), windowId: focused.id };
     }
     case "tab.new": {
       // Every Pi-opened tab must join a tab group. There is intentionally no opt-out: an ungrouped
@@ -2746,7 +2801,7 @@ async function formatTab(tab) {
 //     explicit target they operate on an already-owned automation target if one exists, else
 //     throw asking for an explicit target — so e.g. `chrome_tab close` can never silently close
 //     the user's active tab the way it used to, and never spawns a throwaway tab just to close it.
-async function getTabByParams(params, { createOwnedTarget = true } = {}) {
+async function getTabByParams(params, { createOwnedTarget = true, resolution = null } = {}) {
   // tab-enumeration: avoid the full chrome.tabs.query({}) when an explicit targetId is given —
   // chrome.tabs.get(id) is a single lookup, and waitFor polls evaluateInTab every 250ms. The
   // full enumeration is only needed for urlIncludes/titleIncludes matching and stale-id listings.
@@ -2794,6 +2849,9 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
         "Pass targetId/urlIncludes/titleIncludes, or run chrome_navigate first.",
       );
     }
+    // QoL blank-tab hint: record that this target came from the implicit automation-target path
+    // (not an explicit targetId), so snapshot/inspect can flag a blank owned tab for the caller.
+    if (resolution) resolution.viaAutomationTarget = true;
   }
   if (!tab?.id) throw new Error("No matching Chrome tab found");
   const url = tab.url || "";
@@ -3180,7 +3238,10 @@ function unpackFrameInvoke(results, fallbackError) {
 }
 
 async function snapshotInTab(params) {
-  const tab = await getTabByParams(params);
+  // QoL blank-tab hint: track whether the target was resolved via this session's
+  // automation-target path (implicit, no targetId) so a blank owned tab can be flagged.
+  const resolution = {};
+  const tab = await getTabByParams(params, { resolution });
   if (params.foreground) await bringToFront(tab);
   // Trailing budget args are the service-worker-side hookup for the snippet's single budgeted
   // TreeWalker pass (node + wall-clock budgets): the values are passed positionally (args 8/9)
@@ -3201,6 +3262,9 @@ async function snapshotInTab(params) {
   if (!isSnapshotScriptInstalled(tab.id, 0)) await injectSnapshotFile(tab.id, 0);
   const snapshot = await runSnapshotPageInFrame(tab, 0, args);
   await mergeSubframeSnapshots(tab, snapshot, args);
+  if (snapshot && typeof snapshot === "object" && isBlankAutomationTarget(tab, params, resolution)) {
+    snapshot._blankAutomationTab = true;
+  }
   return snapshot;
 }
 
@@ -3293,12 +3357,18 @@ function placeholderFrame(frame) {
 
 async function inspectInTab(params) {
   if (!params.uid && !params.selector) throw new Error("chrome_inspect requires uid or selector");
-  const tab = await getTabByParams(params);
+  // QoL blank-tab hint: same automation-path tracking as snapshotInTab.
+  const resolution = {};
+  const tab = await getTabByParams(params, { resolution });
   if (params.foreground) await bringToFront(tab);
   const frameUid = params.uid ? parseFrameUid(params.uid) : null;
   const frameId = frameUid ? frameUid.frameId : 0;
   const args = [frameUid ? frameUid.localUid : (params.uid ?? null), params.selector ?? null, params.scrollIntoView === true];
-  return runInspectPageInFrame(tab, frameId, args);
+  const result = await runInspectPageInFrame(tab, frameId, args);
+  if (result && typeof result === "object" && isBlankAutomationTarget(tab, params, resolution)) {
+    result._blankAutomationTab = true;
+  }
+  return result;
 }
 
 // One-shot init script registry, scoped per tab. The source is registered with CDP

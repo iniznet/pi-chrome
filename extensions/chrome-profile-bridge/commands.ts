@@ -235,6 +235,108 @@ export function formatChromeInspect(inspect: any): string {
 }
 
 // ---------------------------------------------------------------------------
+// Tab list / tab formatters (host-side, pure)
+// ---------------------------------------------------------------------------
+// The bridge's `tab.list` action now returns BOTH the user's open tabs and the named-handle
+// registry ({ tabs, handles }) so an agent can discover what the user actually has open. The
+// formatter below is deliberately tolerant: it also accepts a bare tab array (older companion
+// extension) or a { handles }-only registry, and never crashes on a shape mismatch
+// (regression: "tabs.map is not a function").
+
+export type ChromeTabRecord = {
+	id?: number;
+	windowId?: number;
+	active?: boolean;
+	highlighted?: boolean;
+	title?: string;
+	url?: string;
+	status?: string;
+	pinned?: boolean;
+	incognito?: boolean;
+	groupId?: number;
+	group?: {
+		id?: number;
+		title?: string;
+		color?: string;
+		collapsed?: boolean;
+		windowId?: number;
+		piGroup?: boolean;
+	} | null;
+};
+
+export type TabHandle = {
+	name?: string;
+	tabId?: number;
+	windowId?: number;
+	url?: string;
+	title?: string;
+	ownerSessionKey?: string;
+	savedAt?: number;
+};
+
+export type TabListResult =
+	| { tabs?: ChromeTabRecord[]; handles?: TabHandle[] }
+	| ChromeTabRecord[];
+
+// Renders action=list: one line per open tab (active marker, tabId, [group] title, url), then
+// a "Named handles:" section when the registry is non-empty. Never empty while at least one
+// open tab exists.
+export function formatTabList(result: TabListResult): string {
+	const object = !Array.isArray(result) && result !== null && typeof result === "object" ? result : undefined;
+	const tabs = Array.isArray(result)
+		? (result as ChromeTabRecord[])
+		: Array.isArray(object?.tabs)
+			? (object.tabs as ChromeTabRecord[])
+			: [];
+	const handles = object !== undefined && Array.isArray(object.handles) ? (object.handles as TabHandle[]) : [];
+	const lines: string[] = [];
+	for (const tab of tabs) {
+		const groupPrefix = tab.group?.title ? `[${tab.group.title}] ` : "";
+		lines.push(`${tab.active ? "*" : " "}\t${tab.id ?? ""}\t${groupPrefix}${tab.title || "(untitled)"}\t${tab.url || ""}`);
+	}
+	if (handles.length > 0) {
+		lines.push("Named handles:");
+		for (const handle of handles) {
+			lines.push(`  ${handle.name ?? "(unnamed)"}\t${handle.tabId ?? ""}\t${handle.title || "(untitled)"}\t${handle.url || ""}`);
+		}
+	}
+	return lines.join("\n") || "No named handles saved.";
+}
+
+// Renders a single tab record — the wire shape returned by the bridge for tab.active,
+// tab.activate, tab.new, tab.ungroup, navigate, screenshots, etc.
+export function formatTab(tab: ChromeTabRecord | null | undefined): string {
+	if (tab === undefined) return "undefined";
+	if (tab === null) return "null";
+	if (typeof tab !== "object") return safeJson(tab);
+	const lines: string[] = [`# Chrome tab${typeof tab.id === "number" ? ` ${tab.id}` : ""}`];
+	lines.push(`${tab.title || "(untitled)"}`);
+	if (tab.url) lines.push(`${tab.url}`);
+	const state: string[] = [];
+	if (tab.active) state.push("active");
+	if (tab.pinned) state.push("pinned");
+	if (tab.incognito) state.push("incognito");
+	if (state.length) lines.push(`state: ${state.join(", ")}`);
+	if (typeof tab.windowId === "number") lines.push(`windowId: ${tab.windowId}`);
+	if (typeof tab.groupId === "number" && tab.groupId >= 0) {
+		lines.push(`group: ${tab.group?.title || tab.groupId}`);
+	}
+	return truncateText(lines.join("\n"));
+}
+
+// Blank-automation-tab hint: when the companion service worker resolved the action to THIS
+// session's dedicated automation tab and that tab is blank (about:blank / chrome://newtab /
+// ''), it flags the result with `_blankAutomationTab: true`. The host appends this hint so an
+// agent that snapshotted an empty page is told how to find the user's real tabs instead.
+export const BLANK_AUTOMATION_TAB_HINT =
+	"  (note: this is pi-chrome's dedicated automation tab, currently blank. Run chrome_tab list to see your open tabs, or pass targetId/urlIncludes/titleIncludes to target a specific tab.)";
+
+export function appendBlankAutomationHint(text: string, raw: unknown): string {
+	const flagged = raw !== null && typeof raw === "object" && (raw as { _blankAutomationTab?: unknown })._blankAutomationTab === true;
+	return flagged ? `${text}\n${BLANK_AUTOMATION_TAB_HINT}` : text;
+}
+
+// ---------------------------------------------------------------------------
 // chrome_diff digest comparison (S3.1; host-side pure function, no bridge call)
 // ---------------------------------------------------------------------------
 // The digest shape mirrors `digestFor()` in snapshot_injected.js.
