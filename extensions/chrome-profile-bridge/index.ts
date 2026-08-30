@@ -20,10 +20,21 @@ import {
 	diffDigests,
 	formatChromeInspect,
 	formatChromeSnapshot,
+	formatComputedStyle,
 	formatIncludedSnapshotText,
 	formatInitiatorChain,
+	formatBoxModel,
+	formatBrowserInfo,
+	formatDomAtPoint,
+	formatEventListeners,
+	formatIndexedDbResult,
+	formatMemoryCounters,
+	formatNetworkSummary,
+	formatProperties,
+	formatTargetList,
 	formatTab,
 	formatTabList,
+	formatWatchSamples,
 	recordHistory,
 	safeJson,
 	summarizeParams,
@@ -796,6 +807,15 @@ const emulateActionValues = ["set", "clear"] as const;
 const storageKindValues = ["cookies", "localStorage", "sessionStorage", "indexedDB"] as const;
 const storageActionValues = ["get", "set", "delete", "clear", "summary"] as const;
 const cookieSameSiteValues = ["no_restriction", "lax", "strict", "unspecified"] as const;
+const indexedDbActionValues = ["get", "summary", "query", "count", "clearStore", "deleteEntries", "metadata", "clear"] as const;
+const colorSchemeValues = ["light", "dark", "no-preference"] as const;
+const reducedMotionValues = ["reduce", "no-preference"] as const;
+const forcedColorsValues = ["active", "none"] as const;
+const prefersContrastValues = ["more", "less", "no-preference"] as const;
+const printEmulationValues = ["emulate", "no-override"] as const;
+const visionDeficiencyValues = ["achromatopsia", "blurredVision", "deuteranopia", "protanopia", "tritanopia"] as const;
+const scrollBlockValues = ["start", "center", "end", "nearest"] as const;
+const targetFilterValues = ["page", "worker", "service_worker", "shared_worker", "other", "all"] as const;
 const CHROME_TOOL_NAMES = [
 	"chrome_launch",
 	"chrome_tab",
@@ -814,15 +834,34 @@ const CHROME_TOOL_NAMES = [
 	"chrome_downloads",
 	"chrome_dialog",
 	"chrome_emulate",
+	"chrome_emulate_media",
 	"chrome_storage",
+	"chrome_indexeddb_query",
 	"chrome_perf_metrics",
 	"chrome_list_console_messages",
 	"chrome_list_network_requests",
 	"chrome_get_network_request",
 	"chrome_network_capture",
 	"chrome_network_block",
+	"chrome_network_summary",
+	"chrome_network_cache",
+	"chrome_network_throttle",
 	"chrome_network_export",
 	"chrome_network_initiator_chain",
+	"chrome_computed_style",
+	"chrome_box_model",
+	"chrome_dom_at_point",
+	"chrome_node_html",
+	"chrome_get_properties",
+	"chrome_watch_expression",
+	"chrome_collect_garbage",
+	"chrome_memory_counters",
+	"chrome_event_listeners",
+	"chrome_drop",
+	"chrome_full_page_screenshot",
+	"chrome_scroll_to",
+	"chrome_browser_info",
+	"chrome_targets",
 	"chrome_screenshot",
 	"chrome_hover",
 	"chrome_drag",
@@ -1597,6 +1636,42 @@ Usage rules:
 	});
 
 	pi.registerTool({
+		name: "chrome_indexeddb_query",
+		label: "Chrome IndexedDB Query",
+		description:
+			"Query the resolved tab's IndexedDB object stores via CDP: read entries (query) with a keyRange and/or index, count matching records, clear an object store, delete a keyRange of entries, or read store metadata (entry count + key generator). Compound (array) keys round-trip through the keyRange; filter {keyPath, value} post-filters primitive values (nested object values compare by preview and are best-effort). clearStore is destructive — it empties the store. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Query/count/clear IndexedDB object stores with key ranges and indexes (CDP IndexedDB domain).",
+		parameters: Type.Object({
+			action: StringEnum(indexedDbActionValues),
+			database: Type.Optional(Type.String({ description: "Database name. Required for query/count/clearStore/deleteEntries/metadata." })),
+			objectStore: Type.Optional(Type.String({ description: "Object store name. Required for query/count/clearStore/deleteEntries/metadata." })),
+			indexName: Type.Optional(Type.String({ description: "Optional index name to query through (query/count)." })),
+			keyRange: Type.Optional(Type.Object({
+				lower: Type.Optional(Type.Union([Type.String(), Type.Number(), Type.Boolean(), Type.Array(Type.Unknown())])),
+				upper: Type.Optional(Type.Union([Type.String(), Type.Number(), Type.Boolean(), Type.Array(Type.Unknown())])),
+				lowerOpen: Type.Optional(Type.Boolean({ description: "Exclude the lower bound (open range)." })),
+				upperOpen: Type.Optional(Type.Boolean({ description: "Exclude the upper bound (open range)." })),
+			}, { description: "Key range filter (query/count/deleteEntries)." })),
+			filter: Type.Optional(Type.Object({
+				keyPath: Type.String({ description: "Dotted key path into the stored record (e.g. 'user.email')." }),
+				value: Type.Unknown({ description: "Value to match (query/count; deleteEntries converts a direct store-key filter into a keyRange)." }),
+			}, { description: "Client-side record filter; primitive values match exactly, nested objects by preview." })),
+			limit: Type.Optional(Type.Number({ description: "Max entries to return for query (default 100, max 200)." })),
+			offset: Type.Optional(Type.Number({ description: "Skip N entries (pagination) for query (default 0)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("storage.op", withBackground({ ...params, kind: "indexedDB" }), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatIndexedDbResult(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
 		name: "chrome_perf_metrics",
 		label: "Chrome Performance Metrics",
 		description:
@@ -2141,8 +2216,8 @@ Usage rules:
 		name: "chrome_emulate",
 		label: "Chrome Emulate Device",
 		description:
-			"Set or clear CDP device emulation on the session automation tab: viewport size, device scale factor, mobile flag, user-agent override, and touch emulation. Touch emulation is enabled by default when setting metrics — the touch benchmark requires the renderer to synthesize real TouchEvents, which only happens while touch emulation is on. Emulation persists while the debugger stays attached (kept alive for this tab).",
-		promptSnippet: "Emulate a device viewport, UA, and touch on the Chrome automation tab.",
+			"Set or clear CDP device emulation on the session automation tab: viewport size, device scale factor, mobile flag, user-agent override, and touch emulation. Touch emulation is enabled by default when setting metrics — the touch benchmark requires the renderer to synthesize real TouchEvents, which only happens while touch emulation is on. Also accepts environment overrides — locale, timezoneId, geolocation {latitude, longitude, accuracy}, and idle {isUserActive, isScreenUnlocked} — which ride the same CDP Emulation domain and are re-applied whenever the debugger re-attaches. Emulation persists while the debugger stays attached (kept alive for this tab). Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Emulate a device viewport, UA, touch, locale/timezone, geolocation, or idle state on the Chrome automation tab.",
 		parameters: Type.Object({
 			action: Type.Optional(StringEnum(emulateActionValues)),
 			width: Type.Optional(Type.Number({ description: "Viewport width in CSS px (default 1280)." })),
@@ -2153,6 +2228,17 @@ Usage rules:
 			ua: Type.Optional(Type.String({ description: "User-agent override (also applied at the network layer)." })),
 			platform: Type.Optional(Type.String({ description: "Platform override accompanying ua (e.g. 'Linux armv81' / 'iPhone')." })),
 			acceptLanguage: Type.Optional(Type.String({ description: "Accept-Language override accompanying ua." })),
+			locale: Type.Optional(Type.String({ description: "Locale override (e.g. 'en-US', 'fr-FR') via Emulation.setLocaleOverride." })),
+			timezoneId: Type.Optional(Type.String({ description: "Timezone override (e.g. 'America/New_York', 'UTC') via Emulation.setTimezoneOverride." })),
+			geolocation: Type.Optional(Type.Object({
+				latitude: Type.Number({ description: "Latitude in degrees." }),
+				longitude: Type.Number({ description: "Longitude in degrees." }),
+				accuracy: Type.Optional(Type.Number({ description: "Accuracy in meters (default 0)." })),
+			}, { description: "Geolocation override via Emulation.setGeolocationOverride." })),
+			idle: Type.Optional(Type.Object({
+				isUserActive: Type.Boolean({ description: "Whether the user is active (IdleDetector emulation)." }),
+				isScreenUnlocked: Type.Boolean({ description: "Whether the screen is unlocked." }),
+			}, { description: "Idle-detector override via Emulation.setIdleOverride (may be unavailable on older Chrome — degrades silently)." })),
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
@@ -2162,6 +2248,36 @@ Usage rules:
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const result = await authorizedBridgeSend("page.emulate", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			return { content: [{ type: "text", text: truncateText(safeJson(result)) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_emulate_media",
+		label: "Chrome Emulate Media Features",
+		description:
+			"Set or clear CSS media-feature emulation on the session automation tab: prefers-color-scheme (colorScheme), reducedMotion, forcedColors, prefersContrast, print (emulated print rendering), visionDeficiency, autoDarkMode, focusEmulation, and CPU throttling (cpuThrottleRate). Persists while the debugger stays attached and is re-applied on re-attach; action=clear resets all media features and CPU throttling. Media features ride the existing page.emulate wire kind (emulationScope=media). Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Emulate prefers-color-scheme / reduced-motion / forced-colors / print / vision deficiency / CPU throttle on the Chrome tab.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(emulateActionValues)),
+			colorScheme: Type.Optional(StringEnum(colorSchemeValues)),
+			reducedMotion: Type.Optional(StringEnum(reducedMotionValues)),
+			forcedColors: Type.Optional(StringEnum(forcedColorsValues)),
+			prefersContrast: Type.Optional(StringEnum(prefersContrastValues)),
+			print: Type.Optional(StringEnum(printEmulationValues)),
+			visionDeficiency: Type.Optional(StringEnum(visionDeficiencyValues)),
+			focusEmulation: Type.Optional(Type.Boolean({ description: "Emulate :focus-visible being applied to all focusable elements (Emulation.setFocusEmulationEnabled)." })),
+			autoDarkMode: Type.Optional(Type.Boolean({ description: "Force auto dark-mode (Emulation.setAutoDarkModeOverride)." })),
+			cpuThrottleRate: Type.Optional(Type.Number({ description: "CPU throttling multiplier (1 = no throttle; 6 = 6x slowdown). Version-dependent — degrades to a no-op when unsupported." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("page.emulate", withBackground({ ...params, emulationScope: "media" }), DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: truncateText(safeJson(result)) }], details: { result: result as Json } };
 		},
 	});
@@ -2365,18 +2481,457 @@ Usage rules:
 	});
 
 	pi.registerTool({
+		name: "chrome_network_summary",
+		label: "Chrome Network Summary",
+		description:
+			"Aggregate the CDP Network-domain capture store for the resolved tab (enable capture with chrome_network_capture and reload): request count, failures, cache hits, the slowest requests by duration, status distribution, bytes by mime type, and counts by resource type. Zero new CDP — reads the already-captured entries and timings. Returns an error when no capture is active for the tab. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Summarize captured Chrome network traffic (slowest, failures, status distribution, bytes by type).",
+		parameters: Type.Object({
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("network.summary", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatNetworkSummary(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_network_cache",
+		label: "Chrome Network Cache Toggle",
+		description:
+			"Enable or disable the HTTP cache for the resolved tab via CDP Network.setCacheDisabled. Disabling the cache is useful for clean-reload debugging (every request revalidates); it also turns on the persistent Network-domain attach (chrome_network_capture semantics) and is re-applied automatically after the debugger re-attaches. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Enable/disable the Chrome HTTP cache (Network.setCacheDisabled).",
+		parameters: Type.Object({
+			enabled: Type.Optional(Type.Boolean({ default: true, description: "true = HTTP cache enabled (cacheDisabled=false); false = cache disabled." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("network.cache", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: `HTTP cache ${result.enabled ? "enabled" : "disabled"} (cacheDisabled=${String(result.cacheDisabled)}).` }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_network_throttle",
+		label: "Chrome Network Throttle",
+		description:
+			"Emulate network conditions for the resolved tab via CDP Network.emulateNetworkConditions: offline mode, latency (ms), and download/upload throughput (bytes/sec; 0 or omitted = unlimited). A non-default profile keeps the debugger attach alive and is re-applied after re-attach; passing all-default values resets to unlimited. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Throttle or go offline for the Chrome tab (latency / download / upload / offline).",
+		parameters: Type.Object({
+			offline: Type.Optional(Type.Boolean({ description: "true = fully offline (connectionType none)." })),
+			latencyMs: Type.Optional(Type.Number({ description: "Round-trip latency in ms (default 0)." })),
+			downloadThroughput: Type.Optional(Type.Number({ description: "Download throughput in bytes/sec; 0/omitted = unlimited (CDP -1)." })),
+			uploadThroughput: Type.Optional(Type.Number({ description: "Upload throughput in bytes/sec; 0/omitted = unlimited (CDP -1)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("network.throttle", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			const parts = [
+				result.offline ? "offline" : "online",
+				`${Number(result.latencyMs) || 0}ms latency`,
+				Number(result.downloadThroughput) > 0 ? `${Number(result.downloadThroughput)} B/s down` : "unlimited down",
+				Number(result.uploadThroughput) > 0 ? `${Number(result.uploadThroughput)} B/s up` : "unlimited up",
+			];
+			return { content: [{ type: "text", text: `Network throttling: ${parts.join(", ")}.` }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_computed_style",
+		label: "Chrome Computed Style",
+		description:
+			"Read the full computed-style map for a snapshot uid or CSS selector via CDP CSS.getComputedStyleForNode, optionally filtered to a properties list. The map is capped at 4000 entries (truncated flag set beyond). Stale snapshot uids surface a take-a-fresh-snapshot error; if the page is paused (debugger breakpoint) it is auto-resumed first and the result notes that. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Get the computed CSS style map for a Chrome element (uid/selector).",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String({ description: "Snapshot uid (el-...) of the element." })),
+			selector: Type.Optional(Type.String({ description: "CSS selector (alternative to uid)." })),
+			properties: Type.Optional(Type.Array(Type.String(), { description: "Optional property names to filter to (e.g. ['color', 'font-size', 'display'])." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("css.computedStyle", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatComputedStyle(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_box_model",
+		label: "Chrome Box Model",
+		description:
+			"Read the CSS box model for a snapshot uid or selector via CDP DOM.getBoxModel: content/padding/border/margin quads (8-coordinate arrays in top-frame CSS px) plus width/height. Fails with a clear message when the element is not rendered (display:none / detached). Stale snapshot uids surface a take-a-fresh-snapshot error; a paused page is auto-resumed first. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Read an element's content/padding/border/margin quads (CDP box model).",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String()),
+			selector: Type.Optional(Type.String()),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("css.boxModel", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatBoxModel(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_dom_at_point",
+		label: "Chrome DOM Node At Point",
+		description:
+			"Hit-test the renderer at pure viewport coordinates via CDP DOM.getNodeForLocation (shadow-DOM aware) and describe the node at that point — node name, backend node id, attributes, frame id, and optionally its outerHTML. Requires no snapshot uid — pure coordinates work. Coordinates outside the viewport surface a clear CDP error; pointer-events:none is renderer-truth (no heuristic). Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Find which Chrome DOM node is at a viewport (x, y) point (renderer hit-test).",
+		parameters: Type.Object({
+			x: Type.Number({ description: "Viewport X in CSS px." }),
+			y: Type.Number({ description: "Viewport Y in CSS px." }),
+			includeDepth: Type.Optional(Type.Boolean({ description: "Include one level of child nodes in the node description." })),
+			outerHTML: Type.Optional(Type.Boolean({ description: "Also return the node's outerHTML (capped at 200KB)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("dom.point", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatDomAtPoint(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_node_html",
+		label: "Chrome Node HTML",
+		description:
+			"Return the outerHTML plus the full attribute list for a snapshot uid or CSS selector, evaluated in-page via CDP (CSP-safe, zero new CDP domain). Sub-frame snapshot uids (el-f<frameId>-<n>) route into their owning frame. The HTML is capped at 200KB (truncated flag set beyond). Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Get an element's outerHTML + attributes (snapshot uid or selector).",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String()),
+			selector: Type.Optional(Type.String()),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.outerHTML", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			const html = typeof result.outerHTML === "string" ? result.outerHTML.slice(0, 4000) : "";
+			return { content: [{ type: "text", text: html }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_get_properties",
+		label: "Chrome Get Object Properties",
+		description:
+			"DevTools-style object expansion via CDP Runtime.getProperties for a snapshot uid/selector OR an expression: property names with preview values, enumerable/configurable/writable flags, own vs inherited, get/set accessor descriptors, and internal properties (prototype, [[PrimitiveValue]], …). Getters are NOT invoked (descriptors only); the remote object reference is released after the read. Results are capped (200 properties, preview-capped). Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Expand a JS object's properties (own/inherited, accessors, internal slots) from the Chrome tab.",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String()),
+			selector: Type.Optional(Type.String()),
+			expression: Type.Optional(Type.String({ description: "JS expression evaluating to the object to expand (alternative to uid/selector)." })),
+			depth: Type.Optional(Type.Number({ description: "Preview recursion depth 1-3 (default 1)." })),
+			ownProperties: Type.Optional(Type.Boolean({ description: "Only own (non-inherited) properties (default false)." })),
+			accessorPropertiesOnly: Type.Optional(Type.Boolean({ description: "Only accessor (get/set) properties (default false)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.properties", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatProperties(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_watch_expression",
+		label: "Chrome Watch Expression",
+		promptSnippet: "Poll a JS expression on the Chrome tab and report its value over time (live-expression).",
+		description:
+			"Poll a JavaScript expression on the resolved tab at a fixed interval and return the value time-series (DevTools live-expression semantics). Values run through the pi serializer (undefined/function/symbol/bigint markers); a syntax error on the first sample fails fast, later transient errors are recorded per-sample. Bounded by durationMs (default 5s, max 120s) and maxSamples (default 100); never leaves an interval running. A paused page is auto-resumed before each sample. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		parameters: Type.Object({
+			expression: Type.String({ description: "JS expression to poll." }),
+			durationMs: Type.Optional(Type.Number({ description: "Total polling window in ms (default 5000, max 120000)." })),
+			intervalMs: Type.Optional(Type.Number({ description: "Sample interval in ms (default 500)." })),
+			maxSamples: Type.Optional(Type.Number({ description: "Max samples (default 100, max 1000)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.watch", withBackground(params), Math.min((params.durationMs ?? 5000) + 5000, MAX_WIRE_TIMEOUT_MS), signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatWatchSamples(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_collect_garbage",
+		label: "Chrome Collect Garbage",
+		description:
+			"Run a full JavaScript heap garbage collection on the resolved tab via CDP HeapProfiler.collectGarbage — use before chrome_memory_counters / chrome_perf_metrics to establish a clean baseline. If the page is paused (debugger breakpoint) it is auto-resumed first. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Force a JS heap GC on the Chrome tab (baseline before leak measurements).",
+		parameters: Type.Object({
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.collectGarbage", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: result.collected ? "Garbage collected." : "GC unavailable." }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_memory_counters",
+		label: "Chrome Memory Counters",
+		description:
+			"Read the DevTools 'DOM Counters' trio — nodes, jsEventListeners, documents — via CDP Memory.getDOMCounters plus JS heap usage (Runtime.getHeapUsage). Optionally call Memory.prepareForLeakDetection before the read. On very old Chromes where the Memory domain lacks counters it degrades to heap-only data. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Read DOM counters + JS heap usage (nodes/listeners/documents) from the Chrome tab.",
+		parameters: Type.Object({
+			prepareForLeakDetection: Type.Optional(Type.Boolean({ description: "Call Memory.prepareForLeakDetection first (restarts heap accounting)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.memoryCounters", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatMemoryCounters(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_event_listeners",
+		label: "Chrome Event Listeners",
+		description:
+			"Inventory the event listeners attached to a snapshot uid or selector via CDP DOMDebugger.getEventListeners (pierce:true reaches shadow-DOM listeners): event type, useCapture/passive/once flags, and the handler function name + script location. Capped at 200 listeners. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "List the event listeners registered on a Chrome element (type, capture, handler location).",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String()),
+			selector: Type.Optional(Type.String()),
+			depth: Type.Optional(Type.Number({ description: "Listener depth 0-3 (default 1)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.eventListeners", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatEventListeners(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_drop",
+		label: "Chrome HTML5 Drop",
+		description:
+			"Perform a real HTML5 drag-and-drop between two points (uid/selector/x/y each) via CDP Input.dispatchDragEvent with a constructed DataTransfer payload: string items ({type, data}) and file items (resolved to absolute paths for the CDP DragData files array). A believable press/move/release prelude fires first so sites that gate on mousedown/mousemove accept the drop. steps controls intermediate dragOver positions. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Drag from A to B with a real HTML5 DataTransfer (drop event) in Chrome.",
+		parameters: Type.Object({
+			fromUid: Type.Optional(Type.String()),
+			fromSelector: Type.Optional(Type.String()),
+			fromX: Type.Optional(Type.Number()),
+			fromY: Type.Optional(Type.Number()),
+			toUid: Type.Optional(Type.String()),
+			toSelector: Type.Optional(Type.String()),
+			toX: Type.Optional(Type.Number()),
+			toY: Type.Optional(Type.Number()),
+			steps: Type.Optional(Type.Number({ description: "Intermediate dragOver steps between source and target (default 0)." })),
+			dataTransfer: Type.Optional(Type.Object({
+				items: Type.Optional(Type.Array(Type.Object({
+					kind: Type.Optional(StringEnum(["string", "file"] as const)),
+					type: Type.Optional(Type.String({ description: "MIME type of the item (e.g. 'text/plain', 'application/json')." })),
+					data: Type.Optional(Type.String({ description: "Item data (string items), or the absolute file path for file items." })),
+					files: Type.Optional(Type.Array(Type.String(), { description: "Absolute file paths for file items (resolved from the workspace cwd)." })),
+				}))),
+			}, { description: "DataTransfer payload to attach to the drop." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.drop", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			const to = result.to as Record<string, unknown> | undefined;
+			return { content: [{ type: "text", text: `Dropped ${Number(result.dataTransferItems) || 0} data-transfer item(s) at (${String(to?.x)}, ${String(to?.y)}).` }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_full_page_screenshot",
+		label: "Chrome Full-Page Screenshot",
+		description:
+			"Capture a single-shot full-page screenshot of the resolved tab via CDP Page.captureScreenshot with captureBeyondViewport:true — no scroll/focus churn and no lazy-load artifacts. Extremely tall pages (>90 viewport heights) automatically fall back to the tile-stitched path. The image is written under .pi/chrome-screenshots (customize with path). Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Capture the full page height of a Chrome tab in one shot (CDP captureBeyondViewport).",
+		parameters: Type.Object({
+			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-screenshots/<timestamp>.<format>." })),
+			format: Type.Optional(StringEnum(imageFormatValues)),
+			quality: Type.Optional(Type.Number({ description: "JPEG quality 0-100." })),
+			scale: Type.Optional(Type.Number({ description: "Capture scale (default 1; 2 = 2x DPR)." })),
+			captureBeyondViewport: Type.Optional(Type.Boolean({ description: "Single-shot full-page capture (default true)." })),
+			clip: Type.Optional(Type.Object({
+				x: Type.Optional(Type.Number()),
+				y: Type.Optional(Type.Number()),
+				width: Type.Optional(Type.Number()),
+				height: Type.Optional(Type.Number()),
+			}, { description: "Optional clip rect (overrides the full-content size)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal, _onUpdate, ctx: ExtensionContext): Promise<ToolTextResult> {
+			const format = params.format ?? "png";
+			const cwd = workspaceCwd(ctx);
+			const defaultPath = join(cwd, ".pi", "chrome-screenshots", `fullpage-${new Date().toISOString().replace(/[:.]/g, "-")}.${format}`);
+			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
+			const result = (await authorizedBridgeSend("page.screenshot", withBackground({ ...params, fullPage: true }), 120_000, signal)) as {
+				dataUrl?: string;
+				tab?: unknown;
+				fullPage?: boolean;
+				dimensions?: Record<string, unknown>;
+				tiles?: Array<{ y: number; dataUrl: string }>;
+			};
+			await mkdir(dirname(outputPath), { recursive: true });
+			if (result.fullPage && Array.isArray(result.tiles) && result.tiles.length) {
+				// Tile fallback (single-shot captureBeyondViewport was unavailable or the page is
+				// extremely tall): write each tile next to the main path with a stitched.json manifest.
+				const manifest: Array<{ path: string; y: number }> = [];
+				for (let i = 0; i < result.tiles.length; i++) {
+					const tilePath = outputPath.replace(/(\.[^.]+)$/, `-tile${i}.${format}`);
+					const base64 = result.tiles[i].dataUrl.replace(/^data:image\/(?:png|jpeg);base64,/, "");
+					await writeFile(tilePath, Buffer.from(base64, "base64"));
+					manifest.push({ path: tilePath, y: result.tiles[i].y });
+				}
+				await writeFile(outputPath + ".json", JSON.stringify({ ...result.dimensions, tiles: manifest }, null, 2));
+				return { content: [{ type: "text", text: `Saved ${manifest.length} full-page tile(s). Manifest: ${outputPath}.json` }], details: { manifest: outputPath + ".json", tiles: manifest, dimensions: result.dimensions } as unknown as Record<string, unknown> };
+			}
+			if (!result.dataUrl) throw new Error("Full-page screenshot returned no image data");
+			const base64 = result.dataUrl.replace(/^data:image\/(?:png|jpeg);base64,/, "");
+			await writeFile(outputPath, Buffer.from(base64, "base64"));
+			return { content: [{ type: "text", text: `Saved full-page screenshot (${String(result.dimensions?.width)}×${String(result.dimensions?.height)}) to ${outputPath}` }], details: { path: outputPath, format, dimensions: result.dimensions, tab: result.tab } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_scroll_to",
+		label: "Chrome Scroll To Element",
+		description:
+			"Deterministically scroll a snapshot uid or CSS selector into view (scrollIntoView with block/inline control, instant behavior) and report the post-scroll bounding rect plus a visibility verdict (reuse of the in-page visibility rules). Sub-frame uids route into their owning frame. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Scroll a Chrome element into view and report its rect + visibility.",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String()),
+			selector: Type.Optional(Type.String()),
+			block: Type.Optional(StringEnum(scrollBlockValues)),
+			inline: Type.Optional(StringEnum(scrollBlockValues)),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.scrollTo", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			const rect = result.rect as Record<string, unknown> | undefined;
+			return {
+				content: [{ type: "text", text: `Scrolled ${params.uid ?? params.selector}: visible=${String(result.visible)}, rect=${rect ? `${Number(rect.left)},${Number(rect.top)} ${Number(rect.width)}x${Number(rect.height)}` : "?"}.` }],
+				details: { result: result as Json },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_browser_info",
+		label: "Chrome Browser Info",
+		description:
+			"Read Chrome browser fingerprints via CDP Browser.getVersion: product, revision, userAgent, jsVersion, protocolVersion. Also best-effort reads the browser command line (Browser.getBrowserCommandLine) — on a page-target attach that command is unavailable and the result marks degraded:true with commandLine null. Runs via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Read Chrome version + command-line fingerprint (Browser.getVersion).",
+		parameters: Type.Object({
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("browser.info", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatBrowserInfo(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_targets",
+		label: "Chrome CDP Targets",
+		description:
+			"List the CDP targets visible to the companion extension — pages, workers, service workers, shared workers, and other (extension) targets — with id, type, title, url, attach state, tabId, and extensionId. Never attaches (a wrapper over chrome.debugger.getTargets), so worker targets surface here for chrome_target_evaluate (P1). Capped at 500. Runs via the companion extension; requires /chrome authorize.",
+		promptSnippet: "List all CDP targets (pages, workers, service workers, extensions).",
+		parameters: Type.Object({
+			filter: Type.Optional(StringEnum(targetFilterValues)),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("target.list", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatTargetList(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
 		name: "chrome_screenshot",
 		label: "Chrome Screenshot",
 		description:
-			"Capture a screenshot of an existing Chrome tab via the companion extension and save it to disk. Chrome's extension screenshot API requires the target tab to be the active tab in its window. Runs in the background by default (the tab is briefly activated within its window for the capture, then the previous active tab is restored); pass background=false to focus Chrome so the user can watch.",
+			"Capture a screenshot of an existing Chrome tab via the companion extension and save it to disk. Viewport captures use the extension screenshot API (requires the tab briefly active in its window); element captures (uid/selector) and full-page captures (fullPage) route through CDP and work on inactive tabs. Runs in the background by default; pass background=false to focus Chrome so the user can watch. For full-page options (scale/captureBeyondViewport/clip) prefer the dedicated chrome_full_page_screenshot tool.",
 		promptSnippet: "Capture Chrome screenshots and save them under .pi/chrome-screenshots by default.",
 		parameters: Type.Object({
 			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-screenshots/<timestamp>.<format>." })),
 			format: Type.Optional(StringEnum(imageFormatValues)),
 			quality: Type.Optional(Type.Number({ description: "JPEG quality 0-100." })),
-			uid: Type.Optional(Type.String({ description: "Snapshot uid (el-...) of the element to capture. Resolves the element's bounding rect and crops the capture to it via CDP; works on inactive tabs without focusing Chrome." })),
-			selector: Type.Optional(Type.String({ description: "CSS selector of the element to capture (alternative to uid)." })),
-			fullPage: Type.Optional(Type.Boolean({ description: "Not supported by the extension bridge yet; viewport screenshots are captured. Cannot be combined with uid/selector." })),
+			uid: Type.Optional(Type.String({ description: "Snapshot uid (el-...) of the element to capture. Resolves the element's bounding rect and crops the capture to it via CDP; works on inactive tabs without focusing Chrome. Cannot be combined with fullPage." })),
+			selector: Type.Optional(Type.String({ description: "CSS selector of the element to capture (alternative to uid). Cannot be combined with fullPage." })),
+			fullPage: Type.Optional(Type.Boolean({ description: "Capture the full page height in one shot (CDP captureBeyondViewport) with an automatic tile-stitched fallback on very tall pages. Cannot be combined with uid/selector." })),
+			scale: Type.Optional(Type.Number({ description: "Capture scale for fullPage (default 1; 2 = 2x DPR)." })),
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
@@ -2400,9 +2955,8 @@ Usage rules:
 			};
 			await mkdir(dirname(outputPath), { recursive: true });
 			if (result.fullPage && result.tiles && result.dimensions) {
-				// Stitch via PNG if format is png; otherwise we fall back to writing tile files and a
-				// manifest. We avoid pulling in an image library by writing each tile next to the main
-				// path with a -tileN suffix and a stitched.json manifest.
+				// Tile fallback (single-shot captureBeyondViewport was unavailable or the page is
+				// extremely tall): write each tile next to the main path with a stitched.json manifest.
 				const { width, height, viewportHeight, dpr } = result.dimensions;
 				const manifest: Array<{ path: string; y: number }> = [];
 				for (let i = 0; i < result.tiles.length; i++) {
@@ -2421,7 +2975,10 @@ Usage rules:
 			if (!result.dataUrl) throw new Error("Screenshot returned no dataUrl");
 			const base64 = result.dataUrl.replace(/^data:image\/(?:png|jpeg);base64,/, "");
 			await writeFile(outputPath, Buffer.from(base64, "base64"));
-			return { content: [{ type: "text", text: `Saved Chrome screenshot to ${outputPath}` }], details: { path: outputPath, format, tab: result.tab } };
+			return {
+				content: [{ type: "text", text: result.fullPage ? `Saved full-page screenshot (${String(result.dimensions?.width)}×${String(result.dimensions?.height)}) to ${outputPath}` : `Saved Chrome screenshot to ${outputPath}` }],
+				details: { path: outputPath, format, tab: result.tab, dimensions: result.dimensions ?? undefined },
+			};
 		},
 	});
 

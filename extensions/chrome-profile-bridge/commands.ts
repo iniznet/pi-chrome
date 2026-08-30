@@ -280,6 +280,171 @@ function chainNodeLine(node: Record<string, unknown>): string {
 }
 
 // ---------------------------------------------------------------------------
+// P0 tool formatters (pure, testable; added by the P0 batch per TOOL_CONTRACTS §2.6)
+// ---------------------------------------------------------------------------
+
+export function formatBytes(value: number): string {
+	if (!Number.isFinite(value) || value < 0) return String(value);
+	if (value < 1024) return `${Math.round(value)} B`;
+	if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+	if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+	return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+export function formatComputedStyle(result: Record<string, unknown>): string {
+	const node = result.node as Record<string, unknown> | undefined;
+	const map = (result.computedStyle ?? {}) as Record<string, unknown>;
+	const keys = Object.keys(map);
+	const target = node && (node.uid || node.selector) ? String(node.uid || node.selector) : "";
+	const head = target ? `Computed style for ${target}` : `Computed style (${keys.length} propert${keys.length === 1 ? "y" : "ies"})`;
+	const lines: string[] = [head];
+	const shown = keys.slice(0, 24);
+	for (const k of shown) lines.push(`  ${k}: ${String(map[k])}`);
+	if (keys.length > shown.length) lines.push(`  … ${keys.length - shown.length} more${result.truncated ? " (truncated)" : ""}`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatBoxModel(result: Record<string, unknown>): string {
+	const box = result.boxModel as Record<string, unknown> | undefined;
+	const node = result.node as Record<string, unknown> | undefined;
+	if (!box) return safeJson(result);
+	const quad = (v: unknown) =>
+		Array.isArray(v) && v.length >= 8
+			? `(${Number(v[0]).toFixed(0)},${Number(v[1]).toFixed(0)})→(${Number(v[6]).toFixed(0)},${Number(v[7]).toFixed(0)})`
+			: "?";
+	const target = node && (node.uid || node.selector) ? ` for ${String(node.uid || node.selector)}` : "";
+	return truncateText(
+		[
+			`Box model${target}: ${Number(box.width) || 0}×${Number(box.height) || 0}px`,
+			`  content ${quad(box.content)}  padding ${quad(box.padding)}  border ${quad(box.border)}  margin ${quad(box.margin)}`,
+		].join("\n"),
+	);
+}
+
+export function formatDomAtPoint(result: Record<string, unknown>): string {
+	const node = result.node as Record<string, unknown> | undefined;
+	if (!node) return safeJson(result);
+	const name = String(node.nodeName || node.localName || "?");
+	const attrs = Array.isArray(node.attributes) ? (node.attributes as string[]).join(" ") : "";
+	const lines = [`Node at (${String(result.x)}, ${String(result.y)}): <${name}${attrs ? ` ${attrs}` : ""}>`];
+	if (typeof result.outerHTML === "string") lines.push(compactLine(result.outerHTML, 300));
+	return truncateText(lines.join("\n"));
+}
+
+export function formatProperties(result: Record<string, unknown>): string {
+	const props = Array.isArray(result.properties) ? (result.properties as Array<Record<string, unknown>>) : [];
+	const target = result.target ? ` for ${String(result.target)}` : "";
+	const lines = [`Properties${target} (${props.length}):`];
+	for (const p of props.slice(0, 40)) {
+		const name = String(p.name ?? "?");
+		const value = p.value === undefined ? "<accessor>" : typeof p.value === "string" ? p.value : compactLine(p.value, 60);
+		lines.push(`  ${p.isOwn ? "own" : "inh"} ${p.enumerable ? "enum" : "    "} ${name}: ${value}`);
+	}
+	if (props.length > 40) lines.push(`  … ${props.length - 40} more${result.truncated ? " (truncated)" : ""}`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatWatchSamples(result: Record<string, unknown>): string {
+	const samples = Array.isArray(result.samples) ? (result.samples as Array<Record<string, unknown>>) : [];
+	const lines = [`Watch ${String(result.expression ?? "")} — ${samples.length} sample(s), stopped: ${String(result.stopped ?? "")}:`];
+	for (const s of samples.slice(-12)) {
+		const t = Number(s.t) ?? 0;
+		const v = s.error !== undefined ? `ERR ${compactLine(s.error, 60)}` : compactLine(s.value, 80);
+		lines.push(`  t=${t}ms  ${v}`);
+	}
+	if (samples.length > 12) lines.push(`  … ${samples.length - 12} earlier sample(s)`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatNetworkSummary(result: Record<string, unknown>): string {
+	const counts = (result.counts ?? {}) as Record<string, unknown>;
+	const lines = [`Network summary: ${Number(counts.total) || 0} request(s), ${Number(counts.failed) || 0} failed, ${Number(counts.cacheHit) || 0} cache hit`];
+	const status = (result.statusDistribution ?? {}) as Record<string, unknown>;
+	const statusKeys = Object.keys(status);
+	if (statusKeys.length) lines.push(`Status: ${statusKeys.map((k) => `${k}=${status[k]}`).join(", ")}`);
+	const slowest = Array.isArray(result.slowest) ? (result.slowest as Array<Record<string, unknown>>) : [];
+	if (slowest.length) {
+		lines.push("Slowest:");
+		for (const s of slowest) lines.push(`  ${Number(s.durationMs) || 0}ms ${String(s.method ?? "GET")} ${compactLine(s.url, 90)} (${String(s.status ?? "")})`);
+	}
+	const byType = (result.bytesByType ?? {}) as Record<string, unknown>;
+	const typeKeys = Object.keys(byType);
+	if (typeKeys.length) lines.push(`Bytes by mime: ${typeKeys.map((k) => `${k}=${formatBytes(Number(byType[k]) || 0)}`).join(", ")}`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatEventListeners(result: Record<string, unknown>): string {
+	const listeners = Array.isArray(result.listeners) ? (result.listeners as Array<Record<string, unknown>>) : [];
+	const node = result.node as Record<string, unknown> | undefined;
+	const target = node && (node.uid || node.selector) ? ` for ${String(node.uid || node.selector)}` : "";
+	const lines = [`Event listeners${target} (${listeners.length}):`];
+	for (const l of listeners.slice(0, 40)) {
+		const handler = (l.handler ?? {}) as Record<string, unknown>;
+		const flags = [l.useCapture ? "capture" : null, l.passive ? "passive" : null, l.once ? "once" : null].filter(Boolean).join("+");
+		lines.push(`  ${String(l.type ?? "?")}${flags ? ` (${flags})` : ""} → ${String(handler.functionName ?? "(anonymous)")}`);
+	}
+	if (listeners.length > 40) lines.push(`  … ${listeners.length - 40} more${result.truncated ? " (truncated)" : ""}`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatTargetList(result: Record<string, unknown>): string {
+	const targets = Array.isArray(result.targets) ? (result.targets as Array<Record<string, unknown>>) : [];
+	const lines = [`CDP targets (${targets.length}):`];
+	for (const t of targets.slice(0, 60)) {
+		lines.push(`  ${t.attached ? "●" : "○"} ${String(t.type ?? "?")}\t${String(t.title ?? "")}\t${String(t.url ?? "")}${t.attached ? " [attached]" : ""}`);
+	}
+	if (targets.length > 60) lines.push(`  … ${targets.length - 60} more`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatBrowserInfo(result: Record<string, unknown>): string {
+	const browser = result.browser as Record<string, unknown> | undefined;
+	if (!browser) return `Browser info unavailable${result.degraded ? " (degraded — page-target attach)" : ""}`;
+	const lines = [
+		`Chrome ${String(browser.product ?? "")} (revision ${String(browser.revision ?? "")})`,
+		`  protocol ${String(browser.protocolVersion ?? "")}  js ${String(browser.jsVersion ?? "")}`,
+		`  UA: ${String(browser.userAgent ?? "")}`,
+	];
+	if (Array.isArray(result.commandLine)) lines.push(`  command line: ${(result.commandLine as string[]).join(" ")}`);
+	if (result.degraded) lines.push("  (command-line fingerprint unavailable on a page-target attach)");
+	return truncateText(lines.join("\n"));
+}
+
+export function formatMemoryCounters(result: Record<string, unknown>): string {
+	const dom = result.domCounters as Record<string, unknown> | null | undefined;
+	const heap = result.heap as Record<string, unknown> | null | undefined;
+	const lines: string[] = [];
+	if (dom) lines.push(`DOM counters: ${Number(dom.nodes) || 0} nodes, ${Number(dom.jsEventListeners) || 0} listeners, ${Number(dom.documents) || 0} documents`);
+	if (heap) lines.push(`JS heap: ${formatBytes(Number(heap.usedSize) || 0)} used / ${formatBytes(Number(heap.totalSize) || 0)} total`);
+	if (!dom && !heap) lines.push("Memory counters unavailable on this Chrome version");
+	if (result.prepared) lines.push("Leak-detection preparation requested.");
+	return truncateText(lines.join("\n"));
+}
+
+export function formatIndexedDbResult(result: Record<string, unknown>): string {
+	const action = String(result.action ?? "get");
+	const db = result.database ? ` db=${String(result.database)}` : "";
+	const store = result.objectStore ? ` store=${String(result.objectStore)}` : "";
+	const lines = [`IndexedDB ${action}${db}${store}${result.indexName ? ` (index ${String(result.indexName)})` : ""}.`];
+	if (Array.isArray(result.databases)) lines.push(`• ${result.databases.length} database(s).`);
+	if (Array.isArray(result.stores)) lines.push(`• ${result.stores.length} object store(s).`);
+	if (typeof result.entryCount === "number") lines.push(`• ${result.entryCount} record(s).`);
+	if (Array.isArray(result.entries)) {
+		for (const e of (result.entries as Array<Record<string, unknown>>).slice(0, 12)) {
+			lines.push(`  ${compactLine(e.key, 40)} → ${compactLine(e.value, 100)}`);
+		}
+		if (result.entries.length > 12) lines.push(`  … ${result.entries.length - 12} more`);
+	}
+	if (result.metadata && typeof result.metadata === "object") {
+		const m = result.metadata as Record<string, unknown>;
+		lines.push(`• metadata: ${String(m.entriesCount ?? 0)} entries, keyGeneratorValue=${m.keyGeneratorValue === null ? "null" : compactLine(m.keyGeneratorValue, 30)}`);
+	}
+	if (result.cleared === true) lines.push("• Store cleared.");
+	if (result.deleted === true) lines.push("• Entries deleted.");
+	return truncateText(lines.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
 // Tab list / tab formatters (host-side, pure)
 // ---------------------------------------------------------------------------
 // The bridge's `tab.list` action now returns BOTH the user's open tabs and the named-handle

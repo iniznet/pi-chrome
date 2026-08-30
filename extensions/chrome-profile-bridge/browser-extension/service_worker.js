@@ -330,6 +330,9 @@ const NETWORK_TEXT_MIME_RE = /^(text\/|application\/(json|xml|javascript|x-www-f
 const networkModeTabs = new Set(); // tabId with opt-in persistent CDP Network capture
 const blockedUrlsPerTab = new Map(); // tabId -> string[] patterns last applied via Network.setBlockedURLs
 const cdpNetworkEntries = new Map(); // tabId -> Map<requestId, entry>
+const cacheDisabledPerTab = new Map(); // tabId -> boolean (Network.setCacheDisabled; re-applied on re-attach)
+const throttlePerTab = new Map(); // tabId -> { offline, latencyMs, downloadThroughput, uploadThroughput }
+const THROTTLE_MODE_KEEPALIVE_MS = 10 * 60 * 1000;
 
 // =================== M0 shared plumbing: keepalive mode registry ===================
 // Long-lived modes (network capture, emulation, blocked URLs — later throttle/headers/media/
@@ -379,11 +382,18 @@ const keepaliveModes = {
   [MODE_NETWORK]: {
     keepaliveMs: NETWORK_MODE_KEEPALIVE_MS,
     persist: true,
-    snapshot: (tabId) => (networkModeTabs.has(tabId) ? { enabled: true, blockedUrls: blockedUrlsPerTab.get(tabId) || [] } : null),
+    snapshot: (tabId) => {
+      if (!networkModeTabs.has(tabId)) return null;
+      const snap = { enabled: true, blockedUrls: blockedUrlsPerTab.get(tabId) || [] };
+      // Network.setCacheDisabled dies with the attach — carry the value so re-attach restores it.
+      if (cacheDisabledPerTab.has(tabId)) snap.cacheDisabled = cacheDisabledPerTab.get(tabId);
+      return snap;
+    },
     restore: (tabId, snap) => {
       if (snap && snap.enabled) {
         networkModeTabs.add(tabId);
         if (Array.isArray(snap.blockedUrls)) blockedUrlsPerTab.set(tabId, snap.blockedUrls);
+        if (typeof snap.cacheDisabled === "boolean") cacheDisabledPerTab.set(tabId, snap.cacheDisabled);
       }
     },
     reapply: async (tabId, snap) => {
@@ -392,15 +402,63 @@ const keepaliveModes = {
     onDetach: (tabId) => {
       networkModeTabs.delete(tabId);
       blockedUrlsPerTab.delete(tabId);
+      cacheDisabledPerTab.delete(tabId);
     },
   },
   [MODE_EMULATE]: {
     keepaliveMs: EMULATE_ATTACH_KEEPALIVE_MS,
     persist: true,
+    // The single per-tab emulation record carries device metrics/UA/touch PLUS the media-feature
+    // block (chrome_emulate_media) and env overrides (locale/timezone/geolocation/idle), so a
+    // fresh attach re-applies the whole emulation surface with one snapshot (TOOL_CONTRACTS §5.5/§5.6).
     snapshot: (tabId) => (emulatedTabs.has(tabId) ? { ...emulatedTabs.get(tabId) } : null),
     restore: (tabId, snap) => { if (snap) emulatedTabs.set(tabId, snap); },
     reapply: async (tabId, snap) => { if (snap) await applyEmulationOverrides(tabId, snap); },
     onDetach: (tabId) => emulatedTabs.delete(tabId),
+  },
+  [MODE_MEDIA]: {
+    keepaliveMs: EMULATE_ATTACH_KEEPALIVE_MS,
+    persist: true,
+    // Media features live inside the shared emulatedTabs record (media + cpuThrottleRate keys) so
+    // clear/reset never leaves a half-applied emulation surface. Snapshot/restore mirror that slice.
+    snapshot: (tabId) => {
+      const record = emulatedTabs.get(tabId);
+      if (!record || (!record.media && record.cpuThrottleRate === undefined)) return null;
+      return { media: record.media ? { ...record.media } : undefined, cpuThrottleRate: record.cpuThrottleRate };
+    },
+    restore: (tabId, snap) => {
+      if (!snap) return;
+      const record = emulatedTabs.get(tabId) || {};
+      if (snap.media && typeof snap.media === "object") record.media = snap.media;
+      if (snap.cpuThrottleRate !== undefined) record.cpuThrottleRate = snap.cpuThrottleRate;
+      emulatedTabs.set(tabId, record);
+    },
+    reapply: async (tabId, snap) => {
+      if (snap) await applyMediaOverrides(tabId, snap.media || {}, snap.cpuThrottleRate).catch(() => undefined);
+    },
+    onDetach: (tabId) => {
+      // The shared record is dropped by MODE_EMULATE.onDetach; here only clear the media slice so
+      // cleanupModesForTab runs both hooks without ordering surprises.
+      const record = emulatedTabs.get(tabId);
+      if (record) {
+        delete record.media;
+        delete record.cpuThrottleRate;
+      }
+    },
+  },
+  [MODE_THROTTLE]: {
+    keepaliveMs: THROTTLE_MODE_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => (throttlePerTab.has(tabId) ? { ...throttlePerTab.get(tabId) } : null),
+    restore: (tabId, snap) => { if (snap) throttlePerTab.set(tabId, snap); },
+    reapply: async (tabId, snap) => {
+      // Network.emulateNetworkConditions dies with the attach; restore the throttling profile and
+      // (best-effort) re-enable the Network domain first — it may not be on if capture is off.
+      if (!snap) return;
+      try { await enableNetworkDomain(tabId); } catch {}
+      await cdp(tabId, "Network.emulateNetworkConditions", networkConditionsFor(snap)).catch(() => undefined);
+    },
+    onDetach: (tabId) => throttlePerTab.delete(tabId),
   },
   [MODE_BLOCKED_URLS]: {
     keepaliveMs: NETWORK_MODE_KEEPALIVE_MS,
@@ -2565,6 +2623,10 @@ async function ensureNetworkCapture(tabId) {
   if (blocked && blocked.length) {
     await cdp(tabId, "Network.setBlockedURLs", { urls: blocked }).catch(() => undefined);
   }
+  // Network.setCacheDisabled also dies with the attach — re-apply chrome_network_cache's setting.
+  if (cacheDisabledPerTab.has(tabId)) {
+    await cdp(tabId, "Network.setCacheDisabled", { cacheDisabled: cacheDisabledPerTab.get(tabId) === true }).catch(() => undefined);
+  }
 }
 
 async function disableNetworkCapture(tabId) {
@@ -2967,6 +3029,558 @@ function buildInitiatorChain(stored, params) {
   };
 }
 
+// ==========================================================================
+// P0 tool handlers (TOOL_CONTRACTS §5). One top-level handler per P0 wire kind;
+// the dispatch switch routes to them. Handlers that touch the DOM/renderer wrap
+// themselves in the paused-page rail (ensurePageUsable) and release remote
+// objectId references in finally (risk #6 remote-object leaks).
+// ==========================================================================
+
+// css.computedStyle — chrome_computed_style: computed-style map for a uid/selector.
+async function chromeComputedStyle(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  // resolveCdpNode scrolls the element into view via Runtime.evaluate, which a paused page
+  // freezes — rail first (constraint #3).
+  const pauseNote = await ensurePageUsable(tab.id, "computed style");
+  const resolved = await resolveCdpNode(tab.id, params);
+  try {
+    await enableCdpDomain(tab.id, "CSS");
+    const res = await cdp(tab.id, "CSS.getComputedStyleForNode", { nodeId: resolved.nodeId });
+    const styles = Array.isArray(res?.computedStyle) ? res.computedStyle : [];
+    const requested = Array.isArray(params.properties) ? new Set(params.properties.map((p) => String(p))) : null;
+    const MAX_COMPUTED_PROPS = 4000;
+    const computedStyle = {};
+    let truncated = false;
+    for (const s of styles) {
+      if (!s || typeof s.name !== "string") continue;
+      if (requested && !requested.has(s.name)) continue;
+      computedStyle[s.name] = typeof s.value === "string" ? s.value : "";
+      if (Object.keys(computedStyle).length >= MAX_COMPUTED_PROPS) { truncated = true; break; }
+    }
+    let tag = null;
+    try {
+      const described = await cdp(tab.id, "DOM.describeNode", { nodeId: resolved.nodeId, depth: 0 });
+      tag = described?.node?.nodeName ?? null;
+    } catch {}
+    const result = { node: { uid: params.uid ?? null, selector: params.selector ?? null, tag }, computedStyle, truncated };
+    if (pauseNote) result.pausedAutoResumed = pauseNote;
+    return result;
+  } finally {
+    await cdp(tab.id, "Runtime.releaseObject", { objectId: resolved.objectId }).catch(() => undefined);
+  }
+}
+
+// css.boxModel — chrome_box_model: content/padding/border/margin quads via DOM.getBoxModel.
+async function chromeBoxModel(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  const pauseNote = await ensurePageUsable(tab.id, "box model");
+  const resolved = await resolveCdpNode(tab.id, params);
+  try {
+    const res = await cdp(tab.id, "DOM.getBoxModel", { nodeId: resolved.nodeId });
+    if (!res?.model) throw new Error("DOM.getBoxModel returned no model — the element may not be rendered (display:none / detached)");
+    const m = res.model;
+    const result = {
+      node: { uid: params.uid ?? null, selector: params.selector ?? null },
+      boxModel: {
+        content: m.content, padding: m.padding, border: m.border, margin: m.margin,
+        width: m.width, height: m.height,
+      },
+    };
+    if (pauseNote) result.pausedAutoResumed = pauseNote;
+    return result;
+  } finally {
+    await cdp(tab.id, "Runtime.releaseObject", { objectId: resolved.objectId }).catch(() => undefined);
+  }
+}
+
+// dom.point — chrome_dom_at_point: renderer hit-test at pure coordinates (no snapshot uid).
+async function chromeDomAtPoint(params) {
+  const x = Number(params.x);
+  const y = Number(params.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error("chrome_dom_at_point requires numeric x and y");
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  const pauseNote = await ensurePageUsable(tab.id, "dom at point");
+  await enableCdpDomain(tab.id, "DOM");
+  const located = await cdp(tab.id, "DOM.getNodeForLocation", { x, y, includeUserAgentShadowDOM: true });
+  if (!located || typeof located.nodeId !== "number") {
+    throw new Error(`No node found at (${x}, ${y}) — the point may be outside the viewport or over a browser-chrome region`);
+  }
+  const described = await cdp(tab.id, "DOM.describeNode", { nodeId: located.nodeId, depth: params.includeDepth === true ? 1 : 0 });
+  const node = described?.node || {};
+  const result = {
+    x, y,
+    node: {
+      nodeId: node.nodeId, backendNodeId: node.backendNodeId, nodeName: node.nodeName,
+      localName: node.localName, attributes: Array.isArray(node.attributes) ? node.attributes : undefined,
+      frameId: node.frameId,
+    },
+  };
+  if (params.outerHTML === true) {
+    try {
+      const obj = await cdp(tab.id, "DOM.resolveNode", { nodeId: located.nodeId, objectGroup: NODE_RESOLVE_OBJECT_GROUP });
+      if (obj?.object?.objectId) {
+        const html = await cdp(tab.id, "Runtime.callFunctionOn", {
+          objectId: obj.object.objectId,
+          functionDeclaration: "function() { return this.outerHTML || ''; }",
+          returnByValue: true,
+        });
+        if (typeof html?.result?.value === "string") result.outerHTML = html.result.value.slice(0, 200_000);
+        await cdp(tab.id, "Runtime.releaseObject", { objectId: obj.object.objectId }).catch(() => undefined);
+      }
+    } catch {
+      // outerHTML enrichment is best-effort; the hit-test result stands alone.
+    }
+  }
+  if (pauseNote) result.pausedAutoResumed = pauseNote;
+  return result;
+}
+
+// page.outerHTML — chrome_node_html: outerHTML + attribute list via in-page cdpEval (zero new
+// CDP domain; CSP-safe). Sub-frame uids route through cdpEvalInFrame (OOPIF-aware).
+async function chromeNodeHtml(params) {
+  const tab = await getTabByParams(params);
+  const pauseNote = await ensurePageUsable(tab.id, "node outerHTML");
+  const frameUid = params.uid ? parseFrameUid(params.uid) : null;
+  const frameId = frameUid ? frameUid.frameId : 0;
+  const localUid = frameUid ? frameUid.localUid : (params.uid ?? null);
+  const expression = `(() => {
+    const selector = ${JSON.stringify(params.selector ?? null)};
+    const uid = ${JSON.stringify(localUid ?? null)};
+    const state = window.__PI_CHROME_STATE__;
+    const el = uid && state && state.elements ? state.elements[uid] : (selector ? document.querySelector(selector) : null);
+    if (!el) return { missing: true };
+    if (!el.isConnected) return { stale: true };
+    const attrs = [];
+    const attrsList = el.attributes ? Array.from(el.attributes) : [];
+    for (const a of attrsList) attrs.push([a.name, a.value]);
+    let outer = typeof el.outerHTML === "string" ? el.outerHTML : String(el);
+    const truncated = outer.length > 200000;
+    if (truncated) outer = outer.slice(0, 200000);
+    return { outerHTML: outer, attrs, tag: el.tagName || "", truncated };
+  })()`;
+  const res = frameId > 0 ? await cdpEvalInFrame(tab, frameId, expression, {}) : await cdpEval(tab.id, expression);
+  if (res.exceptionDetails) {
+    throw new Error(`chrome_node_html failed: ${cdpExceptionText(res.exceptionDetails) || "evaluation failed"}`);
+  }
+  const v = res?.result?.value;
+  if (v?.stale) {
+    throw new Error(`Snapshot uid ${params.uid} refers to an element that is no longer connected to the document — take a fresh chrome_snapshot and retry.`);
+  }
+  if (v?.missing || !v) {
+    const reason = params.uid ? `snapshot uid ${params.uid}` : `selector ${params.selector}`;
+    throw new Error(`No element found in the live document for ${reason} — take a fresh chrome_snapshot or check the selector.`);
+  }
+  const result = { node: { tag: v.tag, attrs: v.attrs || [] }, outerHTML: v.outerHTML, truncated: v.truncated === true };
+  if (pauseNote) result.pausedAutoResumed = pauseNote;
+  return result;
+}
+
+// page.properties — chrome_get_properties: DevTools-style Runtime.getProperties expansion.
+// getters are NOT invoked (descriptors only); objectId is released in finally.
+async function chromeGetProperties(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  const pauseNote = await ensurePageUsable(tab.id, "get properties");
+  const depth = Math.max(1, Math.min(3, Number(params.depth) || 1));
+  let objectId = null;
+  let target = null;
+  if (params.expression) {
+    const evaluated = await cdp(tab.id, "Runtime.evaluate", {
+      expression: String(params.expression),
+      objectGroup: NODE_RESOLVE_OBJECT_GROUP,
+      returnByValue: false,
+      awaitPromise: true,
+      userGesture: false,
+    });
+    if (evaluated.exceptionDetails) {
+      throw new Error(`chrome_get_properties: ${cdpExceptionText(evaluated.exceptionDetails) || "evaluation failed"}`);
+    }
+    if (!evaluated.result?.objectId) throw new Error("chrome_get_properties: the expression did not evaluate to an object");
+    objectId = evaluated.result.objectId;
+    target = String(params.expression);
+  } else {
+    if (!params.uid && !params.selector) {
+      throw new Error("chrome_get_properties requires uid/selector or an expression");
+    }
+    const resolved = await resolveCdpNode(tab.id, params);
+    objectId = resolved.objectId;
+    target = params.uid ?? params.selector ?? null;
+  }
+  try {
+    const res = await cdp(tab.id, "Runtime.getProperties", {
+      objectId,
+      ownProperties: params.ownProperties === true,
+      accessorPropertiesOnly: params.accessorPropertiesOnly === true,
+      generatePreview: true,
+    });
+    const rawProps = Array.isArray(res?.result) ? res.result : [];
+    const CAP_PROPERTIES = 200;
+    const properties = rawProps.slice(0, CAP_PROPERTIES).map((p) => {
+      const out = {
+        name: p.name,
+        value: cdpRemoteValue(p.value),
+        enumerable: p.enumerable === true,
+        configurable: p.configurable === true,
+        writable: p.writable === true,
+        isOwn: p.isOwn === true,
+      };
+      if (p.get) out.get = cdpRemoteValue(p.get);
+      if (p.set) out.set = cdpRemoteValue(p.set);
+      return out;
+    });
+    const internalProperties = Array.isArray(res?.internalProperties) ? res.internalProperties.slice(0, 40).map((p) => ({
+      name: p.name, value: cdpRemoteValue(p.value),
+    })) : [];
+    const result = {
+      target,
+      properties,
+      internalProperties,
+      truncated: rawProps.length > CAP_PROPERTIES,
+    };
+    if (pauseNote) result.pausedAutoResumed = pauseNote;
+    return result;
+  } finally {
+    await cdp(tab.id, "Runtime.releaseObject", { objectId }).catch(() => undefined);
+  }
+}
+
+// page.watch — chrome_watch_expression: poll an expression at an interval, bounded by duration
+// and maxSamples. The loop is fully awaited (no dangling interval survives a cancel).
+async function chromeWatchExpression(params) {
+  const tab = await getTabByParams(params);
+  if (params.foreground) await bringToFront(tab);
+  const expression = String(params.expression ?? "");
+  if (!expression) throw new Error("chrome_watch_expression requires an expression");
+  const durationMs = Math.max(200, Math.min(120_000, Number(params.durationMs) || 5000));
+  const intervalMs = Math.max(50, Math.min(durationMs, Number(params.intervalMs) || 500));
+  const maxSamples = Math.max(1, Math.min(1000, Number(params.maxSamples) || 100));
+  const started = Date.now();
+  const samples = [];
+  let stopped = "duration";
+  while (samples.length < maxSamples && Date.now() - started < durationMs) {
+    try {
+      // evaluateInResolvedTab carries the paused-page rail internally.
+      const value = await evaluateInResolvedTab(tab, { ...params, expression, foreground: false });
+      samples.push({ t: Date.now() - started, value: value === undefined ? { kind: "undefined" } : value });
+    } catch (error) {
+      const message = String(error?.message || error);
+      if (samples.length === 0) {
+        throw new Error(`chrome_watch_expression: ${message}`);
+      }
+      samples.push({ t: Date.now() - started, error: message });
+    }
+    if (samples.length >= maxSamples) { stopped = "maxSamples"; break; }
+    await sleep(intervalMs);
+  }
+  return { expression, samples, elapsedMs: Date.now() - started, stopped };
+}
+
+// network.summary — chrome_network_summary: aggregate the CDP capture store (pure; vm-testable).
+function buildNetworkSummary(stored) {
+  const entries = stored ? Array.from(stored.values()) : [];
+  const failed = entries.filter((e) => e.errorText || e.failedAt);
+  const cacheHit = entries.filter((e) => e.fromCache);
+  const byDuration = entries.filter((e) => typeof e.durationMs === "number").sort((a, b) => b.durationMs - a.durationMs);
+  const slowest = byDuration.slice(0, 5).map((e) => ({
+    requestId: e.requestId, method: e.method, url: e.url,
+    status: typeof e.status === "number" ? e.status : null,
+    durationMs: e.durationMs, resourceType: e.resourceType || "",
+  }));
+  const statusDistribution = {};
+  const bytesByType = {};
+  const byResourceType = {};
+  for (const e of entries) {
+    const status = typeof e.status === "number" ? e.status : (e.errorText ? "failed" : "unknown");
+    statusDistribution[status] = (statusDistribution[status] || 0) + 1;
+    const mime = e.mimeType || "unknown";
+    bytesByType[mime] = (bytesByType[mime] || 0) + (e.encodedDataLength || 0);
+    const rt = e.resourceType || "other";
+    byResourceType[rt] = (byResourceType[rt] || 0) + 1;
+  }
+  return {
+    counts: { total: entries.length, failed: failed.length, cacheHit: cacheHit.length },
+    slowest,
+    statusDistribution,
+    bytesByType,
+    byResourceType,
+  };
+}
+
+// network.cache — chrome_network_cache: toggle Network.setCacheDisabled on the capture attach.
+async function chromeNetworkCache(params) {
+  const tab = await getTabByParams(params);
+  await ensureNetworkCapture(tab.id);
+  const enabled = params.enabled !== false;
+  const cacheDisabled = !enabled;
+  cacheDisabledPerTab.set(tab.id, cacheDisabled);
+  await cdp(tab.id, "Network.setCacheDisabled", { cacheDisabled });
+  return { enabled, cacheDisabled };
+}
+
+// Map a throttle profile to the Network.emulateNetworkConditions payload. -1 throughput = unlimited.
+function networkConditionsFor(record) {
+  return {
+    offline: record.offline === true,
+    latency: Number(record.latencyMs) || 0,
+    downloadThroughput: (Number(record.downloadThroughput) || 0) > 0 ? Number(record.downloadThroughput) : -1,
+    uploadThroughput: (Number(record.uploadThroughput) || 0) > 0 ? Number(record.uploadThroughput) : -1,
+    connectionType: record.offline === true ? "none" : "wifi",
+  };
+}
+
+// network.throttle — chrome_network_throttle: offline/latency/throughput emulation. While a
+// non-default profile is active the MODE_THROTTLE keepalive holds the attach (and re-applies on
+// re-attach); an all-default profile resets the tab to unlimited and clears the mode.
+async function chromeNetworkThrottle(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  await enableNetworkDomain(tab.id);
+  const record = {
+    offline: params.offline === true,
+    latencyMs: Math.max(0, Number(params.latencyMs) || 0),
+    downloadThroughput: Math.max(0, Number(params.downloadThroughput) || 0),
+    uploadThroughput: Math.max(0, Number(params.uploadThroughput) || 0),
+  };
+  const active = record.offline || record.latencyMs > 0 || record.downloadThroughput > 0 || record.uploadThroughput > 0;
+  if (active) {
+    throttlePerTab.set(tab.id, record);
+    registerMode(tab.id, MODE_THROTTLE);
+  } else {
+    throttlePerTab.delete(tab.id);
+    unregisterMode(tab.id, MODE_THROTTLE);
+  }
+  await cdp(tab.id, "Network.emulateNetworkConditions", networkConditionsFor(record));
+  return { ...record, enabled: active };
+}
+
+// page.collectGarbage — chrome_collect_garbage: HeapProfiler.collectGarbage baseline.
+async function chromeCollectGarbage(params) {
+  const tab = await getTabByParams(params);
+  const pauseNote = await ensurePageUsable(tab.id, "collect garbage");
+  await attachDebugger(tab.id);
+  await enableCdpDomain(tab.id, "HeapProfiler");
+  await cdp(tab.id, "HeapProfiler.collectGarbage", {});
+  const result = { collected: true };
+  if (pauseNote) result.pausedAutoResumed = pauseNote;
+  return result;
+}
+
+// page.memoryCounters — chrome_memory_counters: DOM counters + heap usage + leak-prep hook.
+// Memory.getDOMCounters is absent on very old Chromes — degrade to Performance-only heap data.
+async function chromeMemoryCounters(params) {
+  const tab = await getTabByParams(params);
+  const pauseNote = await ensurePageUsable(tab.id, "memory counters");
+  await attachDebugger(tab.id);
+  let domCounters = null;
+  try {
+    const res = await cdp(tab.id, "Memory.getDOMCounters", {});
+    domCounters = { nodes: res?.nodes ?? null, jsEventListeners: res?.jsEventListeners ?? null, documents: res?.documents ?? null };
+  } catch {
+    domCounters = null; // very old Chrome: Memory domain may not expose counters
+  }
+  let heap = null;
+  try {
+    const res = await cdp(tab.id, "Runtime.getHeapUsage", {});
+    heap = { usedSize: res?.usedSize ?? null, totalSize: res?.totalSize ?? null };
+  } catch {}
+  let prepared = false;
+  if (params.prepareForLeakDetection === true) {
+    try { await cdp(tab.id, "Memory.prepareForLeakDetection", {}); prepared = true; } catch {}
+  }
+  const result = { domCounters, heap, prepared };
+  if (pauseNote) result.pausedAutoResumed = pauseNote;
+  return result;
+}
+
+// page.eventListeners — chrome_event_listeners: DOMDebugger.getEventListeners inventory.
+async function chromeEventListeners(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  const pauseNote = await ensurePageUsable(tab.id, "event listeners");
+  const resolved = await resolveCdpNode(tab.id, params);
+  try {
+    // getEventListeners requires the Debugger domain; DOMDebugger.enable is a no-op + idempotent.
+    await enableCdpDomain(tab.id, "Debugger");
+    await enableCdpDomain(tab.id, "DOMDebugger");
+    const depth = Math.max(0, Math.min(3, Number(params.depth) || 1));
+    const res = await cdp(tab.id, "DOMDebugger.getEventListeners", { objectId: resolved.objectId, depth, pierce: true });
+    const rawListeners = Array.isArray(res?.listeners) ? res.listeners : [];
+    const CAP_LISTENERS = 200;
+    const listeners = rawListeners.slice(0, CAP_LISTENERS).map((l) => ({
+      type: String(l?.type ?? ""),
+      useCapture: l?.useCapture === true,
+      passive: l?.passive === true,
+      once: l?.once === true,
+      handler: {
+        functionName: String(l?.handler?.functionName ?? ""),
+        location: l?.handler?.location ?? null,
+        scriptId: l?.handler?.scriptId ?? null,
+      },
+    }));
+    const result = {
+      node: { uid: params.uid ?? null, selector: params.selector ?? null },
+      listeners,
+      truncated: rawListeners.length > CAP_LISTENERS,
+    };
+    if (pauseNote) result.pausedAutoResumed = pauseNote;
+    return result;
+  } finally {
+    await cdp(tab.id, "Runtime.releaseObject", { objectId: resolved.objectId }).catch(() => undefined);
+  }
+}
+
+// page.drop — chrome_drop: real HTML5 drag-and-drop via Input.dispatchDragEvent with a
+// DataTransfer payload (files resolve to absolute paths). The press/move prelude makes the drop
+// believable to sites that gate on mousedown/mousemove before accepting the dragover/drop.
+async function chromeDrop(params) {
+  const tab = await getTabByParams(params);
+  // resolveTargetInTab carries the paused-page rail internally for both endpoints.
+  const from = await resolveTargetInTab(tab.id, {
+    selector: params.fromSelector ?? null, uid: params.fromUid ?? null,
+    x: params.fromX ?? null, y: params.fromY ?? null,
+  });
+  const to = await resolveTargetInTab(tab.id, {
+    selector: params.toSelector ?? null, uid: params.toUid ?? null,
+    x: params.toX ?? null, y: params.toY ?? null,
+  });
+  await attachDebugger(tab.id);
+  const rawItems = Array.isArray(params.dataTransfer?.items) ? params.dataTransfer.items : [];
+  const items = rawItems.map((it) => ({
+    mimeType: it?.type || "text/plain",
+    data: String(it?.data ?? ""),
+  }));
+  const data = { items, dragOperationsMask: 1 };
+  const files = rawItems
+    .filter((it) => it?.kind === "file" && (it?.files?.[0] || it?.data))
+    .map((it) => String(it?.files?.[0] ?? it?.data));
+  if (files.length) data.files = files;
+  await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", x: from.x, y: from.y, button: "left", buttons: 1, clickCount: 1 });
+  const steps = Math.max(0, Math.min(20, Number(params.steps) || 0));
+  if (steps > 0) {
+    await cdp(tab.id, "Input.dispatchDragEvent", { type: "dragEnter", x: to.x, y: to.y, data, dragOperationsMask: 1 });
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      await cdp(tab.id, "Input.dispatchDragEvent", {
+        type: "dragOver",
+        x: Math.round(from.x + (to.x - from.x) * t),
+        y: Math.round(from.y + (to.y - from.y) * t),
+        data, dragOperationsMask: 1,
+      });
+    }
+  } else {
+    await cdp(tab.id, "Input.dispatchDragEvent", { type: "dragEnter", x: to.x, y: to.y, data, dragOperationsMask: 1 });
+    await cdp(tab.id, "Input.dispatchDragEvent", { type: "dragOver", x: to.x, y: to.y, data, dragOperationsMask: 1 });
+  }
+  await cdp(tab.id, "Input.dispatchDragEvent", { type: "drop", x: to.x, y: to.y, data, dragOperationsMask: 1 });
+  await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: to.x, y: to.y, button: "left", buttons: 0, clickCount: 1 });
+  return {
+    input: "chrome",
+    from: { x: from.x, y: from.y },
+    to: { x: to.x, y: to.y },
+    drop: true,
+    dataTransferItems: rawItems.length,
+    ...(from.pausedAutoResumed ? { pausedAutoResumed: from.pausedAutoResumed } : {}),
+  };
+}
+
+// page.scrollTo — chrome_scroll_to: deterministic scrollIntoView + post-scroll rect/visibility.
+async function chromeScrollTo(params) {
+  const tab = await getTabByParams(params);
+  const pauseNote = await ensurePageUsable(tab.id, "scroll to");
+  const frameUid = params.uid ? parseFrameUid(params.uid) : null;
+  const frameId = frameUid ? frameUid.frameId : 0;
+  const localUid = frameUid ? frameUid.localUid : (params.uid ?? null);
+  const block = ["start", "center", "end", "nearest"].includes(params.block) ? params.block : "center";
+  const inline = ["start", "center", "end", "nearest"].includes(params.inline) ? params.inline : "nearest";
+  const expression = `(() => {
+    const selector = ${JSON.stringify(params.selector ?? null)};
+    const uid = ${JSON.stringify(localUid ?? null)};
+    const state = window.__PI_CHROME_STATE__;
+    const el = uid && state && state.elements ? state.elements[uid] : (selector ? document.querySelector(selector) : null);
+    if (!el) return { missing: true };
+    if (!el.isConnected) return { stale: true };
+    try { el.scrollIntoView({ block: ${JSON.stringify(block)}, inline: ${JSON.stringify(inline)}, behavior: "instant" }); } catch (e) { return { error: String(e && e.message || e) }; }
+    const r = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    const visible = !(style.visibility === "hidden" || style.display === "none") && r.width > 0 && r.height > 0 &&
+      !(r.bottom < 0 || r.right < 0 || r.top > innerHeight || r.left > innerWidth);
+    return { rect: { left: r.left, top: r.top, width: r.width, height: r.height }, visible, viewport: { scrollX: window.scrollX, scrollY: window.scrollY } };
+  })()`;
+  const res = frameId > 0 ? await cdpEvalInFrame(tab, frameId, expression, {}) : await cdpEval(tab.id, expression);
+  if (res.exceptionDetails) {
+    throw new Error(`chrome_scroll_to failed: ${cdpExceptionText(res.exceptionDetails) || "evaluation failed"}`);
+  }
+  const v = res?.result?.value;
+  if (v?.error) throw new Error(`chrome_scroll_to: ${v.error}`);
+  if (v?.stale) {
+    throw new Error(`Snapshot uid ${params.uid} refers to an element that is no longer connected to the document — take a fresh chrome_snapshot and retry.`);
+  }
+  if (v?.missing || !v) {
+    const reason = params.uid ? `snapshot uid ${params.uid}` : `selector ${params.selector}`;
+    throw new Error(`No element found in the live document for ${reason} — take a fresh chrome_snapshot or check the selector.`);
+  }
+  const result = { scrolled: true, rect: v.rect, visible: v.visible === true, viewport: v.viewport };
+  if (pauseNote) result.pausedAutoResumed = pauseNote;
+  return result;
+}
+
+// browser.info — chrome_browser_info: Browser.getVersion (+ best-effort getBrowserCommandLine
+// which only works from a browser-level target — page-target attaches degrade to UA-only).
+async function chromeBrowserInfo(params) {
+  let version = null;
+  let commandLine = null;
+  let degraded = false;
+  let tabId = null;
+  try {
+    const tab = await getTabByParams(params);
+    tabId = tab.id;
+    await attachDebugger(tab.id);
+    version = await cdp(tab.id, "Browser.getVersion", {});
+  } catch {
+    degraded = true;
+  }
+  if (version && tabId !== null) {
+    try {
+      const cl = await cdp(tabId, "Browser.getBrowserCommandLine", {});
+      commandLine = Array.isArray(cl?.arguments) ? cl.arguments : [];
+    } catch {
+      degraded = true;
+      commandLine = null;
+    }
+  }
+  return {
+    browser: version
+      ? {
+          protocolVersion: version.protocolVersion ?? null,
+          product: version.product ?? null,
+          revision: version.revision ?? null,
+          userAgent: version.userAgent ?? null,
+          jsVersion: version.jsVersion ?? null,
+        }
+      : null,
+    commandLine,
+    degraded,
+  };
+}
+
+// target.list — chrome_targets: full CDP target inventory. Never attaches (wrapper over the
+// existing getTargets promise); worker targets surface here for chrome_target_evaluate (P1).
+async function chromeTargets(params) {
+  const filter = String(params.filter || "all");
+  const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
+  const filtered = targets
+    .filter((t) => filter === "all" || t.type === filter)
+    .slice(0, 500)
+    .map((t) => ({
+      id: t.id, type: t.type, title: t.title ?? "", url: t.url ?? "",
+      attached: t.attached === true, tabId: t.tabId ?? null, extensionId: t.extensionId ?? null,
+    }));
+  return { targets: filtered, count: filtered.length };
+}
+
 async function dispatch(action, params) {
   switch (action) {
     case "tab.version":
@@ -3116,6 +3730,32 @@ async function dispatch(action, params) {
       return handleDialogCommand(params);
     case "page.emulate":
       return chromeEmulate(params);
+    case "css.computedStyle":
+      return chromeComputedStyle(params);
+    case "css.boxModel":
+      return chromeBoxModel(params);
+    case "dom.point":
+      return chromeDomAtPoint(params);
+    case "page.outerHTML":
+      return chromeNodeHtml(params);
+    case "page.properties":
+      return chromeGetProperties(params);
+    case "page.watch":
+      return chromeWatchExpression(params);
+    case "page.eventListeners":
+      return chromeEventListeners(params);
+    case "page.drop":
+      return chromeDrop(params);
+    case "page.scrollTo":
+      return chromeScrollTo(params);
+    case "page.collectGarbage":
+      return chromeCollectGarbage(params);
+    case "page.memoryCounters":
+      return chromeMemoryCounters(params);
+    case "browser.info":
+      return chromeBrowserInfo(params);
+    case "target.list":
+      return chromeTargets(params);
     case "page.perfMetrics":
       return chromePerfMetrics(params);
     case "storage.op":
@@ -3214,6 +3854,21 @@ async function dispatch(action, params) {
       }
       return buildInitiatorChain(stored, params);
     }
+    case "network.summary": {
+      // chrome_network_summary: aggregate the captured CDP store (pure builder, vm-testable).
+      const tab = await getTabByParams(params);
+      const stored = cdpNetworkEntries.get(tab.id);
+      if (!stored || stored.size === 0) {
+        throw new Error(
+          "No CDP network entries captured for this tab — enable chrome_network_capture and reload the page before asking for a summary",
+        );
+      }
+      return buildNetworkSummary(stored);
+    }
+    case "network.cache":
+      return chromeNetworkCache(params);
+    case "network.throttle":
+      return chromeNetworkThrottle(params);
     case "network.export": {
       const tab = await getTabByParams(params);
       return exportNetworkHar(tab, params);
@@ -4037,6 +4692,53 @@ function waitForTabComplete(tabId, timeoutMs) {
   });
 }
 
+// Single-shot full-page capture via CDP Page.captureScreenshot { captureBeyondViewport: true }
+// (chrome_full_page_screenshot, TOOL_CONTRACTS §5.17). Returns the same wire shape as the tile
+// path ({ fullPage, dataUrl, dimensions }) or null so takeScreenshot can fall back to tiles.
+// Extremely tall pages (> MAX_FULLPAGE_TILES * 3 viewport heights) skip the single shot — a
+// viewport-height-only buffer risks renderer OOM on a mega capture.
+async function captureFullPageViaCdp(tab, params) {
+  await attachDebugger(tab.id);
+  const metrics = await cdp(tab.id, "Page.getLayoutMetrics", {}).catch(() => null);
+  const contentSize = metrics?.cssContentSize;
+  if (!contentSize || typeof contentSize.width !== "number" || typeof contentSize.height !== "number") return null;
+  const viewportHeight = metrics?.cssVisualViewport?.clientHeight || 800;
+  const height = contentSize.height;
+  if (height / Math.max(viewportHeight, 1) > MAX_FULLPAGE_TILES * 3) return null;
+  const format = params.format || "png";
+  const scale = Math.max(0.1, Math.min(3, Number(params.scale) || 1));
+  const clip = params.clip && typeof params.clip === "object"
+    ? {
+        x: Number(params.clip.x) || 0,
+        y: Number(params.clip.y) || 0,
+        width: Math.max(1, Number(params.clip.width) || 1),
+        height: Math.max(1, Number(params.clip.height) || 1),
+        scale,
+      }
+    : undefined;
+  const shot = await cdp(tab.id, "Page.captureScreenshot", {
+    format,
+    quality: format === "jpeg" ? (typeof params.quality === "number" ? params.quality : 90) : undefined,
+    captureBeyondViewport: true,
+    fromSurface: true,
+    scale,
+    ...(clip ? { clip } : {}),
+  });
+  if (!shot || typeof shot.data !== "string" || !shot.data) return null;
+  return {
+    fullPage: true,
+    dataUrl: `data:image/${format};base64,${shot.data}`,
+    tab: await formatTab(tab),
+    dimensions: {
+      width: clip ? clip.width : contentSize.width,
+      height: clip ? clip.height : height,
+      viewportHeight,
+      dpr: contentSize.scale ?? 1,
+    },
+    captureMode: "cdp",
+  };
+}
+
 async function takeScreenshot(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
@@ -4061,6 +4763,15 @@ async function takeScreenshot(params) {
   }
   try {
     if (params.fullPage) {
+      // P0 single-shot full page (chrome_full_page_screenshot, TOOL_CONTRACTS §5.17): prefer
+      // CDP Page.captureScreenshot with captureBeyondViewport — no scroll/focus churn, no
+      // lazy-load artifacts. Falls back to the tile-stitched path when the renderer rejects it
+      // (older Chrome / headless builds) or the page is extremely tall (OOM guard).
+      const single = await captureFullPageViaCdp(tab, params).catch((error) => {
+        console.warn(`[pi-chrome] CDP full-page capture failed, falling back to tiles: ${String(error?.message || error)}`);
+        return null;
+      });
+      if (single) return mergePauseNote(single);
       // Tile-stitched full page capture: scroll, capture, paste, repeat. Defaults to jpeg (PNG
       // tiles for tall pages are tens of MB per tile set) and caps pathological page heights.
       const tiles = await executeInTab({ ...params, foreground: false }, captureFullPageTiles, [MAX_FULLPAGE_TILES]);
@@ -4078,13 +4789,13 @@ async function takeScreenshot(params) {
         captured.push({ y: tile.y, dataUrl });
       }
       await executeInTab({ ...params, foreground: false }, scrollToY, [tiles.originalScrollY]);
-      return {
+      return mergePauseNote({
         fullPage: true,
         tab: await formatTab(tab),
         dimensions: { width: tiles.width, height: tiles.height, viewportHeight: tiles.viewportHeight, dpr: tiles.dpr },
         tiles: captured,
         tilesTruncated: Array.isArray(tiles.tiles) && tiles.tiles.length > MAX_FULLPAGE_TILES ? tiles.tiles.length - MAX_FULLPAGE_TILES : undefined,
-      };
+      });
     }
     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
       format: params.format || "png",
@@ -5360,12 +6071,21 @@ async function handleDialogNow(tabId, info, params) {
 // Emulation overrides live on the CDP target, so after `set` we register MODE_EMULATE (extends
 // the attach keepalive + persists intent + re-applies on re-attach) and remember the state so
 // `clear` (or a re-attach) can reset it. Extracted apply/clear helpers are the re-apply hooks.
+//
+// P0 extension (TOOL_CONTRACTS §5.6): locale / timezone / geolocation / idle overrides ride the
+// same `page.emulate` wire kind and the same emulatedTabs record (as `env`), so `clear` resets
+// the whole emulation surface. Media-feature emulation (chrome_emulate_media) is a sibling
+// handler on the same kind, dispatched by `emulationScope:"media"` (host sets it).
 async function chromeEmulate(params) {
   const tab = await getTabByParams(params);
   await attachDebugger(tab.id);
+  if (params.emulationScope === "media") return chromeEmulateMedia(params, tab);
   if (params.action === "clear") {
     await clearEmulationOverrides(tab.id, params);
-    emulatedTabs.delete(tab.id);
+    await clearEnvOverrides(tab.id);
+    const record = emulatedTabs.get(tab.id);
+    if (record) delete record.env;
+    if (record && !record.media && record.cpuThrottleRate === undefined) emulatedTabs.delete(tab.id);
     unregisterMode(tab.id, MODE_EMULATE);
     return { action: "clear", cleared: true };
   }
@@ -5382,13 +6102,44 @@ async function chromeEmulate(params) {
     platform: params.platform ? String(params.platform) : null,
     acceptLanguage: params.acceptLanguage ? String(params.acceptLanguage) : null,
   };
+  const env = envOverridesFromParams(params);
+  if (env) overrides.env = env;
   await applyEmulationOverrides(tab.id, overrides);
-  emulatedTabs.set(tab.id, overrides);
+  const record = emulatedTabs.get(tab.id) || {};
+  Object.assign(record, overrides);
+  emulatedTabs.set(tab.id, record);
   registerMode(tab.id, MODE_EMULATE);
-  return { action: "set", width, height, deviceScaleFactor, mobile, touch, ua: params.ua ? String(params.ua) : null };
+  return {
+    action: "set", width, height, deviceScaleFactor, mobile, touch,
+    ua: params.ua ? String(params.ua) : null,
+    overrides: env || null,
+  };
+}
+
+// Extract the env-override slice (locale/timezone/geolocation/idle) from page.emulate params,
+// or null when none of the keys are present. Shared by chromeEmulate set and its re-apply path.
+function envOverridesFromParams(params) {
+  const env = {};
+  if (params.locale !== undefined && params.locale !== null && params.locale !== "") env.locale = String(params.locale);
+  if (params.timezoneId !== undefined && params.timezoneId !== null && params.timezoneId !== "") env.timezoneId = String(params.timezoneId);
+  if (params.geolocation && typeof params.geolocation === "object") {
+    const lat = Number(params.geolocation.latitude);
+    const lon = Number(params.geolocation.longitude);
+    if (Number.isFinite(lat) && Number.isFinite(lon)) {
+      env.geolocation = { latitude: lat, longitude: lon, accuracy: Number(params.geolocation.accuracy) || 0 };
+    }
+  }
+  if (params.idle && typeof params.idle === "object") {
+    if (typeof params.idle.isUserActive === "boolean" && typeof params.idle.isScreenUnlocked === "boolean") {
+      env.idle = { isUserActive: params.idle.isUserActive, isScreenUnlocked: params.idle.isScreenUnlocked };
+    }
+  }
+  return Object.keys(env).length ? env : null;
 }
 
 // Apply a full emulation override snapshot (used by chromeEmulate set AND the M0 re-apply hook).
+// The snapshot may carry the media slice + env overrides; apply those too so a re-attach restores
+// the entire emulation surface in one pass.
 async function applyEmulationOverrides(tabId, o) {
   if (!o || typeof o !== "object") return;
   await cdp(tabId, "Emulation.setDeviceMetricsOverride", {
@@ -5406,10 +6157,18 @@ async function applyEmulationOverrides(tabId, o) {
     await cdp(tabId, "Network.setUserAgentOverride", { userAgent: String(o.ua) }).catch(() => undefined);
   }
   await cdp(tabId, "Emulation.setTouchEmulationEnabled", { enabled: o.touch !== false, maxTouchPoints: o.touch !== false ? 5 : 1 });
+  if (o.media && typeof o.media === "object") {
+    await applyMediaOverrides(tabId, o.media, o.cpuThrottleRate);
+  }
+  if (o.env && typeof o.env === "object") {
+    await applyEnvOverrides(tabId, o.env);
+  }
 }
 
 // Reset emulation overrides. Preserves the legacy chromeEmulate clear semantics: a `ua` passed
-// alongside clear re-applies a UA override after metrics are reset.
+// alongside clear re-applies a UA override after metrics are reset. Media/env overrides are NOT
+// reset here — chrome_emulate_media has its own action=clear and env clears on chrome_emulate
+// clear (they live on the same record).
 async function clearEmulationOverrides(tabId, params) {
   await cdp(tabId, "Emulation.clearDeviceMetricsOverride").catch(() => undefined);
   await cdp(tabId, "Emulation.setTouchEmulationEnabled", { enabled: false }).catch(() => undefined);
@@ -5419,6 +6178,114 @@ async function clearEmulationOverrides(tabId, params) {
       await cdp(tabId, "Network.setUserAgentOverride", { userAgent: String(params.ua) }).catch(() => undefined);
     } catch {}
   }
+}
+
+// =================== chrome_emulate_media (P0, TOOL_CONTRACTS §5.5) ===================
+// Media-feature emulation (prefers-color-scheme / reduced-motion / forced-colors / contrast /
+// print / vision deficiency / auto-dark / focus) plus CPU throttling. Lives on the shared
+// `page.emulate` wire kind (emulationScope:"media") and the shared emulatedTabs record; CDP
+// Emulation.setCPUThrottlingRate is version-dependent so it degrades to a no-op when absent.
+const MEDIA_FEATURE_KEYS = ["colorScheme", "reducedMotion", "forcedColors", "prefersContrast", "prefersReducedData"];
+const VISION_DEFICIENCY_VALUES = new Set(["none", "achromatopsia", "blurredVision", "deuteranopia", "protanopia", "tritanopia"]);
+
+async function chromeEmulateMedia(params, tab) {
+  const tabId = tab.id;
+  if (params.action === "clear") {
+    await clearMediaOverrides(tabId);
+    const record = emulatedTabs.get(tabId);
+    if (record) {
+      delete record.media;
+      delete record.cpuThrottleRate;
+      if (!record.width && !record.env) emulatedTabs.delete(tabId);
+    }
+    unregisterMode(tabId, MODE_MEDIA);
+    return { action: "clear", media: {}, cpuThrottleRate: null, cleared: true };
+  }
+  const media = {};
+  for (const key of MEDIA_FEATURE_KEYS) {
+    if (params[key] !== undefined && params[key] !== null) media[key] = String(params[key]);
+  }
+  if (params.print === "emulate" || params.print === "no-override") media.print = String(params.print);
+  if (params.visionDeficiency && VISION_DEFICIENCY_VALUES.has(String(params.visionDeficiency)) && String(params.visionDeficiency) !== "none") {
+    media.visionDeficiency = String(params.visionDeficiency);
+  }
+  if (params.focusEmulation !== undefined) media.focusEmulation = params.focusEmulation === true;
+  if (params.autoDarkMode !== undefined) media.autoDarkMode = params.autoDarkMode === true;
+  const cpuThrottleRate = typeof params.cpuThrottleRate === "number" ? params.cpuThrottleRate : undefined;
+  const record = emulatedTabs.get(tabId) || {};
+  if (Object.keys(media).length) record.media = media;
+  else delete record.media;
+  if (cpuThrottleRate !== undefined) record.cpuThrottleRate = cpuThrottleRate;
+  emulatedTabs.set(tabId, record);
+  await applyMediaOverrides(tabId, media, cpuThrottleRate);
+  registerMode(tabId, MODE_MEDIA);
+  return { action: "set", media, cpuThrottleRate: cpuThrottleRate ?? null };
+}
+
+// Apply a media-feature snapshot (chrome_emulate_media set + MODE_MEDIA re-apply). Emulation.setEmulatedMedia
+// always carries the full feature list, so clearing one key means re-sending the remaining set.
+async function applyMediaOverrides(tabId, media, cpuThrottleRate) {
+  if (!media || typeof media !== "object") media = {};
+  const features = [];
+  for (const key of MEDIA_FEATURE_KEYS) {
+    if (media[key] && media[key] !== "no-preference") features.push({ name: key, value: String(media[key]) });
+  }
+  if (media.print === "emulate") features.push({ name: "print", value: "" });
+  await cdp(tabId, "Emulation.setEmulatedMedia", { features }).catch(() => undefined);
+  if (typeof media.autoDarkMode === "boolean") {
+    await cdp(tabId, "Emulation.setAutoDarkModeOverride", { enabled: media.autoDarkMode }).catch(() => undefined);
+  }
+  if (typeof media.focusEmulation === "boolean") {
+    await cdp(tabId, "Emulation.setFocusEmulationEnabled", { enabled: media.focusEmulation }).catch(() => undefined);
+  }
+  if (media.visionDeficiency && VISION_DEFICIENCY_VALUES.has(String(media.visionDeficiency))) {
+    await cdp(tabId, "Emulation.setEmulatedVisionDeficiency", { type: String(media.visionDeficiency) }).catch(() => undefined);
+  }
+  if (typeof cpuThrottleRate === "number" && cpuThrottleRate >= 1) {
+    await cdp(tabId, "Emulation.setCPUThrottlingRate", { rate: cpuThrottleRate }).catch(() => undefined);
+  }
+}
+
+async function clearMediaOverrides(tabId) {
+  await cdp(tabId, "Emulation.setEmulatedMedia", { features: [] }).catch(() => undefined);
+  await cdp(tabId, "Emulation.setAutoDarkModeOverride", { enabled: false }).catch(() => undefined);
+  await cdp(tabId, "Emulation.setFocusEmulationEnabled", { enabled: false }).catch(() => undefined);
+  await cdp(tabId, "Emulation.setEmulatedVisionDeficiency", { type: "none" }).catch(() => undefined);
+  await cdp(tabId, "Emulation.setCPUThrottlingRate", { rate: 1 }).catch(() => undefined);
+}
+
+// =================== env overrides (chrome_emulate P0 extension) ===================
+// locale / timezone / geolocation / idle ride Emulation.* and die with the attach, so the SW
+// stores them in the emulatedTabs record and re-applies them on re-attach (MODE_EMULATE).
+// Emulation.setIdleOverride is version-dependent — degrade to a no-op when the target lacks it.
+async function applyEnvOverrides(tabId, env) {
+  if (!env || typeof env !== "object") return;
+  if (typeof env.locale === "string" && env.locale) {
+    await cdp(tabId, "Emulation.setLocaleOverride", { locale: env.locale }).catch(() => undefined);
+  }
+  if (typeof env.timezoneId === "string" && env.timezoneId) {
+    await cdp(tabId, "Emulation.setTimezoneOverride", { timezoneId: env.timezoneId }).catch(() => undefined);
+  }
+  if (env.geolocation && typeof env.geolocation === "object") {
+    await cdp(tabId, "Emulation.setGeolocationOverride", {
+      latitude: Number(env.geolocation.latitude) || 0,
+      longitude: Number(env.geolocation.longitude) || 0,
+      accuracy: Number(env.geolocation.accuracy) || 0,
+    }).catch(() => undefined);
+  }
+  if (env.idle && typeof env.idle === "object") {
+    await cdp(tabId, "Emulation.setIdleOverride", {
+      isUserActive: env.idle.isUserActive === true,
+      isScreenUnlocked: env.idle.isScreenUnlocked === true,
+    }).catch(() => undefined);
+  }
+}
+
+async function clearEnvOverrides(tabId) {
+  await cdp(tabId, "Emulation.setLocaleOverride", { locale: "" }).catch(() => undefined);
+  await cdp(tabId, "Emulation.setTimezoneOverride", { timezoneId: "" }).catch(() => undefined);
+  await cdp(tabId, "Emulation.clearGeolocationOverride", {}).catch(() => undefined);
+  await cdp(tabId, "Emulation.clearIdleOverride", {}).catch(() => undefined);
 }
 
 // =================== chrome_storage (feat-storage) ===================
@@ -5568,6 +6435,10 @@ async function webStorageOperation(kind, action, params) {
 // IndexedDB via CDP IndexedDB.enable / requestDatabaseNames / requestDatabase / requestData,
 // plus deleteDatabase for clear. Per-record set/delete is intentionally not exposed — CDP
 // writes through object stores are not ergonomic; page.evaluate with a real transaction is.
+//
+// P0 extension (TOOL_CONTRACTS §5.14, chrome_indexeddb_query): adds query / count / clearStore /
+// deleteEntries / metadata actions with keyRange + indexName + offset support on the existing
+// `storage.op` wire kind — no new plumbing.
 async function indexedDBOperation(action, params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
@@ -5579,6 +6450,18 @@ async function indexedDBOperation(action, params) {
   const securityOrigin = originRes.result?.value ? String(originRes.result.value) : String(tab.url || "");
   if (!securityOrigin) throw new Error("chrome_storage IndexedDB: could not determine the tab origin");
   await cdp(tab.id, "IndexedDB.enable").catch(() => undefined);
+  const requireStore = () => {
+    if (params.database === undefined || params.objectStore === undefined) {
+      throw new Error("chrome_indexeddb_query requires database and objectStore for this action");
+    }
+    return { databaseName: String(params.database), objectStoreName: String(params.objectStore) };
+  };
+  const idbSummary = (extra = {}) => ({
+    origin: securityOrigin,
+    databases: [String(params.database ?? "")],
+    objectStore: params.objectStore !== undefined ? String(params.objectStore) : undefined,
+    ...extra,
+  });
   if (action === "summary" || (action === "get" && params.database === undefined)) {
     const namesRes = await cdp(tab.id, "IndexedDB.requestDatabaseNames", { securityOrigin });
     const databaseNames = Array.isArray(namesRes?.databaseNames) ? namesRes.databaseNames : [];
@@ -5591,6 +6474,7 @@ async function indexedDBOperation(action, params) {
     const stores = Array.isArray(db?.objectStores) ? db.objectStores.map((s) => ({
       name: s.name, keyPath: s.keyPath ?? null, autoIncrement: s.autoIncrement === true,
       indexCount: Array.isArray(s.indexes) ? s.indexes.length : 0,
+      indexes: Array.isArray(s.indexes) ? s.indexes.map((ix) => ({ name: ix.name, keyPath: ix.keyPath ?? null, unique: ix.unique === true, multiEntry: ix.multiEntry === true })) : [],
     })) : [];
     if (params.objectStore === undefined) {
       return { kind: "indexedDB", action, origin: securityOrigin, database: databaseName, stores, summary: { origin: securityOrigin, databases: [databaseName] } };
@@ -5606,6 +6490,82 @@ async function indexedDBOperation(action, params) {
     }));
     return { kind: "indexedDB", action, origin: securityOrigin, database: databaseName, objectStore: objectStoreName, entryCount: entries.length, entries, summary: { origin: securityOrigin, databases: [databaseName], objectStore: objectStoreName, entryCount: entries.length } };
   }
+  if (action === "query") {
+    const { databaseName, objectStoreName } = requireStore();
+    const indexName = params.indexName !== undefined ? String(params.indexName) : "";
+    const keyRange = buildIdbKeyRange(params.keyRange);
+    const pageSize = Math.max(1, Math.min(200, Number(params.limit) || 100));
+    const skipCount = Math.max(0, Number(params.offset) || 0);
+    const dataRes = await cdp(tab.id, "IndexedDB.requestData", {
+      securityOrigin, databaseName, objectStoreName, indexName, skipCount, pageSize, keyRange,
+    });
+    const rawEntries = Array.isArray(dataRes?.objectStoreDataEntries) ? dataRes.objectStoreDataEntries : [];
+    let entries = rawEntries.map((e) => ({
+      key: cdpRemoteValue(e?.key), primaryKey: cdpRemoteValue(e?.primaryKey), value: cdpRemoteValue(e?.value),
+    }));
+    if (params.filter && typeof params.filter === "object" && params.filter.keyPath !== undefined) {
+      entries = entries.filter((e) => matchesIdbFilter(e.value, params.filter));
+    }
+    return {
+      kind: "indexedDB", action, origin: securityOrigin, database: databaseName, objectStore: objectStoreName,
+      ...(indexName ? { indexName } : {}),
+      ...(keyRange ? { keyRange } : {}),
+      entryCount: entries.length, hasMore: dataRes?.hasMore === true, entries,
+      summary: idbSummary({ entryCount: entries.length, indexName: indexName || undefined }),
+    };
+  }
+  if (action === "count") {
+    const { databaseName, objectStoreName } = requireStore();
+    const keyRange = buildIdbKeyRange(params.keyRange);
+    const hasFilter = params.filter && typeof params.filter === "object" && params.filter.keyPath !== undefined;
+    // No range/index/filter: the object store metadata already carries the exact count.
+    if (!keyRange && params.indexName === undefined && !hasFilter) {
+      const metaRes = await cdp(tab.id, "IndexedDB.getMetadata", { securityOrigin, databaseName, objectStoreName });
+      const entryCount = typeof metaRes?.entriesCount === "number" ? metaRes.entriesCount : 0;
+      return { kind: "indexedDB", action, origin: securityOrigin, database: databaseName, objectStore: objectStoreName, entryCount, summary: idbSummary({ entryCount }) };
+    }
+    // Range/index/filter counts page through requestData (bounded — IndexedDB cap risk #11).
+    let entryCount = 0;
+    let skipCount = 0;
+    const pageSize = 200;
+    const MAX_COUNT_SCAN = 20000;
+    for (;;) {
+      const dataRes = await cdp(tab.id, "IndexedDB.requestData", {
+        securityOrigin, databaseName, objectStoreName,
+        indexName: params.indexName !== undefined ? String(params.indexName) : "",
+        skipCount, pageSize, keyRange,
+      });
+      const rawEntries = Array.isArray(dataRes?.objectStoreDataEntries) ? dataRes.objectStoreDataEntries : [];
+      for (const e of rawEntries) {
+        if (!hasFilter || matchesIdbFilter(cdpRemoteValue(e?.value), params.filter)) entryCount++;
+      }
+      skipCount += rawEntries.length;
+      if (!dataRes?.hasMore || rawEntries.length === 0 || skipCount >= MAX_COUNT_SCAN) break;
+    }
+    return { kind: "indexedDB", action, origin: securityOrigin, database: databaseName, objectStore: objectStoreName, entryCount, summary: idbSummary({ entryCount }) };
+  }
+  if (action === "clearStore") {
+    const { databaseName, objectStoreName } = requireStore();
+    await cdp(tab.id, "IndexedDB.clearObjectStore", { securityOrigin, databaseName, objectStoreName });
+    return { kind: "indexedDB", action, ok: true, origin: securityOrigin, database: databaseName, objectStore: objectStoreName, cleared: true, summary: idbSummary() };
+  }
+  if (action === "deleteEntries") {
+    const { databaseName, objectStoreName } = requireStore();
+    // filter {keyPath, value} doubles as a keyRange when no explicit range is given.
+    const keyRange = buildIdbKeyRange(params.keyRange) || idbFilterAsKeyRange(params.filter);
+    if (!keyRange) throw new Error("chrome_indexeddb_query deleteEntries requires keyRange (or filter with keyPath/value)");
+    await cdp(tab.id, "IndexedDB.deleteObjectStoreEntries", { securityOrigin, databaseName, objectStoreName, keyRange });
+    return { kind: "indexedDB", action, ok: true, origin: securityOrigin, database: databaseName, objectStore: objectStoreName, keyRange, deleted: true, summary: idbSummary() };
+  }
+  if (action === "metadata") {
+    const { databaseName, objectStoreName } = requireStore();
+    const metaRes = await cdp(tab.id, "IndexedDB.getMetadata", { securityOrigin, databaseName, objectStoreName });
+    return {
+      kind: "indexedDB", action, origin: securityOrigin, database: databaseName, objectStore: objectStoreName,
+      metadata: { entriesCount: typeof metaRes?.entriesCount === "number" ? metaRes.entriesCount : 0, keyGeneratorValue: metaRes?.keyGeneratorValue ?? null },
+      summary: idbSummary({ entryCount: typeof metaRes?.entriesCount === "number" ? metaRes.entriesCount : 0 }),
+    };
+  }
   if (action === "clear") {
     if (params.database === undefined) throw new Error("chrome_storage IndexedDB clear requires database (deletes the whole database)");
     const databaseName = String(params.database);
@@ -5616,6 +6576,49 @@ async function indexedDBOperation(action, params) {
     throw new Error("chrome_storage IndexedDB does not support per-record set/delete via CDP; use chrome_evaluate with an IndexedDB transaction to modify records");
   }
   throw new Error(`chrome_storage IndexedDB: unsupported action ${action}`);
+}
+
+// Build the CDP IndexedDB.KeyRange shape ({ lower?, upper?, lowerOpen?, upperOpen? }) from a
+// host-side { lower, upper, lowerOpen, upperOpen } object. Compound keys (arrays) round-trip as
+// JSON — CDP accepts array keys directly. Returns undefined when no bounds are given.
+function buildIdbKeyRange(keyRange) {
+  if (!keyRange || typeof keyRange !== "object") return undefined;
+  const range = {};
+  if (keyRange.lower !== undefined && keyRange.lower !== null) range.lower = keyRange.lower;
+  if (keyRange.upper !== undefined && keyRange.upper !== null) range.upper = keyRange.upper;
+  if (keyRange.lowerOpen !== undefined) range.lowerOpen = keyRange.lowerOpen === true;
+  if (keyRange.upperOpen !== undefined) range.upperOpen = keyRange.upperOpen === true;
+  return Object.keys(range).length ? range : undefined;
+}
+
+// A { keyPath, value } filter approximates a single-key equality range: lower=upper=value.
+function idbFilterAsKeyRange(filter) {
+  if (!filter || typeof filter !== "object" || filter.keyPath === undefined || filter.value === undefined) return null;
+  const keyPath = String(filter.keyPath);
+  if (keyPath.includes(".") || keyPath === "value") return null; // only direct store keys map to a range
+  return { lower: filter.value, upper: filter.value };
+}
+
+// Client-side record filter (query/count): matches when the record value's dotted keyPath equals
+// filter.value. Primitive values (string/number/boolean) compare exactly; object values compare
+// by JSON serialization (CDP previews are lossy for nested objects — documented in the tool).
+function matchesIdbFilter(value, filter) {
+  if (!filter || filter.keyPath === undefined) return true;
+  const keyPath = String(filter.keyPath);
+  let actual = value;
+  if (keyPath && keyPath !== "value") {
+    for (const part of keyPath.split(".")) {
+      if (actual === null || actual === undefined) return false;
+      actual = actual[part];
+    }
+  }
+  const expected = filter.value;
+  if (actual === expected) return true;
+  try {
+    return JSON.stringify(actual) === JSON.stringify(expected);
+  } catch {
+    return false;
+  }
 }
 
 // Convert a CDP RemoteObject into a JSON-safe value for IndexedDB reads: primitives carry
