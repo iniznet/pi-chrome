@@ -909,7 +909,52 @@
     });
   }
 
+  // P2 chrome_record_session: continuous MutationObserver recorder. Keeps a bounded ring of
+  // records in __PI_CHROME_STATE__.sessionRecording; start/stop idempotent. The SW drives it via
+  // cdpEval and reads the ring on session.export.
+  const SESSION_RECORD_CAP = 1000;
+  const sessionRecorder = {
+    observer: null,
+    started: false,
+    start() {
+      const state = getPiChromeState();
+      if (!Array.isArray(state.sessionRecording)) state.sessionRecording = [];
+      if (this.started && this.observer) return true;
+      const records = state.sessionRecording;
+      const describeTarget = (node) => {
+        if (!node || typeof node.nodeType !== "number") return null;
+        if (node.nodeType === 1) {
+          return { tag: node.tagName ? node.tagName.toLowerCase() : "?", id: node.id || null, uid: rememberElement(node) };
+        }
+        if (node.nodeType === 3) return { text: textOf(node, 120) };
+        return { nodeType: node.nodeType };
+      };
+      this.observer = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          if (records.length >= SESSION_RECORD_CAP) { records.shift(); }
+          records.push({
+            t: Date.now(),
+            type: m.type,
+            target: describeTarget(m.target),
+            attributeName: m.attributeName || null,
+            addedNodes: m.addedNodes.length,
+            removedNodes: m.removedNodes.length,
+          });
+        }
+      });
+      this.observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+      this.started = true;
+      return true;
+    },
+    stop() {
+      if (this.observer) { this.observer.disconnect(); this.observer = null; }
+      this.started = false;
+      return true;
+    },
+  };
+
   globalThis.__piChromeSnapshotPage = snapshotPage;
   globalThis.__piChromeInspectTarget = inspectTarget;
   globalThis.__piChromeWaitForMutation = waitForMutation;
+  globalThis.__piChromeSessionRecorder = sessionRecorder;
 })();

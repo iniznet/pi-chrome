@@ -70,6 +70,22 @@ import {
 	formatPdfResult,
 	formatCpuProfile,
 	formatCoverage,
+	formatDomSnapshot,
+	formatCssAudit,
+	formatAccessibilityAudit,
+	formatTraceSummary,
+	formatHeapSummary,
+	formatAllocationProfile,
+	formatSessionExport,
+	formatBackgroundService,
+	formatStorageWatch,
+	formatEventBreakpoint,
+	formatDomBreakpoint,
+	formatImeCompose,
+	formatVirtualTime,
+	formatDeviceMatrix,
+	formatMhtml,
+	formatNetworkTls,
 	recordHistory,
 	safeJson,
 	summarizeParams,
@@ -863,6 +879,18 @@ const serviceWorkerActionValues = ["list", "start", "stop", "unregister", "inspe
 const animationActionValues = ["list", "pause", "resume", "seek", "rate", "waitSettled"] as const;
 const permissionSettingValues = ["granted", "denied", "prompt"] as const;
 const cpuProfileActionValues = ["start", "stop"] as const;
+const traceActionValues = ["start", "stop", "getCategories"] as const;
+const samplingActionValues = ["samplingStart", "samplingStop", "profile"] as const;
+const sessionActionValues = ["record", "export"] as const;
+const backgroundServiceActionValues = ["list", "observe", "stop", "events"] as const;
+const storageWatchActionValues = ["start", "stop", "events"] as const;
+const eventBreakActionValues = ["set", "remove", "list", "capture"] as const;
+const domBreakActionValues = ["set", "remove", "list", "capture"] as const;
+const virtualTimeActionValues = ["start", "advance", "pause", "reset", "status"] as const;
+const imeActionValues = ["compose", "commit"] as const;
+const backgroundServiceNameValues = ["backgroundFetch", "backgroundSync", "pushMessaging", "notifications", "paymentHandler", "periodicBackgroundSync"] as const;
+const domBreakTypeValues = ["subtree-modified", "attribute-modified", "node-removed"] as const;
+const deviceMatrixImageFormatValues = ["jpeg", "png"] as const;
 const CHROME_TOOL_NAMES = [
 	"chrome_launch",
 	"chrome_tab",
@@ -947,6 +975,22 @@ const CHROME_TOOL_NAMES = [
 	"chrome_pdf",
 	"chrome_cpu_profile",
 	"chrome_coverage",
+	"chrome_dom_snapshot",
+	"chrome_css_audit",
+	"chrome_a11y_audit",
+	"chrome_trace",
+	"chrome_heap_snapshot",
+	"chrome_allocation_profile",
+	"chrome_record_session",
+	"chrome_background_service",
+	"chrome_watch_storage",
+	"chrome_event_breakpoint",
+	"chrome_dom_breakpoint",
+	"chrome_ime_compose",
+	"chrome_virtual_time",
+	"chrome_device_matrix",
+	"chrome_snapshot_mhtml",
+	"chrome_network_tls",
 	"chrome_screenshot",
 	"chrome_hover",
 	"chrome_drag",
@@ -3906,6 +3950,488 @@ Usage rules:
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const result = (await authorizedBridgeSend("coverage.get", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
 			return { content: [{ type: "text", text: formatCoverage(result) }], details: { result: result as Json } };
+		},
+	});
+
+	// =================== P2 (TOOL_CONTRACTS §7 rows 60–75) ===================
+
+	pi.registerTool({
+		name: "chrome_dom_snapshot",
+		label: "Chrome DOM Snapshot (DOMSnapshot)",
+		description:
+			"Capture the full-page style-aware DOM via CDP DOMSnapshot.captureSnapshot (node tree, per-node computed styles, layout tree, text boxes, paint order, DOM rects) and write the JSON to a file under .pi/chrome-dom-snapshots/<timestamp>.json. The snapshot is inlined only while it fits under the bridge caps; beyond that a structural summary (documents/nodes/string-pool) is returned with snapshotTooLarge. Use computedStyles to choose which per-node styles to capture (defaults to a small color/layout set). Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Capture the full style-aware DOM (DOMSnapshot) to a JSON file for forensic analysis.",
+		parameters: Type.Object({
+			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-dom-snapshots/<timestamp>.json." })),
+			computedStyles: Type.Optional(Type.Array(Type.String(), { description: "Computed styles to capture per node (max 50). Defaults to a small color/layout set." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
+			const cwd = workspaceCwd(ctx);
+			const defaultPath = join(cwd, ".pi", "chrome-dom-snapshots", `${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
+			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
+			const result = (await authorizedBridgeSend("dom.snapshot", withBackground(params), 90_000, signal)) as {
+				summary?: Record<string, unknown>;
+			snapshot?: unknown;
+			snapshotTooLarge?: number;
+			truncated?: boolean;
+		};
+			if (result.snapshot === undefined) {
+				throw new Error(`chrome_dom_snapshot: snapshot too large (${result.snapshotTooLarge ?? "?"} bytes) — summary only.`);
+			}
+			await mkdir(dirname(outputPath), { recursive: true });
+			await writeFile(outputPath, JSON.stringify(result.snapshot, null, 2));
+			const s = result.summary ?? {};
+			return {
+				content: [{ type: "text", text: formatDomSnapshot({ ...result, path: outputPath }) }],
+				details: { path: outputPath, documents: s.documentCount, totalNodes: s.totalNodes, stringPool: s.stringPool, bytes: s.bytes } as unknown as Record<string, unknown>,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_css_audit",
+		label: "Chrome CSS Audit",
+		description:
+			"Cross-element layout/style audit via a bounded in-page scan (cap 500 elements, 5000 overlap comparisons): overlapping interactive elements (z-index occlusion), zero-size elements that are still visible, text truncation (scrollWidth > clientWidth with overflow hidden), low text contrast (WCAG ratio vs effective background), and hidden-element counts. Zero new CDP domains — client-side aggregation over computed styles and layout rects. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Audit the page for overlap, zero-size, truncation and low-contrast layout/style issues.",
+		parameters: Type.Object({
+			maxElements: Type.Optional(Type.Number({ description: "Element scan cap (default 500, max 500)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("css.audit", withBackground(params), 60_000, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatCssAudit(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_a11y_audit",
+		label: "Chrome A11y Audit",
+		description:
+			"Lighthouse-lite accessibility report from the engine AX tree (Accessibility.getFullAXTree): buttons/links/checkboxes/radios without accessible names, images without alt, unlabeled form controls, empty links — plus a bounded low-contrast check (CSS.getBackgroundColors + the computed text color, capped by contrastLimit, default 30). Violations list is capped at 200. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Audit the page for accessibility violations (missing names/alts/labels + low contrast).",
+		parameters: Type.Object({
+			depth: Type.Optional(Type.Number({ description: "AX tree depth (0 = full tree)." })),
+			contrastLimit: Type.Optional(Type.Number({ description: "Max low-contrast checks (default 30, max 100)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("a11y.audit", withBackground(params), 90_000, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatAccessibilityAudit(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_trace",
+		label: "Chrome Trace (Performance)",
+		description:
+			"Record a Chrome performance trace via CDP Tracing and export it: start begins tracing with curated categories (customize with categories), stop ends it, waits for tracingComplete, and returns a plain-language hot-path summary (top self-time events, event counts, long tasks >50ms, layout/style/paint totals) plus the raw trace event array (bounded ~6MB buffer — recent tail kept on overflow, marked truncated). The host writes the trace JSON to .pi/chrome-traces/<timestamp>.json for Perfetto. Recording is keepalive-registered and persisted; a dropped attach surfaces 'recording lost'. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Record and export a Chrome performance trace with a plain-language hot-path summary.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(traceActionValues)),
+			path: Type.Optional(Type.String({ description: "Output path for the trace JSON (stop). Defaults to .pi/chrome-traces/<timestamp>.json." })),
+			categories: Type.Optional(Type.Array(Type.String(), { description: "Tracing categories for start (default: curated devtools.timeline/v8 set)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
+			if (params.action === "stop") {
+				const cwd = workspaceCwd(ctx);
+				const defaultPath = join(cwd, ".pi", "chrome-traces", `${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
+				const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
+				const result = (await authorizedBridgeSend("tracing.stop", withBackground(params), 60_000, signal)) as Record<string, unknown>;
+				const trace = (result.trace ?? []) as unknown[];
+				await mkdir(dirname(outputPath), { recursive: true });
+				await writeFile(outputPath, JSON.stringify(trace));
+				return {
+					content: [{ type: "text", text: formatTraceSummary({ ...result, path: outputPath }) }],
+				details: { path: outputPath, eventCount: result.eventCount, bytes: result.bytes, truncated: result.truncated, dataLoss: result.dataLoss, summary: result.summary } as unknown as Record<string, unknown>,
+			};
+			}
+			if (params.action === "getCategories") {
+				const result = (await authorizedBridgeSend("tracing.getCategories", withBackground(params), 30_000, signal)) as Record<string, unknown>;
+				return { content: [{ type: "text", text: formatTraceSummary(result) }], details: { result: result as Json } };
+			}
+			const result = (await authorizedBridgeSend("tracing.start", withBackground(params), 30_000, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatTraceSummary(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_heap_snapshot",
+		label: "Chrome Heap Snapshot",
+		description:
+			"Capture a V8 heap snapshot via HeapProfiler.takeHeapSnapshot (addHeapSnapshotChunk streaming, chunked accumulation under a ~6MB budget — no service-worker OOM) and return a summary first: node/edge counts, chunk count, bytes, and top self-size nodes. When the snapshot fits the bridge cap the full .heapsnapshot JSON is inlined and the host writes it to .pi/chrome-heap-snapshots/<timestamp>.heapsnapshot; larger heaps return snapshotTooLarge (use chrome_allocation_profile for sampling attribution). Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Capture a heap snapshot (summary first) for memory triage.",
+		parameters: Type.Object({
+			path: Type.Optional(Type.String({ description: "Output path for the .heapsnapshot JSON. Defaults to .pi/chrome-heap-snapshots/<timestamp>.heapsnapshot." })),
+			summaryOnly: Type.Optional(Type.Boolean({ description: "Skip inlining the full snapshot (summary + chunk stats only). Default false." })),
+			maxNodes: Type.Optional(Type.Number({ description: "Top self-size node rows to include in the summary (default 15, max 150)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
+			const cwd = workspaceCwd(ctx);
+			const defaultPath = join(cwd, ".pi", "chrome-heap-snapshots", `${new Date().toISOString().replace(/[:.]/g, "-")}.heapsnapshot`);
+			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
+			const result = (await authorizedBridgeSend("heap.snapshot", withBackground(params), 120_000, signal)) as Record<string, unknown>;
+			const snapshot = (result.snapshot ?? null) as string | null;
+			if (typeof snapshot === "string" && snapshot.length) {
+				await mkdir(dirname(outputPath), { recursive: true });
+				await writeFile(outputPath, snapshot, "utf8");
+				return { content: [{ type: "text", text: formatHeapSummary({ ...result, path: outputPath }) }], details: { path: outputPath, summary: result.summary, bytes: result.bytes } as unknown as Record<string, unknown> };
+			}
+			return { content: [{ type: "text", text: formatHeapSummary(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_allocation_profile",
+		label: "Chrome Allocation Profile",
+		description:
+			"Record JavaScript allocation attribution via HeapProfiler.startSampling/stopSampling: samplingStart begins sampling (keepalive holds the attach while recording), samplingStop collects the SamplingHeapProfile and returns a top self-size allocation table (function, url, bytes) with the full profile inlined only when it fits under the bridge caps (else profileTooLarge). Optionally track heap objects (trackObjects). MV3 suspend mid-record surfaces as lost. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Sample and attribute JS heap allocations (top allocating functions).",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(samplingActionValues)),
+			samplingInterval: Type.Optional(Type.Number({ description: "Sampling interval in bytes (default 32768)." })),
+			trackObjects: Type.Optional(Type.Boolean({ description: "Also start tracking heap objects (startTrackingHeapObjects)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			if (params.action === "samplingStop") {
+				const result = (await authorizedBridgeSend("heap.samplingStop", withBackground(params), 60_000, signal)) as Record<string, unknown>;
+				return { content: [{ type: "text", text: formatAllocationProfile(result) }], details: { result: result as Json } };
+			}
+			if (params.action === "profile") {
+				const result = (await authorizedBridgeSend("heap.samplingProfile", withBackground(params), 60_000, signal)) as Record<string, unknown>;
+				return { content: [{ type: "text", text: formatAllocationProfile(result) }], details: { result: result as Json } };
+			}
+			const result = (await authorizedBridgeSend("heap.samplingStart", withBackground(params), 60_000, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatAllocationProfile(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_record_session",
+		label: "Chrome Record Session",
+		description:
+			"Record a time-correlated session timeline: record starts a bounded window (durationMs, default 10s, max 60s) capturing CDP network, console/log/exception rings, in-page DOM mutations (MutationObserver) and periodic JPEG screenshots (screenshotIntervalMs, capped 30). export stops the recording and returns the timeline JSON (events/mutations/screenshots with timestamps), which the host writes to .pi/chrome-session-recordings/<timestamp>.json. All buffers are bounded; a dropped attach/suspend surfaces 'recording lost'. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Record a session replay timeline (network + console + DOM mutations + screenshots).",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(sessionActionValues)),
+			path: Type.Optional(Type.String({ description: "Output path for the timeline JSON (export). Defaults to .pi/chrome-session-recordings/<timestamp>.json." })),
+			durationMs: Type.Optional(Type.Number({ description: "Recording window (default 10000, max 60000)." })),
+			screenshotIntervalMs: Type.Optional(Type.Number({ description: "Screenshot interval (default 1000, min 200)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
+			if (params.action === "export") {
+				const cwd = workspaceCwd(ctx);
+				const defaultPath = join(cwd, ".pi", "chrome-session-recordings", `${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
+				const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
+				const result = (await authorizedBridgeSend("session.export", withBackground(params), 60_000, signal)) as Record<string, unknown>;
+				const { events, mutations, screenshots } = result;
+				await mkdir(dirname(outputPath), { recursive: true });
+				await writeFile(outputPath, JSON.stringify({ startedAt: result.startedAt, durationMs: result.durationMs, events, mutations, screenshots }, null, 2));
+				return {
+					content: [{ type: "text", text: formatSessionExport({ ...result, path: outputPath }) }],
+				details: { path: outputPath, eventCount: result.eventCount, mutationCount: result.mutationCount, screenshotCount: result.screenshotCount, durationMs: result.durationMs, truncated: result.truncated } as unknown as Record<string, unknown>,
+			};
+			}
+			const result = (await authorizedBridgeSend("session.record", withBackground(params), 30_000, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatSessionExport(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_background_service",
+		label: "Chrome Background Service",
+		description:
+			"Observe browser background-service events via CDP BackgroundService: list the supported services (backgroundFetch/backgroundSync/pushMessaging/notifications/paymentHandler/periodicBackgroundSync), observe starts recording-mode observation of one service (keepalive-registered), stop ends it, events returns the bounded event ring (500) with metadata. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Observe background fetch/sync/push events for the page.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(backgroundServiceActionValues)),
+			serviceName: Type.Optional(StringEnum(backgroundServiceNameValues)),
+			service: Type.Optional(StringEnum(backgroundServiceNameValues)),
+			limit: Type.Optional(Type.Number({ description: "Max events to return (default 500, max 500)." })),
+			mode: Type.Optional(Type.String({ description: "Observation mode for observe (events or recording)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("background.service", withBackground({ ...params, service: params.serviceName ?? params.service }), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatBackgroundService(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_watch_storage",
+		label: "Chrome Watch Storage",
+		description:
+			"Watch IndexedDB + Cache Storage mutations for an origin via CDP Storage.trackIndexedDBForOrigin/trackCacheStorageForOrigin: start records a before-state and begins tracking (keepalive-registered), events returns the bounded change-event ring (500) plus a before/after diff (databases/caches added or removed), stop ends tracking. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Watch IndexedDB / Cache Storage changes for an origin.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(storageWatchActionValues)),
+			origin: Type.Optional(Type.String({ description: "Origin to watch, e.g. https://example.com." })),
+			track: Type.Optional(Type.Array(StringEnum(["indexedDB", "cacheStorage"] as const), { description: "Which storages to track (default both)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("storage.watch", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatStorageWatch(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_event_breakpoint",
+		label: "Chrome Event Breakpoint",
+		description:
+			"Pause on event-listener firing via CDP DOMDebugger.setEventListenerBreakpoints: set/remove installs persistent event breakpoints (eventNames like [\"click\"], or [\"*\"] for all) that record each pause's call stack into a bounded ring and auto-resume the page (safety rail), and list shows them; capture waits for one firing, returns the handler stack, then removes the breakpoint and resumes. Keepalive-registered + persisted; re-applied on re-attach. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Break/capture on an event-listener firing and read the handler stack.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(eventBreakActionValues)),
+			eventNames: Type.Optional(Type.Array(Type.String(), { description: "Event names to break on (e.g. [\"click\", \"mousedown\"], [\"*\"] for all)." })),
+			eventName: Type.Optional(Type.String({ description: "Single event name (alternative to eventNames)." })),
+			timeoutMs: Type.Optional(Type.Number({ description: "Capture wait budget (default 10000, max 30000)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("debug.eventBreak", withBackground(params), 40_000, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatEventBreakpoint(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_dom_breakpoint",
+		label: "Chrome DOM Breakpoint",
+		description:
+			"Pause on DOM mutation of a node via CDP DOMDebugger.setDOMBreakpoint (types: subtree-modified / attribute-modified / node-removed): set/remove installs persistent breakpoints on a uid/selector-resolved node (recorded pauses + auto-resume rail, keepalive-registered + persisted, re-applied on re-attach), list shows them, and capture waits for one mutation of the given type, returns the mutator stack, then removes the breakpoint and resumes. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Break/capture on a DOM mutation of an element and read the mutator stack.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(domBreakActionValues)),
+			uid: Type.Optional(Type.String({ description: "Snapshot uid of the element to break on." })),
+			selector: Type.Optional(Type.String({ description: "CSS selector of the element to break on (alternative to uid)." })),
+			types: Type.Optional(Type.Array(StringEnum(domBreakTypeValues), { description: "Mutation types to break on." })),
+			timeoutMs: Type.Optional(Type.Number({ description: "Capture wait budget (default 10000, max 30000)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("debug.domBreak", withBackground(params), 40_000, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatDomBreakpoint(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_ime_compose",
+		label: "Chrome IME Compose",
+		description:
+			"Drive IME composition entry via CDP Input.imeSetComposition/imeCommitComposition (CJK / predictive / autocomplete entry): compose sets a composition string with a selection range (plus optional replacement range), commit commits it. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Send IME composition (CJK/predictive) to the focused field.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(imeActionValues)),
+			type: Type.Optional(StringEnum(imeActionValues)),
+			text: Type.Optional(Type.String({ description: "Composition text (compose) or commit text (commit)." })),
+			selectionStart: Type.Optional(Type.Number()),
+			selectionEnd: Type.Optional(Type.Number()),
+			replacementStart: Type.Optional(Type.Number()),
+			replacementEnd: Type.Optional(Type.Number()),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.ime", withBackground({ ...params, action: params.type ?? params.action }), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatImeCompose(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_virtual_time",
+		label: "Chrome Virtual Time",
+		description:
+			"Deterministic time control via CDP Emulation.setVirtualTimePolicy: start/advance sets a virtual-time policy with an optional budget (ms) and waits for virtualTimeBudgetExpired (bounded window), pause freezes virtual time, reset restores natural time flow, status reports the active policy. Keepalive-registered + persisted. chrome_pdf refuses to run while a virtual-time policy is active (printToPDF hangs under virtual time). Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Control virtual time (deterministic replay) — budget, pause, reset.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(virtualTimeActionValues)),
+			budgetMs: Type.Optional(Type.Number({ description: "Virtual-time budget in ms to advance before virtualTimeBudgetExpired (0 = unbounded advance)." })),
+			initialVirtualTime: Type.Optional(Type.Number({ description: "Initial virtual timestamp (ms since epoch) for the policy." })),
+			waitForNavigation: Type.Optional(Type.Boolean({ description: "Pause while network fetches are pending (pauseIfNetworkFetchesPending)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.virtualTime", withBackground(params), 40_000, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatVirtualTime(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_device_matrix",
+		label: "Chrome Device Matrix",
+		description:
+			"Responsive/i18n QA sweep: compose CDP device-metrics emulation + screenshot + Performance.getMetrics per profile. profiles is a bounded list (max 6) of {name, width, height, deviceScaleFactor, mobile, ua?}; defaults to a desktop 1280x800 and mobile 390x844 sweep. Each profile's screenshot is written to .pi/chrome-device-matrix/<timestamp>-<name>.<format> and the perf metrics are inlined. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Run a responsive screenshot + perf sweep across device profiles.",
+		parameters: Type.Object({
+			path: Type.Optional(Type.String({ description: "Output directory. Defaults to .pi/chrome-device-matrix/." })),
+			profiles: Type.Optional(Type.Array(Type.Object({
+				name: Type.Optional(Type.String()),
+				width: Type.Optional(Type.Number()),
+				height: Type.Optional(Type.Number()),
+				deviceScaleFactor: Type.Optional(Type.Number()),
+				mobile: Type.Optional(Type.Boolean()),
+				ua: Type.Optional(Type.String()),
+				platform: Type.Optional(Type.String()),
+			}), { description: "Device profiles (max 6). Defaults to desktop + mobile sweeps." })),
+			format: Type.Optional(StringEnum(deviceMatrixImageFormatValues)),
+			quality: Type.Optional(Type.Number({ description: "JPEG quality 0-100 (default 60)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
+			const cwd = workspaceCwd(ctx);
+			const outDir = params.path ? resolve(cwd, params.path) : join(cwd, ".pi", "chrome-device-matrix");
+			const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+			const result = (await authorizedBridgeSend("page.deviceMatrix", withBackground(params), 120_000, signal)) as Record<string, unknown>;
+			const profiles = (result.profiles ?? []) as Array<Record<string, unknown>>;
+			const ext = params.format === "png" ? "png" : "jpeg";
+			await mkdir(outDir, { recursive: true });
+			const written = [];
+			for (const p of profiles) {
+				const data = p.screenshot;
+				if (typeof data !== "string" || !data) continue;
+				const filePath = join(outDir, `${stamp}-${String(p.name ?? "profile")}.${ext}`);
+				await writeFile(filePath, Buffer.from(data, "base64"));
+				written.push(filePath);
+				delete p.screenshot;
+				p.file = filePath;
+			}
+			return { content: [{ type: "text", text: formatDeviceMatrix(result) }], details: { profiles: result.profiles, screenshots: written, count: written.length } as unknown as Record<string, unknown> };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_snapshot_mhtml",
+		label: "Chrome Snapshot MHTML",
+		description:
+			"Export the page as a single-file MHTML archive via CDP Page.captureSnapshot and write it to .pi/chrome-mhtml/<timestamp>.mhtml (customize with path). Archives larger than the bridge cap are surfaced as tooLarge instead of a partial file. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Export the page as a single-file MHTML archive.",
+		parameters: Type.Object({
+			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-mhtml/<timestamp>.mhtml." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
+			const cwd = workspaceCwd(ctx);
+			const defaultPath = join(cwd, ".pi", "chrome-mhtml", `${new Date().toISOString().replace(/[:.]/g, "-")}.mhtml`);
+			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
+			const result = (await authorizedBridgeSend("page.mhtml", withBackground(params), 90_000, signal)) as {
+				supported?: boolean;
+				data?: string;
+				reason?: string;
+				hint?: string;
+				tooLarge?: boolean;
+				base64Length?: number;
+			};
+			if (!result.supported || typeof result.data !== "string") {
+				throw new Error(`chrome_snapshot_mhtml: ${result.reason ?? "unsupported"}. ${result.hint ?? ""}`);
+			}
+			await mkdir(dirname(outputPath), { recursive: true });
+			await writeFile(outputPath, Buffer.from(result.data, "base64"));
+			return {
+				content: [{ type: "text", text: formatMhtml({ ...result, path: outputPath }) }],
+				details: { path: outputPath, bytes: Math.round((result.base64Length ?? 0) * 0.75) } as unknown as Record<string, unknown>,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_network_tls",
+		label: "Chrome Network TLS",
+		description:
+			"Best-effort TLS certificate surface: Network.getCertificate for an origin returns the subject/SAN name table (capped); with network capture on, requestId/urlIncludes surface the securityDetails captured at response time (subject, issuer, validity, SANs, cipher, protocol). CDP does not expose the full DER chain, so parsing is best-effort by design. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Inspect the TLS certificate names / security details for an origin or request.",
+		parameters: Type.Object({
+			origin: Type.Optional(Type.String({ description: "Origin to query, e.g. https://example.com (Network.getCertificate)." })),
+			requestId: Type.Optional(Type.String({ description: "Captured request id whose securityDetails to surface." })),
+			urlIncludes: Type.Optional(Type.String({ description: "Substring of a captured request URL (alternative to requestId)." })),
+			limit: Type.Optional(Type.Number({ description: "Max tableNames to return (default 50, max 50)." })),
+			targetId: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("network.certificate", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatNetworkTls(result) }], details: { result: result as Json } };
 		},
 	});
 

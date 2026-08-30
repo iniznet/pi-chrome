@@ -369,6 +369,11 @@ const MODE_RECORD_SESSION = "sessionRecord";
 const MODE_PAUSE_EXCEPTIONS = "pauseExceptions";
 const MODE_ANIMATIONS = "animations"; // paused-all animation lock holds the attach
 const MODE_CPU_PROFILE = "cpuProfile"; // Profiler recording holds the attach
+const MODE_BACKGROUND_SERVICE = "backgroundService"; // BackgroundService observation holds the attach
+const MODE_STORAGE_WATCH = "storageWatch"; // Storage track*ForOrigin watching holds the attach
+const MODE_EVENT_BREAKPOINTS = "eventBreakpoints"; // DOMDebugger event-listener breakpoints
+const MODE_DOM_BREAKPOINTS = "domBreakpoints"; // DOMDebugger DOM breakpoints
+const MODE_VIRTUAL_TIME = "virtualTime"; // Emulation virtual-time policy holds the attach
 
 // P1A caps: debugger family + console/exceptions + network deep-dive. Bounded rings everywhere
 // mirroring CDP_NETWORK_MAX_ENTRIES_PER_TAB (2000) and the 500-entry console cap (risk #11); the
@@ -434,10 +439,77 @@ const cpuProfilePerTab = new Map(); // tabId -> { recording: boolean }
 const attachedTargets = new Map(); // targetId -> { tabId?: number } (chrome_target_evaluate; cleanup in onDetach)
 const xhrBreakWaiters = new Map(); // tabId -> { resolve, reject, timer, url } (chrome_capture_fetch_stack)
 
+// =================== P2: audits, trace/heap, replay, breakpoints, virtual time ===================
+// P2 caps. The bridge /result cap (8MB) is the binding constraint for file-export-heavy tools
+// (trace / heap / mhtml / DOM snapshot / session replay): the SW accumulates artifacts under a
+// bounded byte budget (never one giant concat — chunked incremental writes), inlines only what
+// fits, and returns summaryOnly/tooLarge markers otherwise (constraint #4 / risk #4).
+const DOM_SNAPSHOT_MAX_INLINE_BYTES = 6 * 1024 * 1024; // captureSnapshot JSON inline budget
+const CSS_AUDIT_MAX_ELEMENTS = 500; // css.audit element scan cap
+const CSS_AUDIT_MAX_COMPARISONS = 5000; // overlap-pair budget (O(n^2) guard)
+const CSS_AUDIT_MAX_CONTRAST = 100; // contrast checks per audit
+const A11Y_AUDIT_MAX_VIOLATIONS = 200; // listed a11y violations cap
+const A11Y_AUDIT_MAX_CONTRAST = 100; // a11y contrast checks per audit
+const TRACE_MAX_BUFFER_BYTES = 6 * 1024 * 1024; // Tracing.dataCollected accumulated JSON budget
+const TRACE_MAX_EVENTS = 400_000; // trace event count cap
+const TRACE_SUMMARY_TOP = 15; // hot-path summary rows
+const TRACE_CATEGORIES_MAX = 500; // Tracing.getCategories cap
+const TRACE_KEEPALIVE_MS = 30 * 60 * 1000;
+const TRACE_COMPLETE_WAIT_MS = 20_000; // Tracing.end -> tracingComplete window
+const HEAP_SNAPSHOT_MAX_BYTES = 6 * 1024 * 1024; // inline-able .heapsnapshot JSON budget
+const HEAP_SNAPSHOT_SUMMARY_TOP = 15; // top self-size node rows
+const HEAP_SAMPLING_KEEPALIVE_MS = 30 * 60 * 1000;
+const HEAP_SAMPLING_INLINE_MAX_CHARS = 2_000_000; // sampling profile inline budget
+const HEAP_SAMPLING_SUMMARY_TOP = 15; // top self-size allocation rows
+const SESSION_RECORD_KEEPALIVE_MS = 60 * 60 * 1000;
+const SESSION_RECORD_MAX_DURATION_MS = 60_000; // bounded recording window (risk #11)
+const SESSION_RECORD_DEFAULT_DURATION_MS = 10_000;
+const SESSION_RECORD_MAX_EVENTS = 4000; // timeline event cap
+const SESSION_RECORD_MAX_MUTATIONS = 1000; // injected mutation-record cap
+const SESSION_RECORD_MAX_SCREENSHOTS = 30;
+const SESSION_RECORD_SCREENSHOT_BUDGET_BYTES = 4 * 1024 * 1024; // total screenshot budget
+const SESSION_RECORD_SCREENSHOT_INTERVAL_MS = 1000;
+const SESSION_RECORD_EXPORT_WAIT_MS = 30_000; // final screenshot drain window
+const BACKGROUND_SERVICE_RING_MAX = 500; // BackgroundService event ring
+const BACKGROUND_SERVICE_KEEPALIVE_MS = 60 * 60 * 1000;
+const STORAGE_WATCH_RING_MAX = 500; // Storage.*Updated event ring
+const STORAGE_WATCH_KEEPALIVE_MS = 60 * 60 * 1000;
+const EVENT_BREAK_KEEPALIVE_MS = 60 * 60 * 1000;
+const EVENT_BREAK_MAX_WAIT_MS = 30_000; // capture-variant window (risk #5)
+const EVENT_BREAK_PAUSES_MAX = 200; // persistent-mode pause ring
+const DOM_BREAK_PAUSES_MAX = 200;
+const VIRTUAL_TIME_KEEPALIVE_MS = 30 * 60 * 1000;
+const VIRTUAL_TIME_BUDGET_WAIT_MS = 30_000; // budgetExpired wait window
+const VIRTUAL_TIME_MAX_BUDGET_MS = 5 * 60_000; // max advance budget (deterministic replay cap)
+const DEVICE_MATRIX_MAX_PROFILES = 6;
+const MHTML_MAX_BASE64_CHARS = 6 * 1024 * 1024; // leave headroom under the 8MB result cap
+const NETWORK_CERT_TABLE_NAMES_MAX = 50;
+
+// Bounded ring-buffer push shared by every recorder (console/exceptions/log/WS/animation/
+// background-service/storage-watch/pause events). Caps mirror CDP_NETWORK_MAX_ENTRIES_PER_TAB
+// and the 500-entry console cap (risk #11).
 function ringPush(ring, item, cap) {
   ring.push(item);
   if (ring.length > cap) ring.splice(0, ring.length - cap);
 }
+
+// P2 per-tab state (in-memory; long-lived intent rides the keepalive registry).
+const domSnapshotPerTab = new Map(); // tabId -> transient captureSnapshot buffer (one-shot)
+const tracingPerTab = new Map(); // tabId -> { recording, categories, events[], bytes, eventCount, startedAt, truncated, lost } (MODE_TRACING)
+const tracingCompleteWaiters = new Map(); // tabId -> { resolve, timer } (tracing.stop waits for tracingComplete)
+const heapSnapshotPerTab = new Map(); // tabId -> transient addHeapSnapshotChunk buffer (one-shot)
+const heapSamplingPerTab = new Map(); // tabId -> { sampling: boolean } (MODE_HEAP_RECORDING)
+const sessionRecordPerTab = new Map(); // tabId -> { recording, startedAt, durationMs, screenshotIntervalMs, events[], mutations[], screenshots[], screenshotBytes, truncated, injected, lost } (MODE_RECORD_SESSION)
+const backgroundServicePerTab = new Map(); // tabId -> { observing: Set<service>, events: ring, recording: Set<service> } (MODE_BACKGROUND_SERVICE)
+const storageWatchPerTab = new Map(); // tabId -> { tracking: Set<"indexedDB"|"cacheStorage">, events: ring, before: { databases: [string], caches: [string] } } (MODE_STORAGE_WATCH)
+const eventBreakPerTab = new Map(); // tabId -> { breakpoints: Set<eventName>, pauses: ring } (MODE_EVENT_BREAKPOINTS)
+const eventBreakWaiters = new Map(); // tabId -> { resolve, reject, timer, eventNames } (debug.eventBreak capture)
+const domBreakPerTab = new Map(); // tabId -> { types: Set<type>, node: { uid?, selector? }, pauses: ring } (MODE_DOM_BREAKPOINTS)
+const domBreakWaiters = new Map(); // tabId -> { resolve, reject, timer, type } (debug.domBreak capture)
+const virtualTimePerTab = new Map(); // tabId -> { policy, budgetMs, budgetExpired, virtualTimeTicksBase } (MODE_VIRTUAL_TIME)
+const virtualTimeWaiters = new Map(); // tabId -> { resolve, timer } (page.virtualTime waits for budgetExpired)
+const deviceMatrixPerTab = new Map(); // tabId -> transient per-profile sweep state (one-shot)
+const recordingScreenshotTimers = new Map(); // tabId -> interval id (session recording screenshot loop)
 
 // CDP event timestamps arrive in SECONDS since epoch; normalize to ms so console/exception/log
 // rings sort cleanly and render human-readable timestamps.
@@ -758,6 +830,209 @@ const keepaliveModes = {
     },
     onDetach: (tabId) => cpuProfilePerTab.delete(tabId),
   },
+  [MODE_TRACING]: {
+    // Tracing recording holds the attach while active. The intent (categories) is persisted so
+    // a re-attach restarts the recording instead of silently ending it; the buffered events die
+    // with the attach, so onDetach marks the buffer lost and tracing.stop surfaces a clear
+    // "recording lost" error rather than an empty trace (constraint #1).
+    keepaliveMs: TRACE_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => {
+      const rec = tracingPerTab.get(tabId);
+      return rec && rec.recording ? { recording: true, categories: rec.categories ? rec.categories.slice() : [] } : null;
+    },
+    restore: (tabId, snap) => {
+      if (snap && snap.recording) {
+        tracingPerTab.set(tabId, { recording: true, categories: Array.isArray(snap.categories) ? snap.categories.slice() : [], events: [], bytes: 0, eventCount: 0, startedAt: Date.now(), truncated: false, reapplied: true });
+      }
+    },
+    reapply: async (tabId) => {
+      const rec = tracingPerTab.get(tabId);
+      if (!rec || !rec.recording) return;
+      await startTraceRecording(tabId, rec.categories || []).catch(() => undefined);
+    },
+    onDetach: (tabId) => {
+      const rec = tracingPerTab.get(tabId);
+      if (rec) { rec.lost = true; rec.recording = false; }
+    },
+  },
+  [MODE_HEAP_RECORDING]: {
+    // HeapProfiler.startSampling holds the attach while sampling (allocation profile). Intent is
+    // persisted so a re-attach restarts sampling; a lost record surfaces as "recording lost".
+    keepaliveMs: HEAP_SAMPLING_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => (heapSamplingPerTab.get(tabId)?.sampling ? { sampling: true } : null),
+    restore: (tabId, snap) => {
+      if (snap && snap.sampling) heapSamplingPerTab.set(tabId, { sampling: true });
+    },
+    reapply: async (tabId) => {
+      if (!heapSamplingPerTab.get(tabId)?.sampling) return;
+      await enableCdpDomain(tabId, "HeapProfiler").catch(() => undefined);
+      await cdp(tabId, "HeapProfiler.startSampling", {}).catch(() => undefined);
+    },
+    onDetach: (tabId) => heapSamplingPerTab.delete(tabId),
+  },
+  [MODE_RECORD_SESSION]: {
+    // Session recording holds the attach while active. The intent is persisted (re-attach
+    // re-injects the recorder + re-enables the domains) but the collected timeline dies with the
+    // attach/suspend — session.export surfaces "recording lost" instead of a partial timeline.
+    keepaliveMs: SESSION_RECORD_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => {
+      const rec = sessionRecordPerTab.get(tabId);
+      return rec && rec.recording
+        ? { recording: true, startedAt: rec.startedAt, durationMs: rec.durationMs, screenshotIntervalMs: rec.screenshotIntervalMs }
+        : null;
+    },
+    restore: (tabId, snap) => {
+      if (snap && snap.recording) {
+        sessionRecordPerTab.set(tabId, {
+          recording: true, startedAt: Number(snap.startedAt) || Date.now(), durationMs: Number(snap.durationMs) || SESSION_RECORD_DEFAULT_DURATION_MS,
+          screenshotIntervalMs: Number(snap.screenshotIntervalMs) || SESSION_RECORD_SCREENSHOT_INTERVAL_MS,
+          events: [], mutations: [], screenshots: [], screenshotBytes: 0, truncated: false, reapplied: true,
+        });
+      }
+    },
+    reapply: async (tabId) => {
+      const rec = sessionRecordPerTab.get(tabId);
+      if (!rec || !rec.recording) return;
+      await reapplySessionRecording(tabId).catch(() => undefined);
+    },
+    onDetach: (tabId) => {
+      const rec = sessionRecordPerTab.get(tabId);
+      if (rec) { rec.lost = true; rec.recording = false; }
+      const timer = recordingScreenshotTimers.get(tabId);
+      if (timer) { clearInterval(timer); recordingScreenshotTimers.delete(tabId); }
+    },
+  },
+  [MODE_BACKGROUND_SERVICE]: {
+    // BackgroundService observation holds the attach while active; the observed services and
+    // event ring are re-established on re-attach (the ring itself is best-effort across a
+    // suspend — a fresh observer restarts collection).
+    keepaliveMs: BACKGROUND_SERVICE_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => {
+      const st = backgroundServicePerTab.get(tabId);
+      return st && st.observing.size ? { observing: Array.from(st.observing) } : null;
+    },
+    restore: (tabId, snap) => {
+      if (snap && Array.isArray(snap.observing)) {
+        backgroundServicePerTab.set(tabId, { observing: new Set(snap.observing), recording: new Set(snap.observing), events: [] });
+      }
+    },
+    reapply: async (tabId, snap) => {
+      const st = backgroundServicePerTab.get(tabId);
+      if (!st) return;
+      for (const service of st.observing) {
+        await cdp(tabId, "BackgroundService.startObserving", { service, mode: "recording" }).catch(() => undefined);
+      }
+    },
+    onDetach: (tabId) => backgroundServicePerTab.delete(tabId),
+  },
+  [MODE_STORAGE_WATCH]: {
+    // Storage mutation watching holds the attach while active; the tracked origins/kind set is
+    // persisted and re-applied on re-attach (the before-state and event ring are in-memory only).
+    keepaliveMs: STORAGE_WATCH_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => {
+      const st = storageWatchPerTab.get(tabId);
+      return st && st.tracking.size ? { tracking: Array.from(st.tracking), origin: st.origin || null } : null;
+    },
+    restore: (tabId, snap) => {
+      if (snap && Array.isArray(snap.tracking)) {
+        storageWatchPerTab.set(tabId, { tracking: new Set(snap.tracking), origin: snap.origin || null, events: [], before: { databases: [], caches: [] } });
+      }
+    },
+    reapply: async (tabId, snap) => {
+      const st = storageWatchPerTab.get(tabId);
+      if (!st || !st.origin) return;
+      if (st.tracking.has("indexedDB")) await cdp(tabId, "Storage.trackIndexedDBForOrigin", { origin: st.origin }).catch(() => undefined);
+      if (st.tracking.has("cacheStorage")) await cdp(tabId, "Storage.trackCacheStorageForOrigin", { origin: st.origin }).catch(() => undefined);
+    },
+    onDetach: (tabId) => storageWatchPerTab.delete(tabId),
+  },
+  [MODE_EVENT_BREAKPOINTS]: {
+    // Event-listener breakpoints die with the attach (DOMDebugger domain state) — persist the
+    // event-name set and re-apply on re-attach. Pauses (reason EventListener) are recorded and
+    // auto-resumed by the Debugger.paused branch (rail), never left frozen.
+    keepaliveMs: EVENT_BREAK_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => {
+      const st = eventBreakPerTab.get(tabId);
+      return st && st.breakpoints.size ? { breakpoints: Array.from(st.breakpoints) } : null;
+    },
+    restore: (tabId, snap) => {
+      if (snap && Array.isArray(snap.breakpoints)) {
+        eventBreakPerTab.set(tabId, { breakpoints: new Set(snap.breakpoints), pauses: [] });
+      }
+    },
+    reapply: async (tabId) => {
+      const st = eventBreakPerTab.get(tabId);
+      if (!st) return;
+      await enableCdpDomain(tabId, "Debugger").catch(() => undefined);
+      await enableCdpDomain(tabId, "DOMDebugger").catch(() => undefined);
+      for (const name of st.breakpoints) {
+        await cdp(tabId, "DOMDebugger.setEventListenerBreakpoints", { eventListener: name }).catch(() => undefined);
+      }
+    },
+    onDetach: (tabId) => eventBreakPerTab.delete(tabId),
+  },
+  [MODE_DOM_BREAKPOINTS]: {
+    // DOM breakpoints die with the attach — persist the node reference + type set and re-apply on
+    // re-attach (re-resolving the node via the M0 resolver). Pauses (reason DOM) are recorded and
+    // auto-resumed by the Debugger.paused branch (rail).
+    keepaliveMs: EVENT_BREAK_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => {
+      const st = domBreakPerTab.get(tabId);
+      return st && st.types.size ? { types: Array.from(st.types), node: st.node ? { ...st.node } : null } : null;
+    },
+    restore: (tabId, snap) => {
+      if (snap && Array.isArray(snap.types)) {
+        domBreakPerTab.set(tabId, { types: new Set(snap.types), node: snap.node || null, pauses: [] });
+      }
+    },
+    reapply: async (tabId, snap) => {
+      const st = domBreakPerTab.get(tabId);
+      if (!st || !st.node) return;
+      await enableCdpDomain(tabId, "Debugger").catch(() => undefined);
+      await enableCdpDomain(tabId, "DOMDebugger").catch(() => undefined);
+      try {
+        const resolved = await resolveCdpNode(tabId, st.node);
+        for (const type of st.types) {
+          await cdp(tabId, "DOMDebugger.setDOMBreakpoint", { nodeId: resolved.nodeId, type }).catch(() => undefined);
+        }
+        await cdp(tabId, "Runtime.releaseObject", { objectId: resolved.objectId }).catch(() => undefined);
+      } catch {
+        // Element may have detached since the last attach — the next domBreak set command or a
+        // fresh snapshot re-establishes it; never let a re-apply failure wedge the mode.
+      }
+    },
+    onDetach: (tabId) => domBreakPerTab.delete(tabId),
+  },
+  [MODE_VIRTUAL_TIME]: {
+    // Deterministic virtual-time policy holds the attach while active (Emulation state dies with
+    // the attach). Persisted so a re-attach restores the policy; page.pdf refuses to combine
+    // with an active virtual-time policy (printToPDF hangs under virtual time).
+    keepaliveMs: VIRTUAL_TIME_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => {
+      const vt = virtualTimePerTab.get(tabId);
+      return vt ? { policy: vt.policy, budgetMs: vt.budgetMs ?? null, virtualTimeTicksBase: vt.virtualTimeTicksBase ?? null } : null;
+    },
+    restore: (tabId, snap) => {
+      if (snap && snap.policy) {
+        virtualTimePerTab.set(tabId, { policy: snap.policy, budgetMs: snap.budgetMs ?? null, budgetExpired: false, virtualTimeTicksBase: snap.virtualTimeTicksBase ?? null });
+      }
+    },
+    reapply: async (tabId, snap) => {
+      if (!snap || !snap.policy) return;
+      const params = { policy: snap.policy };
+      if (typeof snap.budgetMs === "number" && snap.budgetMs > 0) params.budget = snap.budgetMs;
+      await cdp(tabId, "Emulation.setVirtualTimePolicy", params).catch(() => undefined);
+    },
+    onDetach: (tabId) => virtualTimePerTab.delete(tabId),
+  },
 };
 
 // Per-tab active mode membership. The idle-detach sweep consults this; onDetach drains it.
@@ -946,6 +1221,14 @@ function inputStatus() {
     animationPausedTabs: Array.from(animationPerTab.entries()).filter(([, st]) => st.pausedIds.size > 0).map(([tabId, st]) => ({ tabId, paused: st.pausedIds.size })),
     cpuProfileTabs: Array.from(cpuProfilePerTab.entries()).filter(([, r]) => r.recording).map(([tabId]) => tabId),
     attachedWorkerTargets: Array.from(attachedTargets.keys()),
+    tracingTabs: Array.from(tracingPerTab.entries()).filter(([, r]) => r.recording).map(([tabId]) => tabId),
+    heapSamplingTabs: Array.from(heapSamplingPerTab.entries()).filter(([, r]) => r.sampling).map(([tabId]) => tabId),
+    sessionRecordingTabs: Array.from(sessionRecordPerTab.entries()).filter(([, r]) => r.recording).map(([tabId]) => tabId),
+    backgroundServiceTabs: Array.from(backgroundServicePerTab.entries()).filter(([, s]) => s.observing.size > 0).map(([tabId, s]) => ({ tabId, observing: Array.from(s.observing) })),
+    storageWatchTabs: Array.from(storageWatchPerTab.entries()).filter(([, s]) => s.tracking.size > 0).map(([tabId, s]) => ({ tabId, tracking: Array.from(s.tracking) })),
+    eventBreakTabs: Array.from(eventBreakPerTab.entries()).filter(([, s]) => s.breakpoints.size > 0).map(([tabId]) => tabId),
+    domBreakTabs: Array.from(domBreakPerTab.entries()).filter(([, s]) => s.types.size > 0).map(([tabId]) => tabId),
+    virtualTimeTabs: Array.from(virtualTimePerTab.keys()),
   };
 }
 
@@ -1380,6 +1663,41 @@ if (chrome.debugger && chrome.debugger.onEvent) {
           unregisterMode(tabId, MODE_PAUSED);
           void cdp(tabId, "Debugger.resume", {}).catch(() => undefined);
         }
+        return;
+      }
+      // P2 event/DOM breakpoints (debug.eventBreak / debug.domBreak): a pause wakes the capture
+      // waiter, or (persistent mode) is recorded into the bounded ring and the page auto-resumed
+      // (rail) — a persistent breakpoint must never leave the page frozen. A pause with neither
+      // waiter nor active mode is a stale leftover breakpoint; resume it too.
+      if (String(eventParams?.reason || "other") === "EventListener") {
+        const waiter = eventBreakWaiters.get(tabId);
+        if (waiter) {
+          eventBreakWaiters.delete(tabId);
+          if (waiter.timer) clearTimeout(waiter.timer);
+          waiter.resolve({ pausedAt: Date.now() });
+        } else {
+          const st = eventBreakPerTab.get(tabId);
+          if (st && st.breakpoints.size > 0) recordBreakPause(st.pauses, pausedTabs.get(tabId), EVENT_BREAK_PAUSES_MAX);
+          pausedTabs.delete(tabId);
+          unregisterMode(tabId, MODE_PAUSED);
+          void cdp(tabId, "Debugger.resume", {}).catch(() => undefined);
+        }
+        return;
+      }
+      if (String(eventParams?.reason || "other") === "DOM") {
+        const waiter = domBreakWaiters.get(tabId);
+        if (waiter) {
+          domBreakWaiters.delete(tabId);
+          if (waiter.timer) clearTimeout(waiter.timer);
+          waiter.resolve({ pausedAt: Date.now() });
+        } else {
+          const st = domBreakPerTab.get(tabId);
+          if (st && st.types.size > 0) recordBreakPause(st.pauses, pausedTabs.get(tabId), DOM_BREAK_PAUSES_MAX);
+          pausedTabs.delete(tabId);
+          unregisterMode(tabId, MODE_PAUSED);
+          void cdp(tabId, "Debugger.resume", {}).catch(() => undefined);
+        }
+        return;
       }
       return;
     }
@@ -1453,6 +1771,72 @@ if (chrome.debugger && chrome.debugger.onEvent) {
     }
     if (method.startsWith("ServiceWorker.")) {
       recordServiceWorkerEvent(tabId, method, eventParams);
+      return;
+    }
+    // ---- P2 event branches: tracing / heap / background-service / storage-watch / virtual time ----
+    if (method === "Tracing.dataCollected") {
+      recordTraceData(tabId, eventParams);
+      return;
+    }
+    if (method === "Tracing.tracingComplete") {
+      const waiter = tracingCompleteWaiters.get(tabId);
+      if (waiter) {
+        tracingCompleteWaiters.delete(tabId);
+        if (waiter.timer) clearTimeout(waiter.timer);
+        const rec = tracingPerTab.get(tabId);
+        if (rec) rec.dataLossOccurred = eventParams?.dataLossOccurred === true;
+        waiter.resolve({ dataLossOccurred: eventParams?.dataLossOccurred === true });
+      }
+      return;
+    }
+    if (method === "HeapProfiler.addHeapSnapshotChunk") {
+      const buf = heapSnapshotPerTab.get(tabId);
+      if (buf && !buf.done && typeof eventParams?.chunk === "string") {
+        buf.chunkCount++;
+        buf.totalBytes += eventParams.chunk.length;
+        if (buf.text.length + eventParams.chunk.length <= HEAP_SNAPSHOT_MAX_BYTES) {
+          buf.text += eventParams.chunk; // incremental chunked accumulation (never one giant concat)
+        } else {
+          buf.truncated = true;
+          if (buf.text.length < HEAP_SNAPSHOT_MAX_BYTES) {
+            const room = HEAP_SNAPSHOT_MAX_BYTES - buf.text.length;
+            buf.text += eventParams.chunk.slice(0, room);
+          }
+        }
+      }
+      return;
+    }
+    if (method === "HeapProfiler.reportHeapSnapshotProgress") {
+      const buf = heapSnapshotPerTab.get(tabId);
+      if (buf && typeof eventParams?.done === "number") {
+        buf.progress = { done: eventParams.done, total: eventParams.total ?? null, finished: eventParams.finished === true };
+        if (eventParams.finished === true) buf.done = true;
+      }
+      return;
+    }
+    if (method === "BackgroundService.backgroundServiceEventReceived") {
+      recordBackgroundServiceEvent(tabId, eventParams);
+      return;
+    }
+    if (method.startsWith("Storage.")) {
+      recordStorageWatchEvent(tabId, method, eventParams);
+      return;
+    }
+    if (method === "Emulation.virtualTimeBudgetExpired") {
+      const vt = virtualTimePerTab.get(tabId);
+      if (vt) vt.budgetExpired = true;
+      const waiter = virtualTimeWaiters.get(tabId);
+      if (waiter) {
+        virtualTimeWaiters.delete(tabId);
+        if (waiter.timer) clearTimeout(waiter.timer);
+        waiter.resolve({
+          expired: true,
+          budgetExpired: true,
+          virtualTimeTicksBase: eventParams?.virtualTimeTicksBase ?? null,
+          virtualTimeTicks: eventParams?.virtualTimeTicks ?? null,
+          elapsedVirtualTime: typeof eventParams?.elapsedVirtualTime === "number" ? eventParams.elapsedVirtualTime : null,
+        });
+      }
       return;
     }
     if (method.startsWith("Network.")) handleCdpNetworkEvent(tabId, method, eventParams);
@@ -5695,6 +6079,11 @@ const PDF_MAX_BASE64_CHARS = 6 * 1024 * 1024; // leave headroom under the 8MB re
 
 async function chromePdf(params) {
   const tab = await getTabByParams(params);
+  // Deterministic virtual time (page.virtualTime) freezes rendering — printToPDF hangs under an
+  // active virtual-time policy and must never be combined (TOOL_CONTRACTS §7 row 72 edge).
+  if (virtualTimePerTab.has(tab.id)) {
+    throw new Error("chrome_pdf cannot run while a virtual-time policy is active (page.virtualTime) — call chrome_virtual_time reset first.");
+  }
   const pauseNote = await ensurePageUsable(tab.id, "pdf export");
   await attachDebugger(tab.id);
   const options = {
@@ -5822,6 +6211,1392 @@ async function chromeCoverage(params) {
     capped: files.length >= COVERAGE_MAX_FILES,
     jsSources: jsCoverage ? (Array.isArray(jsCoverage.result) ? jsCoverage.result.length : 0) : 0,
     cssRules: cssCoverage ? (Array.isArray(cssCoverage.coverage) ? cssCoverage.coverage.length : 0) : 0,
+  };
+  if (pauseNote) result.pausedAutoResumed = pauseNote;
+  return result;
+}
+
+// =================== P2: audits, trace/heap, replay, breakpoints, virtual time ===================
+
+// Compact break-pause record from the Debugger.paused cache (event/DOM breakpoint pauses).
+function recordBreakPause(ring, paused, cap) {
+  const frames = Array.isArray(paused?.callFrames)
+    ? paused.callFrames.slice(0, 20).map((f) => ({
+        functionName: String(f?.functionName || ""),
+        url: String(f?.url || ""),
+        lineNumber: typeof f?.lineNumber === "number" ? f.lineNumber : null,
+        columnNumber: typeof f?.columnNumber === "number" ? f.columnNumber : null,
+      }))
+    : [];
+  ringPush(ring, { at: Date.now(), reason: String(paused?.reason || "other"), frameCount: frames.length, frames }, cap);
+}
+
+// ---- tracing (chrome_trace) -----------------------------------------------------------
+const TRACE_CATEGORIES_DEFAULT = [
+  "devtools.timeline", "v8.execute", "disabled-by-default-v8.compile", "disabled-by-default-v8.runtime",
+  "blink.user_timing", "loading", "disabled-by-default-blink.feature_usage", "toplevel",
+];
+
+function normalizeTraceCategories(categories) {
+  if (!Array.isArray(categories) || !categories.length) return TRACE_CATEGORIES_DEFAULT.slice();
+  return categories.map((c) => String(c)).slice(0, 40);
+}
+
+async function startTraceRecording(tabId, categories) {
+  await enableCdpDomain(tabId, "Tracing");
+  await cdp(tabId, "Tracing.start", {
+    categories: normalizeTraceCategories(categories).join(","),
+    transferMode: "ReportEvents",
+    bufferUsageReportingInterval: 1000,
+  });
+}
+
+// Accumulate Tracing.dataCollected event arrays into the per-tab buffer under a byte budget.
+// Chunked incremental append (never one giant concat); over budget the buffer keeps a bounded
+// recent tail so hot-path analysis stays actionable and the result never crosses the bridge cap.
+function recordTraceData(tabId, eventParams) {
+  const rec = tracingPerTab.get(tabId);
+  if (!rec || !rec.recording) return;
+  const events = Array.isArray(eventParams?.value) ? eventParams.value : [];
+  if (!events.length) return;
+  let addedBytes = 0;
+  try { addedBytes = JSON.stringify(events).length; } catch { addedBytes = events.length * 80; }
+  rec.eventCount += events.length;
+  rec.bytes += addedBytes;
+  if (rec.truncated) return;
+  rec.events.push(...events);
+  if (rec.events.length > TRACE_MAX_EVENTS || rec.bytes > TRACE_MAX_BUFFER_BYTES) {
+    const keep = Math.min(rec.events.length, Math.max(TRACE_MAX_EVENTS / 4, 100_000));
+    rec.events = rec.events.slice(Math.max(0, rec.events.length - keep));
+    try { rec.bytes = JSON.stringify(rec.events).length; } catch { rec.bytes = rec.events.length * 40; }
+    rec.truncated = true;
+  }
+}
+
+// Plain-language hot-path summary over the buffered trace events (bounded scan, pure helper).
+function buildTraceSummary(events, top = TRACE_SUMMARY_TOP) {
+  const selfTime = new Map();
+  const counts = new Map();
+  const longTasks = [];
+  const frameTotals = { Layout: 0, UpdateLayoutTree: 0, RecalculateStyles: 0, Paint: 0, Commit: 0 };
+  for (const e of events) {
+    if (!e || typeof e !== "object") continue;
+    const name = String(e.name || "");
+    const dur = typeof e.dur === "number" && e.dur > 0 ? e.dur : 0;
+    if (dur > 0) selfTime.set(name, (selfTime.get(name) || 0) + dur);
+    counts.set(name, (counts.get(name) || 0) + 1);
+    if (name === "RunTask" && dur > 50_000) {
+      const data = e.args && e.args.data && typeof e.args.data === "object" ? e.args.data : null;
+      longTasks.push({ name: "RunTask", durUs: dur, ts: typeof e.ts === "number" ? e.ts : null, frame: data?.frame ? String(data.frame) : null });
+    }
+    if (Object.prototype.hasOwnProperty.call(frameTotals, name)) frameTotals[name] += dur;
+  }
+  const topSelfTime = Array.from(selfTime.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, top)
+    .map(([name, selfUs]) => ({ name, selfUs, count: counts.get(name) || 0 }));
+  const topByCount = Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, top)
+    .map(([name, count]) => ({ name, count }));
+  longTasks.sort((a, b) => b.durUs - a.durUs);
+  return {
+    eventCount: events.length,
+    topSelfTime,
+    topByCount,
+    longTasks: longTasks.slice(0, 10),
+    frameTotals,
+    longestTaskMs: longTasks.length ? Math.round(longTasks[0].durUs / 1000) : 0,
+  };
+}
+
+// tracing.start / tracing.stop / tracing.getCategories — chrome_trace.
+async function chromeTrace(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  const action = String(params.action || "start");
+  if (action === "getCategories") {
+    const res = await cdp(tab.id, "Tracing.getCategories", {}).catch(() => null);
+    const categories = Array.isArray(res?.categories) ? res.categories.slice(0, TRACE_CATEGORIES_MAX) : [];
+    return { categories, count: categories.length };
+  }
+  if (action === "start") {
+    const existing = tracingPerTab.get(tab.id);
+    if (existing && existing.recording) return { recording: true, alreadyRecording: true, categories: existing.categories };
+    const categories = normalizeTraceCategories(params.categories);
+    await startTraceRecording(tab.id, categories);
+    tracingPerTab.set(tab.id, { recording: true, categories, events: [], bytes: 0, eventCount: 0, startedAt: Date.now(), truncated: false });
+    registerMode(tab.id, MODE_TRACING);
+    return { recording: true, categories, transferMode: "ReportEvents" };
+  }
+  if (action === "stop") {
+    const rec = tracingPerTab.get(tab.id);
+    if (!rec || !rec.recording) throw new Error("No tracing recording active on this tab — call chrome_trace start first");
+    if (rec.lost) {
+      tracingPerTab.delete(tab.id);
+      unregisterMode(tab.id, MODE_TRACING);
+      throw new Error("Tracing recording was lost (debugger attach dropped or the service worker restarted) — start a new chrome_trace recording.");
+    }
+    unregisterMode(tab.id, MODE_TRACING);
+    let completed = rec.tracingComplete === true;
+    try {
+      if (!completed) {
+        // tracing.stop (wire kind) maps to the CDP verb Tracing.end — the protocol has no
+        // Tracing.stop method; DevTools renamed stop-at-the-API-layer. Arm the tracingComplete
+        // waiter BEFORE Tracing.end so a fast flush cannot race it; the event branch also sets
+        // rec.tracingComplete so an already-delivered event skips the wait.
+        await new Promise((resolve) => {
+          const timer = setTimeout(() => { tracingCompleteWaiters.delete(tab.id); resolve(false); }, TRACE_COMPLETE_WAIT_MS);
+          tracingCompleteWaiters.set(tab.id, { resolve: () => resolve(true), timer });
+        });
+        await cdp(tab.id, "Tracing.end", {});
+        const waiter = tracingCompleteWaiters.get(tab.id);
+        if (waiter) { tracingCompleteWaiters.delete(tab.id); clearTimeout(waiter.timer); }
+        completed = rec.tracingComplete === true;
+      }
+    } catch (error) {
+      tracingPerTab.delete(tab.id);
+      throw new Error(`chrome_trace stop failed: ${String(error?.message || error)}`);
+    }
+    const events = Array.isArray(rec.events) ? rec.events : [];
+    const result = {
+      recording: false,
+      startedAt: rec.startedAt,
+      elapsedMs: Date.now() - rec.startedAt,
+      eventCount: rec.eventCount || events.length,
+      bytes: rec.bytes || 0,
+      completed,
+      truncated: rec.truncated === true,
+      dataLoss: rec.dataLossOccurred === true,
+      summary: buildTraceSummary(events),
+      trace: events,
+    };
+    tracingPerTab.delete(tab.id);
+    return result;
+  }
+  throw new Error(`Unknown trace action: ${action} (expected start|stop|getCategories)`);
+}
+
+// ---- heap snapshot (chrome_heap_snapshot) ---------------------------------------------
+// Best-effort structural parse of a .heapsnapshot JSON (standard V8 layout): header counts + top
+// self-size nodes. The nodes array is a flat number sequence stepped by node_fields.length;
+// the strings table is the JSON array at the end of the snapshot. Bounded scans mark partial.
+const HEAP_NODE_FIELDS = ["type", "name", "id", "self_size", "edge_count", "trace_node_id", "detachedness"];
+const HEAP_NODE_TYPE_NAMES = ["hidden", "array", "string", "object", "code", "closure", "regexp", "number", "native", "synthetic", "concatenated string", "sliced string", "symbol", "bigint", "object shape"];
+const HEAP_SUMMARY_NODES_MAX = 100_000; // bounded node scan
+const HEAP_SUMMARY_STRINGS_MAX = 30_000; // bounded string-table resolve
+
+function summarizeHeapSnapshot(text, top = HEAP_SNAPSHOT_SUMMARY_TOP) {
+  const summary = { nodeCount: null, edgeCount: null, stringCount: null, selfSizeBytes: null, topSelfSize: [], partial: false };
+  try {
+    const mCount = /"node_count"\s*:\s*(\d+)/.exec(text);
+    const mEdge = /"edge_count"\s*:\s*(\d+)/.exec(text);
+    if (mCount) summary.nodeCount = Number(mCount[1]);
+    if (mEdge) summary.edgeCount = Number(mEdge[1]);
+    const nodesStart = text.indexOf('"nodes"');
+    const stringsStart = text.indexOf('"strings"');
+    if (nodesStart < 0 || stringsStart < 0 || stringsStart < nodesStart) {
+      summary.partial = true;
+      return summary;
+    }
+    // strings table is the last JSON field; parse up to the final ']'.
+    const strOpen = text.indexOf("[", stringsStart);
+    const strEnd = text.lastIndexOf("]");
+    const stringValues = [];
+    if (strOpen >= 0 && strEnd > strOpen) {
+      const strBody = text.slice(strOpen + 1, strEnd);
+      const re = /"((?:[^"\\]|\\.)*)"/g;
+      let m;
+      while ((m = re.exec(strBody)) && stringValues.length < HEAP_SUMMARY_STRINGS_MAX) stringValues.push(m[1]);
+      summary.stringCount = stringValues.length;
+      if (stringValues.length >= HEAP_SUMMARY_STRINGS_MAX) summary.partial = true;
+    }
+    // nodes array: bracket-match the interior, step by node_fields length.
+    const nodeOpen = text.indexOf("[", nodesStart);
+    const nodeEnd = findArrayEnd(text, nodeOpen);
+    if (nodeOpen >= 0 && nodeEnd > nodeOpen) {
+      const nodeBody = text.slice(nodeOpen + 1, nodeEnd);
+      const parts = nodeBody.split(",");
+      const step = HEAP_NODE_FIELDS.length;
+      const scanned = Math.min(Math.floor(parts.length / step), HEAP_SUMMARY_NODES_MAX);
+      if (Math.floor(parts.length / step) > HEAP_SUMMARY_NODES_MAX) summary.partial = true;
+      const rows = [];
+      let selfSizeBytes = 0;
+      for (let i = 0; i < scanned; i++) {
+        const base = i * step;
+        const typeIdx = Number(parts[base]) || 0;
+        const nameIdx = Number(parts[base + 1]) || 0;
+        const selfSize = Number(parts[base + 3]) || 0;
+        if (!selfSize) continue;
+        selfSizeBytes += selfSize;
+        rows.push({
+          type: HEAP_NODE_TYPE_NAMES[typeIdx] || "unknown",
+          name: stringValues[nameIdx] !== undefined ? stringValues[nameIdx] : "",
+          selfSize,
+        });
+      }
+      summary.selfSizeBytes = selfSizeBytes;
+      rows.sort((a, b) => b.selfSize - a.selfSize);
+      summary.topSelfSize = rows.slice(0, top);
+    } else {
+      summary.partial = true;
+    }
+  } catch {
+    summary.partial = true;
+  }
+  return summary;
+}
+
+// Bracket-match the array/object literal starting at openIndex (string-aware).
+function findArrayEnd(text, openIndex) {
+  let depth = 0;
+  let state = "code";
+  for (let i = openIndex; i < text.length; i++) {
+    const c = text[i];
+    const next = text[i + 1];
+    if (state === "str") {
+      if (c === "\\") { i++; continue; }
+      if (c === '"') state = "code";
+      continue;
+    }
+    if (c === '"') { state = "str"; continue; }
+    if (c === "[" || c === "{") { depth++; continue; }
+    if (c === "]" || c === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+// heap.snapshot — chrome_heap_snapshot: one-shot streamed capture (summaryOnly first, full
+// .heapsnapshot JSON inlined only when it fits under the bridge cap; host writes the file).
+const HEAP_SNAPSHOT_CMD_PARAMS = { reportProgress: true, captureNumericValue: false };
+
+async function chromeHeapSnapshot(params) {
+  const tabId = Number(params?.targetId);
+  const hasTab = Number.isInteger(tabId) && tabId > 0;
+  const buf = { text: "", totalBytes: 0, chunkCount: 0, truncated: false, done: false };
+  // Register the chunk buffer + issue takeHeapSnapshot IN THE DISPATCH TICK: the renderer
+  // streams HeapProfiler.addHeapSnapshotChunk events while the command is pending (real protocol
+  // order), so the buffer must exist before the first chunk arrives. A cold tab (not yet
+  // attached) fails fast with "Debugger is not attached" and the call is re-issued after attach.
+  let pending = hasTab ? cdpSend(tabId, "HeapProfiler.takeHeapSnapshot", HEAP_SNAPSHOT_CMD_PARAMS, 120_000) : null;
+  if (hasTab) heapSnapshotPerTab.set(tabId, buf);
+  let tab = null;
+  try {
+    tab = await getTabByParams(params);
+    const pauseNote = await ensurePageUsable(tab.id, "heap snapshot");
+    await attachDebugger(tab.id);
+    await enableCdpDomain(tab.id, "HeapProfiler");
+    if (pending) {
+      try {
+        await pending;
+      } catch (error) {
+        if (!/not attached/i.test(String(error?.message || error))) throw error;
+        await cdpSend(tab.id, "HeapProfiler.takeHeapSnapshot", HEAP_SNAPSHOT_CMD_PARAMS, 120_000);
+      }
+    } else {
+      await cdpSend(tab.id, "HeapProfiler.takeHeapSnapshot", HEAP_SNAPSHOT_CMD_PARAMS, 120_000);
+    }
+    // Drain any trailing chunk events that queued behind the command callback (Chrome delivers
+    // the final addHeapSnapshotChunk around the takeHeapSnapshot response).
+    await sleep(30);
+    // takeHeapSnapshot is done; the done flag drops any straggler racing behind the drain.
+    buf.done = true;
+    const summaryTop = Number(params.maxNodes) > 0 ? Math.min(Number(params.maxNodes), HEAP_SNAPSHOT_SUMMARY_TOP * 10) : HEAP_SNAPSHOT_SUMMARY_TOP;
+    const summary = summarizeHeapSnapshot(buf.text, summaryTop);
+    const truncated = buf.truncated === true;
+    const result = {
+      summaryOnly: true,
+      summary: {
+        ...summary,
+        totalBytes: buf.totalBytes,
+        chunkCount: buf.chunkCount,
+        truncated,
+      },
+      bytes: buf.totalBytes,
+      truncated,
+    };
+    if (truncated) {
+      result.snapshotTooLarge = buf.totalBytes;
+      result.hint = "Heap snapshot exceeds the bridge result cap — run chrome_allocation_profile for sampling attribution, or free memory and retry.";
+    } else {
+      // summaryOnly-first: the SW-side summary is always shipped; the full .heapsnapshot JSON
+      // rides along (host writes it to file) whenever it fits the bridge budget.
+      result.snapshot = buf.text;
+    }
+    if (pauseNote) result.pausedAutoResumed = pauseNote;
+    return result;
+  } finally {
+    const bufTab = (tab && tab.id) || tabId;
+    if (Number.isInteger(bufTab) && bufTab > 0) heapSnapshotPerTab.delete(bufTab);
+  }
+}
+
+// ---- allocation sampling (chrome_allocation_profile) ----------------------------------
+// Top self-size allocation rows from a SamplingHeapProfile (pure helper).
+function summarizeSamplingProfile(profile, top = HEAP_SAMPLING_SUMMARY_TOP) {
+  const rows = [];
+  const visit = (node) => {
+    if (!node || typeof node !== "object") return;
+    const cf = node.callFrame || {};
+    rows.push({
+      functionName: String(cf.functionName || ""),
+      url: String(cf.url || ""),
+      lineNumber: typeof cf.lineNumber === "number" ? cf.lineNumber : null,
+      selfSize: typeof node.selfSize === "number" ? node.selfSize : 0,
+    });
+    if (Array.isArray(node.children)) { for (const c of node.children) visit(c); }
+  };
+  visit(profile && profile.head);
+  rows.sort((a, b) => b.selfSize - a.selfSize);
+  return {
+    topSelfSize: rows.slice(0, top),
+    totalSelfSize: rows.reduce((a, r) => a + r.selfSize, 0),
+    sampleCount: Array.isArray(profile?.samples) ? profile.samples.length : 0,
+    nodeCount: rows.length,
+  };
+}
+
+// heap.samplingStart / heap.samplingStop — chrome_allocation_profile.
+async function chromeAllocationProfile(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  const action = String(params.action || "samplingStart");
+  if (action === "samplingStart" || action === "start") {
+    const existing = heapSamplingPerTab.get(tab.id);
+    if (existing && existing.sampling) return { sampling: true, alreadySampling: true };
+    await enableCdpDomain(tab.id, "HeapProfiler");
+    const startParams = {};
+    if (typeof params.samplingInterval === "number" && params.samplingInterval > 0) startParams.samplingInterval = params.samplingInterval;
+    if (params.trackObjects === true) {
+      await cdp(tab.id, "HeapProfiler.startTrackingHeapObjects", { trackAllocations: true, captureNumericValue: false }).catch(() => undefined);
+    }
+    await cdp(tab.id, "HeapProfiler.startSampling", startParams);
+    heapSamplingPerTab.set(tab.id, { sampling: true, startedAt: Date.now() });
+    registerMode(tab.id, MODE_HEAP_RECORDING);
+    return { sampling: true, startedAt: heapSamplingPerTab.get(tab.id).startedAt };
+  }
+  if (action === "samplingStop" || action === "stop") {
+    const rec = heapSamplingPerTab.get(tab.id);
+    if (!rec || !rec.sampling) throw new Error("No heap sampling recording active on this tab — call chrome_allocation_profile samplingStart first");
+    heapSamplingPerTab.delete(tab.id);
+    unregisterMode(tab.id, MODE_HEAP_RECORDING);
+    let profile = null;
+    try {
+      profile = await cdp(tab.id, "HeapProfiler.stopSampling", {});
+    } catch (error) {
+      return { sampling: false, lost: true, error: String(error?.message || error) };
+    }
+    const cdpProfile = profile?.profile || null;
+    const summary = summarizeSamplingProfile(cdpProfile);
+    const result = {
+      sampling: false,
+      startedAt: rec.startedAt,
+      elapsedMs: Date.now() - rec.startedAt,
+      ...summary,
+    };
+    const full = JSON.stringify(cdpProfile);
+    if (cdpProfile && full.length <= HEAP_SAMPLING_INLINE_MAX_CHARS) result.profile = cdpProfile;
+    else result.profileTooLarge = full.length;
+    return result;
+  }
+  if (action === "samplingProfile" || action === "profile") {
+    // Non-destructive peek: read the current SamplingHeapProfile without stopping sampling.
+    const rec = heapSamplingPerTab.get(tab.id);
+    if (!rec || !rec.sampling) throw new Error("No heap sampling recording active on this tab — call chrome_allocation_profile samplingStart first");
+    const res = await cdp(tab.id, "HeapProfiler.getSamplingProfile", {}).catch((error) => ({ __error: String(error?.message || error) }));
+    if (res && res.__error) return { sampling: true, peek: true, degraded: true, error: res.__error.slice(0, 300) };
+    const summary = summarizeSamplingProfile(res?.profile || null);
+    return { sampling: true, peek: true, startedAt: rec.startedAt, ...summary };
+  }
+  throw new Error(`Unknown allocation profile action: ${action} (expected samplingStart|samplingStop|samplingProfile)`);
+}
+
+// ---- session recording (chrome_record_session) ----------------------------------------
+// The timeline composes CDP Network + Runtime/Log rings (filtered to the recording window) with
+// the injected in-page MutationObserver ring and periodic JPEG screenshots. All buffers bounded.
+
+async function ensureSessionRecorderInjected(tabId) {
+  const rec = sessionRecordPerTab.get(tabId);
+  if (rec && rec.injected) return true;
+  const started = await cdpEval(tabId, `(async () => {
+    if (typeof globalThis.__piChromeSessionRecorder === "function") { globalThis.__piChromeSessionRecorder.start(); return true; }
+    return false;
+  })()`).catch(() => null);
+  if (started && started.result && started.result.value === true) {
+    if (rec) rec.injected = true;
+    return true;
+  }
+  const src = await snapshotSourceText().catch(() => null);
+  if (!src) return false;
+  const res = await cdpEval(tabId, `${src}\n;(typeof globalThis.__piChromeSessionRecorder === "function") ? (globalThis.__piChromeSessionRecorder.start(), true) : false`).catch(() => null);
+  if (res && res.result && res.result.value === true && rec) rec.injected = true;
+  return res && res.result && res.result.value === true;
+}
+
+async function readSessionMutations(tabId) {
+  const res = await cdpEval(tabId, `(() => {
+    const s = window.__PI_CHROME_STATE__;
+    return s && Array.isArray(s.sessionRecording) ? s.sessionRecording.slice() : [];
+  })()`).catch(() => null);
+  const v = res && res.result ? res.result.value : null;
+  return Array.isArray(v) ? v : [];
+}
+
+async function captureRecordingScreenshot(tabId) {
+  const rec = sessionRecordPerTab.get(tabId);
+  if (!rec || !rec.recording) return;
+  if (rec.screenshots.length >= SESSION_RECORD_MAX_SCREENSHOTS || rec.screenshotBytes >= SESSION_RECORD_SCREENSHOT_BUDGET_BYTES) return;
+  const res = await cdp(tabId, "Page.captureScreenshot", { format: "jpeg", quality: 50, fromSurface: true }).catch(() => null);
+  if (res && typeof res.data === "string") {
+    rec.screenshots.push({ t: Date.now(), data: res.data });
+    rec.screenshotBytes += res.data.length;
+  }
+}
+
+function startRecordingScreenshotLoop(tabId) {
+  const existing = recordingScreenshotTimers.get(tabId);
+  if (existing) clearInterval(existing);
+  const interval = Math.max(sessionRecordPerTab.get(tabId)?.screenshotIntervalMs || SESSION_RECORD_SCREENSHOT_INTERVAL_MS, 200);
+  const timer = setInterval(() => { void captureRecordingScreenshot(tabId).catch(() => undefined); }, interval);
+  recordingScreenshotTimers.set(tabId, timer);
+}
+
+async function reapplySessionRecording(tabId) {
+  await enableNetworkDomain(tabId).catch(() => undefined);
+  await enableCdpDomain(tabId, "Runtime").catch(() => undefined);
+  await enableCdpDomain(tabId, "Log").catch(() => undefined);
+  await ensureSessionRecorderInjected(tabId).catch(() => undefined);
+  startRecordingScreenshotLoop(tabId);
+}
+
+// Compose the time-correlated timeline from the shared rings, filtered to the recording window.
+function buildSessionTimeline(tabId, rec) {
+  const startedAt = rec.startedAt;
+  const events = [];
+  const net = cdpNetworkEntries.get(tabId);
+  if (net) {
+    for (const entry of net.values()) {
+      if (!entry.startedAt || entry.startedAt < startedAt) continue;
+      events.push({ t: entry.startedAt, type: "network", method: entry.method, url: String(entry.url || "").slice(0, 300), status: entry.status ?? null, resourceType: entry.resourceType || "" });
+    }
+  }
+  const consoleRing = consoleEntriesPerTab.get(tabId) || [];
+  for (const e of consoleRing) {
+    const t = e.timestamp ?? e.t ?? 0;
+    if (!t || t < startedAt) continue;
+    events.push({ t, type: "console", level: String(e.type || "log"), text: String(e.args?.[0]?.value ?? e.text ?? "").slice(0, 300) });
+  }
+  const logRing = logEntriesPerTab.get(tabId) || [];
+  for (const e of logRing) {
+    const t = e.timestamp ?? e.t ?? 0;
+    if (!t || t < startedAt) continue;
+    events.push({ t, type: "log", level: String(e.level || "info"), text: String(e.text || "").slice(0, 300), source: e.source || "" });
+  }
+  const exRing = runtimeExceptionsPerTab.get(tabId) || [];
+  for (const e of exRing) {
+    const t = e.timestamp ?? e.t ?? 0;
+    if (!t || t < startedAt) continue;
+    events.push({ t, type: "exception", text: String(e.text || e.preview?.value || "").slice(0, 300) });
+  }
+  events.sort((a, b) => a.t - b.t);
+  if (events.length > SESSION_RECORD_MAX_EVENTS) {
+    events.splice(0, events.length - SESSION_RECORD_MAX_EVENTS);
+    rec.truncated = true;
+  }
+  return events;
+}
+
+// session.record / session.export — chrome_record_session.
+async function chromeRecordSession(params) {
+  const action = String(params.action || "record");
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  if (action === "record") {
+    const existing = sessionRecordPerTab.get(tab.id);
+    if (existing && existing.recording) return { recording: true, alreadyRecording: true, startedAt: existing.startedAt, durationMs: existing.durationMs };
+    const durationMs = Math.min(Math.max(Number(params.durationMs) || SESSION_RECORD_DEFAULT_DURATION_MS, 1000), SESSION_RECORD_MAX_DURATION_MS);
+    const screenshotIntervalMs = Math.min(Math.max(Number(params.screenshotIntervalMs) || SESSION_RECORD_SCREENSHOT_INTERVAL_MS, 200), 5000);
+    const rec = {
+      recording: true, startedAt: Date.now(), durationMs, screenshotIntervalMs,
+      events: [], mutations: [], screenshots: [], screenshotBytes: 0, truncated: false, injected: false,
+      hadNetwork: networkModeTabs.has(tab.id), hadConsole: consoleCaptureTabs.has(tab.id),
+    };
+    sessionRecordPerTab.set(tab.id, rec);
+    registerMode(tab.id, MODE_RECORD_SESSION);
+    await enableNetworkDomain(tab.id).catch(() => undefined);
+    networkModeTabs.add(tab.id);
+    await enableCdpDomain(tab.id, "Runtime").catch(() => undefined);
+    await enableCdpDomain(tab.id, "Log").catch(() => undefined);
+    consoleCaptureTabs.add(tab.id);
+    await ensureSessionRecorderInjected(tab.id).catch(() => undefined);
+    startRecordingScreenshotLoop(tab.id);
+    return { recording: true, startedAt: rec.startedAt, durationMs, screenshotIntervalMs };
+  }
+  if (action === "export") {
+    const rec = sessionRecordPerTab.get(tab.id);
+    if (!rec || !rec.recording) throw new Error("No session recording active on this tab — call chrome_record_session record first");
+    if (rec.lost) {
+      sessionRecordPerTab.delete(tab.id);
+      unregisterMode(tab.id, MODE_RECORD_SESSION);
+      throw new Error("Session recording was lost (debugger attach dropped or the service worker restarted) — start a new chrome_record_session recording.");
+    }
+    unregisterMode(tab.id, MODE_RECORD_SESSION);
+    const timer = recordingScreenshotTimers.get(tab.id);
+    if (timer) { clearInterval(timer); recordingScreenshotTimers.delete(tab.id); }
+    await sleep(150);
+    await captureRecordingScreenshot(tab.id).catch(() => undefined);
+    const mutations = await readSessionMutations(tab.id).catch(() => []);
+    const events = buildSessionTimeline(tab.id, rec);
+    const result = {
+      startedAt: rec.startedAt,
+      durationMs: Date.now() - rec.startedAt,
+      eventCount: events.length,
+      mutationCount: mutations.length,
+      screenshotCount: rec.screenshots.length,
+      truncated: rec.truncated === true || events.length >= SESSION_RECORD_MAX_EVENTS,
+      events,
+      mutations,
+      screenshots: rec.screenshots.map((s) => ({ t: s.t, data: s.data })),
+    };
+    sessionRecordPerTab.delete(tab.id);
+    if (!rec.hadNetwork) networkModeTabs.delete(tab.id);
+    if (!rec.hadConsole) consoleCaptureTabs.delete(tab.id);
+    return result;
+  }
+  throw new Error(`Unknown session action: ${action} (expected record|export)`);
+}
+
+// ---- background service (chrome_background_service) ------------------------------------
+const BACKGROUND_SERVICE_NAMES = ["backgroundFetch", "backgroundSync", "pushMessaging", "notifications", "paymentHandler", "periodicBackgroundSync"];
+
+function recordBackgroundServiceEvent(tabId, eventParams) {
+  const ev = eventParams?.backgroundServiceEvent;
+  if (!ev || typeof ev !== "object") return;
+  let st = backgroundServicePerTab.get(tabId);
+  if (!st) return;
+  ringPush(st.events, {
+    timestamp: normalizeCdpTimestamp(ev.timestamp),
+    origin: String(ev.origin || ""),
+    service: String(ev.service || ""),
+    eventName: String(ev.eventName || ""),
+    instanceId: String(ev.instanceId || "").slice(0, 120),
+    serviceWorkerRegistrationId: String(ev.serviceWorkerRegistrationId || "").slice(0, 120),
+    metadata: Array.isArray(ev.eventMetadata) ? ev.eventMetadata.slice(0, 20).map((m) => ({ key: String(m.key || ""), value: String(m.value || "").slice(0, 500) })) : [],
+  }, BACKGROUND_SERVICE_RING_MAX);
+}
+
+// background.service — chrome_background_service.
+async function chromeBackgroundService(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  const action = String(params.action || "list");
+  if (action === "list") {
+    return { action, services: BACKGROUND_SERVICE_NAMES.slice(), count: BACKGROUND_SERVICE_NAMES.length };
+  }
+  const service = params.serviceName ? String(params.serviceName) : (params.service ? String(params.service) : null);
+  if (!service) throw new Error(`chrome_background_service ${action} requires service (one of ${BACKGROUND_SERVICE_NAMES.join(", ")})`);
+  let st = backgroundServicePerTab.get(tab.id);
+  if (!st) { st = { observing: new Set(), recording: new Set(), events: [] }; backgroundServicePerTab.set(tab.id, st); }
+  if (action === "observe") {
+    const mode = String(params.mode || "recording");
+    await cdp(tab.id, "BackgroundService.startObserving", { service, mode });
+    if (mode === "recording" && params.shouldRecord !== false) {
+      await cdp(tab.id, "BackgroundService.setRecording", { shouldRecord: true, service }).catch(() => undefined);
+      st.recording.add(service);
+    }
+    st.observing.add(service);
+    registerMode(tab.id, MODE_BACKGROUND_SERVICE);
+    return { action, service, observing: true, mode, eventCount: st.events.filter((e) => e.service === service).length };
+  }
+  if (action === "stop") {
+    await cdp(tab.id, "BackgroundService.stopObserving", { service }).catch(() => undefined);
+    st.observing.delete(service);
+    st.recording.delete(service);
+    if (!st.observing.size) {
+      backgroundServicePerTab.delete(tab.id);
+      unregisterMode(tab.id, MODE_BACKGROUND_SERVICE);
+    }
+    return { action, service, observing: false };
+  }
+  if (action === "events") {
+    const limit = Math.min(Math.max(Number(params.limit) || BACKGROUND_SERVICE_RING_MAX, 1), BACKGROUND_SERVICE_RING_MAX);
+    const ring = st.events.filter((e) => e.service === service).slice(-BACKGROUND_SERVICE_RING_MAX);
+    // BackgroundService.getEvents returns the browser-persisted events for the service; merge
+    // with the live ring (deduped by instanceId) so a restart never empties the observation.
+    let protocol = [];
+    try {
+      const res = await cdp(tab.id, "BackgroundService.getEvents", { service }).catch(() => null);
+      if (res && Array.isArray(res.events)) {
+        protocol = res.events.map((e) => ({
+          timestamp: normalizeCdpTimestamp(Number(e?.timestamp)),
+          origin: String(e?.origin || ""),
+          service: String(e?.service || service),
+          eventName: String(e?.eventName || ""),
+          instanceId: String(e?.instanceId || "").slice(0, 120),
+          serviceWorkerRegistrationId: String(e?.serviceWorkerRegistrationId || "").slice(0, 120),
+          metadata: Array.isArray(e?.eventMetadata) ? e.eventMetadata.slice(0, 20).map((m) => ({ key: String(m?.key || ""), value: String(m?.value || "").slice(0, 500) })) : [],
+          source: "protocol",
+        }));
+      }
+    } catch {}
+    const seen = new Set(protocol.map((e) => e.instanceId || `${e.timestamp}-${e.eventName}`));
+    const merged = protocol.slice();
+    for (const r of ring) {
+      if (!seen.has(r.instanceId || `${r.timestamp}-${r.eventName}`)) merged.push({ ...r, source: "ring" });
+    }
+    merged.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    const events = merged.slice(-limit);
+    return { action, service, events, count: events.length, limit };
+  }
+  throw new Error(`Unknown background service action: ${action} (expected list|observe|stop|events)`);
+}
+
+// ---- storage watch (chrome_watch_storage) ----------------------------------------------
+function recordStorageWatchEvent(tabId, method, eventParams) {
+  const st = storageWatchPerTab.get(tabId);
+  if (!st) return;
+  const t = Date.now();
+  const origin = String(eventParams?.origin || st.origin || "");
+  if (method === "Storage.indexedDBListUpdated") {
+    ringPush(st.events, { t, origin, kind: "indexedDB", event: "listUpdated" }, STORAGE_WATCH_RING_MAX);
+  } else if (method === "Storage.indexedDBContentUpdated") {
+    ringPush(st.events, { t, origin, kind: "indexedDB", event: "contentUpdated", databaseName: String(eventParams?.databaseName || ""), objectStoreName: String(eventParams?.objectStoreName || "") }, STORAGE_WATCH_RING_MAX);
+  } else if (method === "Storage.cacheStorageListUpdated") {
+    ringPush(st.events, { t, origin, kind: "cacheStorage", event: "listUpdated" }, STORAGE_WATCH_RING_MAX);
+  } else if (method === "Storage.cacheStorageContentUpdated") {
+    ringPush(st.events, { t, origin, kind: "cacheStorage", event: "contentUpdated", cacheName: String(eventParams?.cacheName || "") }, STORAGE_WATCH_RING_MAX);
+  }
+}
+
+// Capture the current origin IDB database + cache names (before/after diff material).
+async function storageWatchSnapshot(tabId, origin) {
+  const databases = [];
+  const caches = [];
+  try {
+    const res = await cdp(tabId, "IndexedDB.requestDatabaseNames", { securityOrigin: origin }).catch(() => null);
+    if (res && Array.isArray(res.databaseNames)) databases.push(...res.databaseNames.map(String));
+  } catch {}
+  try {
+    const res = await cdp(tabId, "CacheStorage.requestCacheNames", { securityOrigin: origin }).catch(() => null);
+    if (res && Array.isArray(res.caches)) caches.push(...res.caches.map((c) => String(c.cacheName || c.securityOrigin || "")));
+  } catch {}
+  return { databases, caches };
+}
+
+// storage.watch — chrome_watch_storage.
+async function chromeWatchStorage(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  const action = String(params.action || "start");
+  const origin = params.origin ? String(params.origin) : null;
+  const trackKinds = Array.isArray(params.track) && params.track.length
+    ? params.track.map((k) => String(k)).filter((k) => k === "indexedDB" || k === "cacheStorage")
+    : ["indexedDB", "cacheStorage"];
+  if (action === "start") {
+    if (!origin) throw new Error("chrome_watch_storage start requires origin (e.g. https://example.com)");
+    const existing = storageWatchPerTab.get(tab.id);
+    if (existing && existing.tracking.size) return { watching: true, alreadyWatching: true, origin: existing.origin, tracking: Array.from(existing.tracking) };
+    const st = { tracking: new Set(), origin, events: [], before: null };
+    if (trackKinds.includes("indexedDB")) {
+      await cdp(tab.id, "Storage.trackIndexedDBForOrigin", { origin });
+      st.tracking.add("indexedDB");
+    }
+    if (trackKinds.includes("cacheStorage")) {
+      await cdp(tab.id, "Storage.trackCacheStorageForOrigin", { origin });
+      st.tracking.add("cacheStorage");
+    }
+    st.before = await storageWatchSnapshot(tab.id, origin).catch(() => null);
+    storageWatchPerTab.set(tab.id, st);
+    registerMode(tab.id, MODE_STORAGE_WATCH);
+    return { watching: true, origin, tracking: Array.from(st.tracking), before: st.before };
+  }
+  if (action === "stop") {
+    const st = storageWatchPerTab.get(tab.id);
+    if (!st) return { watching: false };
+    if (st.tracking.has("indexedDB")) await cdp(tab.id, "Storage.untrackIndexedDBForOrigin", { origin: st.origin }).catch(() => undefined);
+    if (st.tracking.has("cacheStorage")) await cdp(tab.id, "Storage.untrackCacheStorageForOrigin", { origin: st.origin }).catch(() => undefined);
+    storageWatchPerTab.delete(tab.id);
+    unregisterMode(tab.id, MODE_STORAGE_WATCH);
+    return { watching: false };
+  }
+  if (action === "events") {
+    const st = storageWatchPerTab.get(tab.id);
+    if (!st) throw new Error("No storage watch active on this tab — call chrome_watch_storage start first");
+    const after = await storageWatchSnapshot(tab.id, st.origin).catch(() => null);
+    const before = st.before || { databases: [], caches: [] };
+    const dbAdded = (after?.databases || []).filter((d) => !before.databases.includes(d));
+    const dbRemoved = before.databases.filter((d) => !(after?.databases || []).includes(d));
+    const cacheAdded = (after?.caches || []).filter((c) => !before.caches.includes(c));
+    const cacheRemoved = before.caches.filter((c) => !(after?.caches || []).includes(c));
+    return {
+      origin: st.origin,
+      tracking: Array.from(st.tracking),
+      events: st.events.slice(-STORAGE_WATCH_RING_MAX),
+      count: st.events.length,
+      diff: { databasesAdded: dbAdded, databasesRemoved: dbRemoved, cachesAdded: cacheAdded, cachesRemoved: cacheRemoved },
+    };
+  }
+  throw new Error(`Unknown storage watch action: ${action} (expected start|stop|events)`);
+}
+
+// ---- event breakpoints (chrome_event_breakpoint) --------------------------------------
+// debug.eventBreak: persistent set/remove/list (MODE_EVENT_BREAKPOINTS, pauses recorded + auto-
+// resumed by the Debugger.paused branch) or a one-shot capture (waiter + remove + resume rail).
+const EVENT_BREAK_ANY = "*";
+
+async function chromeEventBreakpoint(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  await enableCdpDomain(tab.id, "Debugger");
+  await enableCdpDomain(tab.id, "DOMDebugger");
+  const action = String(params.action || "set");
+  if (action === "list") {
+    const st = eventBreakPerTab.get(tab.id);
+    const names = st ? Array.from(st.breakpoints) : [];
+    return { action, eventNames: names, count: names.length, pauseCount: st ? st.pauses.length : 0 };
+  }
+  if (action === "set" || action === "remove") {
+    const names = Array.isArray(params.eventNames) ? params.eventNames.map((n) => String(n)) : (params.eventName ? [String(params.eventName)] : []);
+    if (!names.length) throw new Error(`chrome_event_breakpoint ${action} requires eventNames (e.g. ["click", "*"] for all)`);
+    let st = eventBreakPerTab.get(tab.id);
+    if (!st) { st = { breakpoints: new Set(), pauses: [] }; eventBreakPerTab.set(tab.id, st); }
+    if (action === "set") {
+      await cdp(tab.id, "DOMDebugger.setEventListenerBreakpoints", { eventListenerNames: names });
+      for (const name of names) st.breakpoints.add(name);
+    } else {
+      await cdp(tab.id, "DOMDebugger.removeEventListenerBreakpoints", { eventListenerNames: names }).catch(() => undefined);
+      for (const name of names) st.breakpoints.delete(name);
+    }
+    if (st.breakpoints.size) registerMode(tab.id, MODE_EVENT_BREAKPOINTS);
+    else { eventBreakPerTab.delete(tab.id); unregisterMode(tab.id, MODE_EVENT_BREAKPOINTS); }
+    return { action, eventNames: names, active: Array.from(st.breakpoints || []), count: (st.breakpoints || new Set()).size };
+  }
+  if (action === "capture") {
+    const names = Array.isArray(params.eventNames) ? params.eventNames.map((n) => String(n)) : [String(params.eventName || EVENT_BREAK_ANY)];
+    const waitMs = Math.min(Math.max(Number(params.timeoutMs) || 10_000, 100), EVENT_BREAK_MAX_WAIT_MS);
+    let waiterEntry = null;
+    const waiter = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (eventBreakWaiters.get(tab.id) === waiterEntry) eventBreakWaiters.delete(tab.id);
+        reject(new Error(`No event (${names.join(", ")}) fired within ${waitMs}ms — the temporary breakpoint was removed.`));
+      }, waitMs);
+      waiterEntry = { resolve, reject, timer, eventNames: names };
+      eventBreakWaiters.set(tab.id, waiterEntry);
+    });
+    try {
+      await cdp(tab.id, "DOMDebugger.setEventListenerBreakpoints", { eventListenerNames: names });
+      await waiter;
+      const paused = pausedTabs.get(tab.id);
+      const frames = paused ? paused.callFrames : [];
+      const stack = frames.map((f) => ({ functionName: f.functionName, url: f.url, lineNumber: f.lineNumber, columnNumber: f.columnNumber }));
+      if (pausedTabs.delete(tab.id)) unregisterMode(tab.id, MODE_PAUSED);
+      await cdp(tab.id, "Debugger.resume", {}).catch(() => undefined);
+      return { captured: true, eventNames: names, stack, frameCount: stack.length };
+    } finally {
+      eventBreakWaiters.delete(tab.id);
+      await cdp(tab.id, "DOMDebugger.removeEventListenerBreakpoints", { eventListenerNames: names }).catch(() => undefined);
+    }
+  }
+  throw new Error(`Unknown event breakpoint action: ${action} (expected set|remove|list|capture)`);
+}
+
+// ---- DOM breakpoints (chrome_dom_breakpoint) ------------------------------------------
+// debug.domBreak: DOMDebugger.setDOMBreakpoint {nodeId, type} on a resolved node; same rail
+// semantics as event breakpoints (persistent mode records + auto-resumes, capture waits once).
+const DOM_BREAK_TYPES = ["subtree-modified", "attribute-modified", "node-removed"];
+
+async function chromeDomBreakpoint(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  await enableCdpDomain(tab.id, "Debugger");
+  await enableCdpDomain(tab.id, "DOMDebugger");
+  const action = String(params.action || "set");
+  const types = Array.isArray(params.types)
+    ? params.types.map((t) => String(t)).filter((t) => DOM_BREAK_TYPES.includes(t))
+    : (params.type ? [String(params.type)].filter((t) => DOM_BREAK_TYPES.includes(t)) : []);
+  if (action === "list") {
+    const st = domBreakPerTab.get(tab.id);
+    return { action, types: st ? Array.from(st.types) : [], pauseCount: st ? st.pauses.length : 0 };
+  }
+  if (types.length === 0) throw new Error(`chrome_dom_breakpoint requires types from ${DOM_BREAK_TYPES.join(", ")}`);
+  if (action === "set" || action === "remove") {
+    const nodeParams = params.uid || params.selector ? { uid: params.uid ?? null, selector: params.selector ?? null } : null;
+    const resolved = nodeParams ? await resolveCdpNode(tab.id, nodeParams) : null;
+    let st = domBreakPerTab.get(tab.id);
+    if (!st) { st = { types: new Set(), node: nodeParams, pauses: [] }; domBreakPerTab.set(tab.id, st); }
+    try {
+      for (const type of types) {
+        if (action === "set") {
+          if (!resolved) throw new Error("chrome_dom_breakpoint set requires uid or selector");
+          await cdp(tab.id, "DOMDebugger.setDOMBreakpoint", { nodeId: resolved.nodeId, type });
+          st.types.add(type);
+        } else {
+          if (resolved) await cdp(tab.id, "DOMDebugger.removeDOMBreakpoint", { nodeId: resolved.nodeId, type }).catch(() => undefined);
+          st.types.delete(type);
+        }
+      }
+      if (st.types.size) registerMode(tab.id, MODE_DOM_BREAKPOINTS);
+      else { domBreakPerTab.delete(tab.id); unregisterMode(tab.id, MODE_DOM_BREAKPOINTS); }
+      return { action, types, active: Array.from(st.types || []), node: nodeParams };
+    } finally {
+      if (resolved) await cdp(tab.id, "Runtime.releaseObject", { objectId: resolved.objectId }).catch(() => undefined);
+    }
+  }
+  if (action === "capture") {
+    const nodeParams = params.uid || params.selector ? { uid: params.uid ?? null, selector: params.selector ?? null } : null;
+    if (!nodeParams) throw new Error("chrome_dom_breakpoint capture requires uid or selector");
+    const type = types[0];
+    const waitMs = Math.min(Math.max(Number(params.timeoutMs) || 10_000, 100), EVENT_BREAK_MAX_WAIT_MS);
+    const resolved = await resolveCdpNode(tab.id, nodeParams);
+    let waiterEntry = null;
+    const waiter = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (domBreakWaiters.get(tab.id) === waiterEntry) domBreakWaiters.delete(tab.id);
+        reject(new Error(`No DOM ${type} mutation within ${waitMs}ms — the temporary breakpoint was removed.`));
+      }, waitMs);
+      waiterEntry = { resolve, reject, timer, type };
+      domBreakWaiters.set(tab.id, waiterEntry);
+    });
+    try {
+      await cdp(tab.id, "DOMDebugger.setDOMBreakpoint", { nodeId: resolved.nodeId, type });
+      await waiter;
+      const paused = pausedTabs.get(tab.id);
+      const frames = paused ? paused.callFrames : [];
+      const stack = frames.map((f) => ({ functionName: f.functionName, url: f.url, lineNumber: f.lineNumber, columnNumber: f.columnNumber }));
+      if (pausedTabs.delete(tab.id)) unregisterMode(tab.id, MODE_PAUSED);
+      await cdp(tab.id, "Debugger.resume", {}).catch(() => undefined);
+      return { captured: true, type, stack, frameCount: stack.length };
+    } finally {
+      domBreakWaiters.delete(tab.id);
+      await cdp(tab.id, "Runtime.releaseObject", { objectId: resolved.objectId }).catch(() => undefined);
+      await cdp(tab.id, "DOMDebugger.removeDOMBreakpoint", { nodeId: resolved.nodeId, type }).catch(() => undefined);
+    }
+  }
+  throw new Error(`Unknown DOM breakpoint action: ${action} (expected set|remove|list|capture)`);
+}
+
+// ---- IME composition (chrome_ime_compose) ----------------------------------------------
+// page.ime — Input.imeSetComposition / Input.imeCommitComposition (CJK/predictive entry).
+async function chromeImeCompose(params) {
+  const tab = await getTabByParams(params);
+  const pauseNote = await ensurePageUsable(tab.id, "ime composition");
+  await attachDebugger(tab.id);
+  const action = String(params.action || "compose");
+  if (action === "compose" || action === "set") {
+    const text = params.text !== undefined ? String(params.text) : "";
+    const selectionStart = typeof params.selectionStart === "number" ? params.selectionStart : text.length;
+    const selectionEnd = typeof params.selectionEnd === "number" ? params.selectionEnd : selectionStart;
+    const payload = { text, selectionStart, selectionEnd };
+    if (typeof params.replacementStart === "number") payload.replacementStart = params.replacementStart;
+    if (typeof params.replacementEnd === "number") payload.replacementEnd = params.replacementEnd;
+    await cdp(tab.id, "Input.imeSetComposition", payload);
+    const result = { composed: true, text, selectionStart, selectionEnd, committed: false };
+    if (pauseNote) result.pausedAutoResumed = pauseNote;
+    return result;
+  }
+  if (action === "commit") {
+    const payload = {};
+    if (params.text !== undefined) payload.text = String(params.text);
+    await cdp(tab.id, "Input.imeCommitComposition", payload);
+    const result = { composed: false, committed: true, text: params.text !== undefined ? String(params.text) : null };
+    if (pauseNote) result.pausedAutoResumed = pauseNote;
+    return result;
+  }
+  throw new Error(`Unknown ime action: ${action} (expected compose|commit)`);
+}
+
+// ---- virtual time (chrome_virtual_time) ------------------------------------------------
+// page.virtualTime — Emulation.setVirtualTimePolicy with budgetExpired handling. NEVER combined
+// with printToPDF (chromePdf guards against an active MODE_VIRTUAL_TIME).
+async function chromeVirtualTime(params) {
+  const action = String(params.action || "start");
+  const tabId = Number(params?.targetId);
+  const hasTab = Number.isInteger(tabId) && tabId > 0;
+  if (action === "status") {
+    const tab = await getTabByParams(params);
+    const vt = virtualTimePerTab.get(tab.id);
+    return vt ? { active: true, ...vt } : { active: false };
+  }
+  if (action === "reset" || action === "pause") {
+    const tab = await getTabByParams(params);
+    await attachDebugger(tab.id);
+    const policy = action === "pause" ? "pause" : "advance";
+    const res = await cdp(tab.id, "Emulation.setVirtualTimePolicy", { policy, maxVirtualTimeTaskStarvationCount: 1000 }).catch(() => null);
+    const vt = virtualTimePerTab.get(tab.id) || { policy, budgetMs: null, budgetExpired: false };
+    vt.policy = policy;
+    if (action === "reset") {
+      vt.budgetMs = null;
+      vt.budgetExpired = false;
+      virtualTimePerTab.delete(tab.id);
+      unregisterMode(tab.id, MODE_VIRTUAL_TIME);
+    } else {
+      virtualTimePerTab.set(tab.id, vt);
+      registerMode(tab.id, MODE_VIRTUAL_TIME);
+    }
+    return { action, policy, virtualTimeTicksBase: res?.virtualTimeTicksBase ?? null, active: virtualTimePerTab.has(tab.id) };
+  }
+  if (action === "start" || action === "advance") {
+    const budgetMs = Math.min(Math.max(Number(params.budgetMs) || 0, 0), VIRTUAL_TIME_MAX_BUDGET_MS);
+    const policy = params.waitForNavigation === true ? "pauseIfNetworkFetchesPending" : "advance";
+    const setParams = { policy, maxVirtualTimeTaskStarvationCount: 1000 };
+    if (budgetMs > 0) setParams.budget = budgetMs;
+    if (params.initialVirtualTime) setParams.initialVirtualTime = Number(params.initialVirtualTime);
+    // Issue setVirtualTimePolicy and arm the budget-expired waiter IN THE DISPATCH TICK so the
+    // deterministic CDP event drives the advance; a cold tab (not yet attached) fails fast with
+    // "Debugger is not attached" and the call is re-issued after attach below.
+    let pending = hasTab ? cdpSend(tabId, "Emulation.setVirtualTimePolicy", setParams, VIRTUAL_TIME_BUDGET_WAIT_MS) : null;
+    let budgetWaiterEntry = null;
+    let budgetWaiter = null;
+    if (budgetMs > 0 && hasTab) {
+      budgetWaiter = new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          if (virtualTimeWaiters.get(tabId) === budgetWaiterEntry) virtualTimeWaiters.delete(tabId);
+          resolve({ expired: false });
+        }, VIRTUAL_TIME_BUDGET_WAIT_MS);
+        budgetWaiterEntry = { resolve: (ev) => resolve(ev || { expired: true }), timer };
+        virtualTimeWaiters.set(tabId, budgetWaiterEntry);
+      });
+    }
+    const tab = await getTabByParams(params);
+    await attachDebugger(tab.id);
+    let res = null;
+    if (pending) {
+      try {
+        res = await pending;
+      } catch (error) {
+        if (!/not attached/i.test(String(error?.message || error))) throw error;
+        res = await cdp(tab.id, "Emulation.setVirtualTimePolicy", setParams);
+      }
+    } else {
+      res = await cdp(tab.id, "Emulation.setVirtualTimePolicy", setParams);
+    }
+    const vt = {
+      policy, budgetMs: budgetMs > 0 ? budgetMs : null, budgetExpired: false,
+      virtualTimeTicksBase: res?.virtualTimeTicksBase ?? null,
+    };
+    virtualTimePerTab.set(tab.id, vt);
+    registerMode(tab.id, MODE_VIRTUAL_TIME);
+    let budgetExpired = false;
+    let advancedMs = null;
+    if (budgetMs > 0) {
+      const ev = budgetWaiter ? await budgetWaiter : { expired: false };
+      const waiter = virtualTimeWaiters.get(tab.id);
+      if (waiter) { virtualTimeWaiters.delete(tab.id); clearTimeout(waiter.timer); }
+      budgetExpired = ev.expired === true;
+      if (typeof ev.elapsedVirtualTime === "number") advancedMs = ev.elapsedVirtualTime;
+      else if (typeof ev.advancedMs === "number") advancedMs = ev.advancedMs;
+      if (virtualTimePerTab.get(tab.id)) virtualTimePerTab.get(tab.id).budgetExpired = budgetExpired;
+    }
+    return { action, policy, budgetMs: budgetMs > 0 ? budgetMs : null, budgetExpired, advancedMs, virtualTimeTicksBase: vt.virtualTimeTicksBase };
+  }
+  throw new Error(`Unknown virtual time action: ${action} (expected start|advance|pause|reset|status)`);
+}
+
+// ---- device matrix (chrome_device_matrix) ----------------------------------------------
+// page.deviceMatrix — compose emulation + screenshot + perfMetrics per profile (bounded sweep).
+const DEVICE_MATRIX_DEFAULT_PROFILES = [
+  { name: "desktop-1280x800", width: 1280, height: 800, deviceScaleFactor: 1, mobile: false },
+  { name: "mobile-390x844", width: 390, height: 844, deviceScaleFactor: 3, mobile: true },
+];
+
+function normalizeDeviceMatrixProfiles(profiles) {
+  if (!Array.isArray(profiles) || !profiles.length) return DEVICE_MATRIX_DEFAULT_PROFILES.slice();
+  return profiles.slice(0, DEVICE_MATRIX_MAX_PROFILES).map((p) => {
+    const rec = {
+      name: p && p.name ? String(p.name).replace(/[^\w-]+/g, "-") : `profile-${Math.floor(Math.random() * 1e6)}`,
+      width: Math.max(Number(p?.width) || 1280, 200),
+      height: Math.max(Number(p?.height) || 800, 200),
+      deviceScaleFactor: Math.max(Number(p?.deviceScaleFactor) || 1, 0.25),
+      mobile: p?.mobile === true,
+    };
+    if (p?.ua) rec.ua = String(p.ua);
+    if (p?.platform) rec.platform = String(p.platform);
+    return rec;
+  });
+}
+
+async function chromeDeviceMatrix(params) {
+  const tab = await getTabByParams(params);
+  const pauseNote = await ensurePageUsable(tab.id, "device matrix");
+  await attachDebugger(tab.id);
+  const profiles = normalizeDeviceMatrixProfiles(params.profiles);
+  const format = String(params.format || "jpeg");
+  const quality = typeof params.quality === "number" ? params.quality : 60;
+  const results = [];
+  for (const profile of profiles) {
+    const metricsOverride = {
+      width: profile.width, height: profile.height, deviceScaleFactor: profile.deviceScaleFactor, mobile: profile.mobile,
+    };
+    try {
+      await cdp(tab.id, "Emulation.setDeviceMetricsOverride", metricsOverride);
+      if (profile.ua) await cdp(tab.id, "Emulation.setUserAgentOverride", { userAgent: profile.ua, platform: profile.platform || undefined }).catch(() => undefined);
+      await sleep(120);
+      const shot = await cdp(tab.id, "Page.captureScreenshot", { format: format === "png" ? "png" : "jpeg", quality: format === "png" ? undefined : quality, fromSurface: true });
+      await enableCdpDomain(tab.id, "Performance").catch(() => undefined);
+      const perf = await cdp(tab.id, "Performance.getMetrics").catch(() => null);
+      const metrics = Array.isArray(perf?.metrics) ? perf.metrics.map((m) => ({ name: m.name, value: m.value })) : [];
+      results.push({ name: profile.name, emulation: metricsOverride, screenshot: typeof shot?.data === "string" ? shot.data : null, perfMetrics: metrics });
+    } catch (error) {
+      results.push({ name: profile.name, emulation: metricsOverride, error: String(error?.message || error).slice(0, 300) });
+    } finally {
+      await cdp(tab.id, "Emulation.clearDeviceMetricsOverride", {}).catch(() => undefined);
+      await cdp(tab.id, "Emulation.setUserAgentOverride", { userAgent: navigator.userAgent }).catch(() => undefined);
+    }
+  }
+  const result = { profiles: results, count: results.length, format, capped: profiles.length >= DEVICE_MATRIX_MAX_PROFILES };
+  if (pauseNote) result.pausedAutoResumed = pauseNote;
+  return result;
+}
+
+// ---- MHTML snapshot (chrome_snapshot_mhtml) --------------------------------------------
+// page.mhtml — Page.captureSnapshot {format:"mhtml"} (base64 to host file writer).
+async function chromeSnapshotMhtml(params) {
+  const tabId = Number(params?.targetId);
+  const hasTab = Number.isInteger(tabId) && tabId > 0;
+  // Issue Page.captureSnapshot in the dispatch tick (the base64 payload arrives in the command
+  // callback; an already-attached tab resolves it directly). A cold tab (not yet attached) fails
+  // fast with "Debugger is not attached" and the call is re-issued after attach below.
+  const pending = hasTab ? cdpSend(tabId, "Page.captureSnapshot", { format: "mhtml" }, PRINT_TO_PDF_TIMEOUT_MS) : null;
+  const tab = await getTabByParams(params);
+  const pauseNote = await ensurePageUsable(tab.id, "mhtml export");
+  await attachDebugger(tab.id);
+  let res = null;
+  if (pending) {
+    try {
+      res = await pending;
+    } catch (error) {
+      if (!/not attached/i.test(String(error?.message || error))) throw error;
+      res = await cdpSend(tab.id, "Page.captureSnapshot", { format: "mhtml" }, PRINT_TO_PDF_TIMEOUT_MS);
+    }
+  } else {
+    res = await cdpSend(tab.id, "Page.captureSnapshot", { format: "mhtml" }, PRINT_TO_PDF_TIMEOUT_MS);
+  }
+  if (!res || typeof res.data !== "string") {
+    const reason = res && res.__error ? res.__error : "Page.captureSnapshot returned no data";
+    return { supported: false, reason: reason.slice(0, 400), hint: "MHTML export may require headless Chrome on some builds." };
+  }
+  const base64 = res.data;
+  const result = {
+    supported: true,
+    base64Length: base64.length,
+    tooLarge: base64.length > MHTML_MAX_BASE64_CHARS,
+    truncated: false,
+  };
+  if (result.tooLarge) {
+    result.hint = "MHTML exceeds the bridge result cap — the page is too large for a single-file archive.";
+  } else {
+    result.data = base64;
+  }
+  if (pauseNote) result.pausedAutoResumed = pauseNote;
+  return result;
+}
+
+// ---- TLS certificate (chrome_network_tls) ----------------------------------------------
+// network.certificate — best-effort X.509 surface: Network.getCertificate tableNames + the
+// securityDetails captured on network entries (subject/issuer/validity/SANs) when capture was on.
+function pickTlsEntry(stored, params) {
+  if (!stored) return null;
+  if (params.requestId && stored.has(String(params.requestId))) return stored.get(String(params.requestId));
+  if (params.urlIncludes) {
+    const needle = String(params.urlIncludes);
+    const matches = Array.from(stored.values()).filter((e) => String(e.url || "").includes(needle));
+    return matches.length ? matches[matches.length - 1] : null;
+  }
+  return null;
+}
+
+async function chromeNetworkTls(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  const origin = params.origin ? String(params.origin) : null;
+  const result = { bestEffort: true };
+  if (origin) {
+    result.origin = origin;
+    const res = await cdp(tab.id, "Network.getCertificate", { origin }).catch((error) => ({ __error: String(error?.message || error) }));
+    if (res && !res.__error && Array.isArray(res.tableNames)) {
+      const limit = Math.min(Math.max(Number(params.limit) || NETWORK_CERT_TABLE_NAMES_MAX, 1), NETWORK_CERT_TABLE_NAMES_MAX);
+      result.tableNames = res.tableNames.slice(0, limit);
+      result.tableNamesCapped = res.tableNames.length > limit;
+    } else if (res && res.__error) {
+      result.degraded = true;
+      result.error = res.__error.slice(0, 300);
+    }
+  }
+  if (params.requestId || params.urlIncludes) {
+    const stored = cdpNetworkEntries.get(tab.id);
+    const entry = pickTlsEntry(stored, params);
+    if (entry && entry.securityDetails) {
+      result.securityDetails = {
+        protocol: entry.securityDetails.protocol || null,
+        subjectName: entry.securityDetails.subjectName || null,
+        issuer: entry.securityDetails.issuer || null,
+        validFrom: entry.securityDetails.validFrom ?? null,
+        validTo: entry.securityDetails.validTo ?? null,
+        sanList: Array.isArray(entry.securityDetails.sanList) ? entry.securityDetails.sanList.slice(0, 20) : [],
+        certificateId: entry.securityDetails.certificateId ?? null,
+        cipher: entry.securityDetails.cipher || null,
+        keyExchange: entry.securityDetails.keyExchange || null,
+      };
+      result.requestId = entry.requestId;
+      result.url = String(entry.url || "").slice(0, 300);
+      result.securityDetailsAvailable = true;
+    } else {
+      result.securityDetailsAvailable = false;
+      result.securityDetailsError = "No TLS securityDetails captured — enable chrome_network_capture and reload while the request is made.";
+    }
+  }
+  if (result.tableNames === undefined && result.securityDetails === undefined) {
+    throw new Error("chrome_network_tls requires origin (Network.getCertificate) or a captured request (requestId/urlIncludes with chrome_network_capture on)");
+  }
+  return result;
+}
+
+// ---- DOM snapshot (chrome_dom_snapshot) ------------------------------------------------
+// dom.snapshot — DOMSnapshot.captureSnapshot, written to a file by the host. The full snapshot
+// JSON is inlined only while under the bridge cap; beyond that a structural summary is returned.
+async function chromeDomSnapshot(params) {
+  const tab = await getTabByParams(params);
+  const pauseNote = await ensurePageUsable(tab.id, "dom snapshot");
+  await attachDebugger(tab.id);
+  await enableCdpDomain(tab.id, "DOMSnapshot").catch(() => undefined);
+  const computedStyles = Array.isArray(params.computedStyles)
+    ? params.computedStyles.map((s) => String(s)).slice(0, 50)
+    : ["color", "font-size", "font-family", "display", "position", "width", "height", "background-color"];
+  const res = await cdpSend(tab.id, "DOMSnapshot.captureSnapshot", { computedStyles, includePaintOrder: true, includeDOMRects: true }, 60_000);
+  const snap = res || {};
+  const documents = Array.isArray(snap.documents) ? snap.documents : [];
+  const strings = Array.isArray(snap.strings) ? snap.strings : [];
+  const docSummaries = documents.slice(0, 20).map((d) => {
+    const nodes = d && d.nodes ? d.nodes : {};
+    const layout = d && d.layout ? d.layout : {};
+    return {
+      documentURL: typeof d.documentURL === "number" ? (strings[d.documentURL] || "") : "",
+      title: typeof d.title === "number" ? (strings[d.title] || "") : "",
+      frameId: d.frameId ? String(d.frameId) : null,
+      nodeCount: Array.isArray(nodes.nodeType) ? nodes.nodeType.length : 0,
+      layoutCount: Array.isArray(layout.nodeIndex) ? layout.nodeIndex.length : 0,
+      textBoxCount: Array.isArray(d.textBoxes && d.textBoxes.start) ? d.textBoxes.start.length : 0,
+    };
+  });
+  const totalNodes = docSummaries.reduce((a, d) => a + d.nodeCount, 0);
+  let bytes = 0;
+  try { bytes = JSON.stringify(snap).length; } catch { bytes = -1; }
+  const summary = { documentCount: documents.length, totalNodes, stringPool: strings.length, documents: docSummaries, bytes };
+  const result = { summary, truncated: false };
+  if (bytes > 0 && bytes <= DOM_SNAPSHOT_MAX_INLINE_BYTES) {
+    result.snapshot = snap;
+  } else {
+    result.summaryOnly = true;
+    result.snapshotTooLarge = bytes;
+    result.hint = "DOM snapshot exceeds the bridge result cap — use chrome_snapshot or chrome_a11y_tree for a smaller capture.";
+  }
+  if (pauseNote) result.pausedAutoResumed = pauseNote;
+  return result;
+}
+
+// ---- CSS audit (chrome_css_audit) -------------------------------------------------------
+// css.audit — client-side aggregation over layout/computed-style primitives (in-page scan,
+// bounded element + comparison budgets; zero new CDP domains).
+async function chromeCssAudit(params) {
+  const tab = await getTabByParams(params);
+  const pauseNote = await ensurePageUsable(tab.id, "css audit");
+  await attachDebugger(tab.id);
+  const maxElements = Math.min(Math.max(Number(params.maxElements) || CSS_AUDIT_MAX_ELEMENTS, 1), CSS_AUDIT_MAX_ELEMENTS);
+  const expr = `(() => {
+    const MAX_EL = ${maxElements};
+    const MAX_COMPARE = ${CSS_AUDIT_MAX_COMPARISONS};
+    const MAX_CONTRAST = ${CSS_AUDIT_MAX_CONTRAST};
+    const issues = [];
+    const counts = { overlap: 0, zeroSize: 0, truncated: 0, lowContrast: 0, hidden: 0, scanned: 0 };
+    const idHint = (el) => { const p = [el.tagName.toLowerCase()]; if (el.id) p.push('#' + el.id); if (typeof el.className === 'string') { const c = el.className.split(/\\s+/).filter(Boolean).slice(0, 2); if (c.length) p.push('.' + c.join('.')); } return p.join(''); };
+    const all = Array.from(document.querySelectorAll('body *')).filter((el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    }).slice(0, MAX_EL);
+    counts.scanned = all.length;
+    let zeroScanned = 0;
+    for (const el of document.querySelectorAll('div,span,button,a,img,input,select,textarea,ul,li,table')) {
+      if (zeroScanned >= MAX_EL) break;
+      const r = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      if (r.width === 0 && r.height === 0 && cs.display !== 'none' && cs.visibility !== 'hidden') {
+        counts.zeroSize++; issues.push({ kind: 'zero-size', hint: idHint(el), detail: '0x0 rect but not display:none' }); zeroScanned++;
+      }
+    }
+    const rects = all.map((el) => { const r = el.getBoundingClientRect(); return { el, r }; });
+    let comparisons = 0;
+    outer: for (let i = 0; i < rects.length; i++) {
+      for (let j = i + 1; j < rects.length; j++) {
+        if (comparisons++ >= MAX_COMPARE) break outer;
+        const a = rects[i], b = rects[j];
+        const r1 = a.r, r2 = b.r;
+        const overlapW = Math.max(0, Math.min(r1.right, r2.right) - Math.max(r1.left, r2.left));
+        const overlapH = Math.max(0, Math.min(r1.bottom, r2.bottom) - Math.max(r1.top, r2.top));
+        const overlapArea = overlapW * overlapH;
+        const minArea = Math.min(r1.width * r1.height, r2.width * r2.height);
+        if (minArea > 0 && overlapArea / minArea > 0.7) {
+          const zi = Number(getComputedStyle(a.el).zIndex) || 0;
+          const zj = Number(getComputedStyle(b.el).zIndex) || 0;
+          if (zi > zj) {
+            counts.overlap++;
+            issues.push({ kind: 'overlap', hint: idHint(b.el) + ' covered by ' + idHint(a.el), detail: 'zIndex ' + zi + ' vs ' + zj + ' covers ~' + Math.round((overlapArea / minArea) * 100) + '%' });
+          }
+        }
+      }
+    }
+    let truncScanned = 0;
+    for (const el of all) {
+      if (truncScanned >= MAX_EL) break;
+      const cs = getComputedStyle(el);
+      if (cs.overflowX === 'hidden' && el.scrollWidth > el.clientWidth + 1 && el.textContent && el.textContent.trim()) {
+        counts.truncated++;
+        issues.push({ kind: 'truncated', hint: idHint(el), detail: 'scrollWidth ' + el.scrollWidth + ' > clientWidth ' + el.clientWidth });
+        truncScanned++;
+      }
+    }
+    const lum = (c) => { const p = c.match(/[\\d.]+/g); if (!p || p.length < 3) return 0; const v = p.slice(0, 3).map((x) => { const n = Number(x) / 255; return n <= 0.03928 ? n / 12.92 : Math.pow((n + 0.055) / 1.055, 2.4); }); return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]; };
+    let contrastScanned = 0;
+    for (const el of all) {
+      if (contrastScanned >= MAX_CONTRAST) break;
+      if (!el.textContent || !el.textContent.trim() || el.children.length > 2) continue;
+      const cs = getComputedStyle(el);
+      const fg = cs.color;
+      let bg = cs.backgroundColor;
+      let walker = el;
+      let depth = 0;
+      while ((bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent') && walker.parentElement && depth < 8) {
+        walker = walker.parentElement; bg = getComputedStyle(walker).backgroundColor; depth++;
+      }
+      if (bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent') bg = 'rgb(255, 255, 255)';
+      const L1 = lum(fg), L2 = lum(bg);
+      const ratio = (Math.max(L1, L2) + 0.05) / (Math.min(L1, L2) + 0.05);
+      const fontSize = parseFloat(cs.fontSize) || 16;
+      const weight = Number(cs.fontWeight) || 400;
+      const large = fontSize >= 18 || (fontSize >= 14 && weight >= 600);
+      const need = large ? 3 : 4.5;
+      if (ratio < need) {
+        counts.lowContrast++;
+        issues.push({ kind: 'low-contrast', hint: idHint(el), detail: 'contrast ' + ratio.toFixed(2) + ' < ' + need + ' (' + fg + ' on ' + bg + ')' });
+        contrastScanned++;
+      }
+    }
+    counts.hidden = all.filter((el) => getComputedStyle(el).visibility === 'hidden').length;
+    return { issues: issues.slice(0, ${CSS_AUDIT_MAX_ELEMENTS}), counts, capped: issues.length >= ${CSS_AUDIT_MAX_ELEMENTS} };
+  })()`;
+  const res = await cdpEval(tab.id, expr);
+  if (res.exceptionDetails) throw new Error(`chrome_css_audit failed: ${cdpExceptionText(res.exceptionDetails) || "evaluation failed"}`);
+  const v = res && res.result ? res.result.value : null;
+  const result = v || { issues: [], counts: {}, capped: false };
+  if (pauseNote) result.pausedAutoResumed = pauseNote;
+  return result;
+}
+
+// ---- A11y audit (chrome_a11y_audit) ------------------------------------------------------
+// a11y.audit — Lighthouse-lite report: engine AX-tree structural violations (missing names /
+// alts / input labels) + bounded low-contrast checks (CSS.getBackgroundColors + computed text
+// color via DOM.resolveNode). Capped violations list.
+function colorLuminance(rgbString) {
+  const m = String(rgbString).match(/[\\d.]+/g);
+  if (!m || m.length < 3) return null;
+  const v = m.slice(0, 3).map((x) => {
+    const n = Number(x) / 255;
+    return n <= 0.03928 ? n / 12.92 : Math.pow((n + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+}
+
+function contrastRatioOf(fgRgb, bgRgb) {
+  const L1 = colorLuminance(fgRgb);
+  const L2 = colorLuminance(bgRgb);
+  if (L1 === null || L2 === null) return null;
+  return (Math.max(L1, L2) + 0.05) / (Math.min(L1, L2) + 0.05);
+}
+
+async function chromeA11yAudit(params) {
+  const tab = await getTabByParams(params);
+  const pauseNote = await ensurePageUsable(tab.id, "a11y audit");
+  await attachDebugger(tab.id);
+  await enableCdpDomain(tab.id, "Accessibility");
+  await enableCdpDomain(tab.id, "DOM").catch(() => undefined);
+  await enableCdpDomain(tab.id, "CSS").catch(() => undefined);
+  const depth = Math.min(Math.max(Number(params.depth) || 0, 0), AX_TREE_DEPTH_MAX);
+  const res = await cdp(tab.id, "Accessibility.getFullAXTree", depth > 0 ? { depth } : {}).catch(() => null);
+  const rawNodes = Array.isArray(res?.nodes) ? res.nodes.slice(0, AX_TREE_MAX_NODES) : [];
+  const nodes = rawNodes.map((n) => normalizeAxNode(n, depth));
+  const summary = buildAxTreeSummary(nodes, AX_SUMMARY_ROLES_MAX);
+  const violations = [];
+  const counts = { missingName: 0, missingAlt: 0, unlabeledInput: 0, emptyLink: 0, lowContrast: 0 };
+  const byBackend = new Map();
+  const prop = (n, name) => { const p = Array.isArray(n.properties) ? n.properties.find((x) => x.name === name) : null; return p ? p.value : null; };
+  for (const n of nodes) {
+    if (n.ignored) continue;
+    const role = String(n.role || "");
+    const name = String(n.name || "");
+    const backendNodeId = n.backendDOMNodeId;
+    if (backendNodeId) byBackend.set(backendNodeId, n);
+    if ((role === "button" || role === "link" || role === "checkbox" || role === "radio") && !name) {
+      counts.missingName++;
+      violations.push({ role, name: "", issue: "missing-accessible-name", backendNodeId, reason: `${role} without an accessible name` });
+    }
+    if (role === "link" && !name) {
+      counts.emptyLink++;
+      violations.push({ role, name: "", issue: "empty-link", backendNodeId, reason: "link with no text or aria-label" });
+    }
+    if ((role === "image" || role === "img") && !name) {
+      counts.missingAlt++;
+      violations.push({ role, name: "", issue: "image-without-alt", backendNodeId, reason: "image has no accessible name (alt text)" });
+    }
+    if (role === "textbox" || role === "combobox") {
+      const label = prop(n, "name") || name;
+      if (!label) {
+        counts.unlabeledInput++;
+        violations.push({ role, name: "", issue: "unlabeled-input", backendNodeId, reason: "form control without an accessible label" });
+      }
+    }
+  }
+  // Bounded low-contrast check over name-bearing text/button/link nodes.
+  const contrastLimit = Math.min(Math.max(Number(params.contrastLimit) || 30, 0), A11Y_AUDIT_MAX_CONTRAST);
+  let contrastChecked = 0;
+  for (const [backendNodeId, n] of byBackend) {
+    if (contrastChecked >= contrastLimit) break;
+    const role = String(n.role || "");
+    if (!["staticText", "text", "link", "button"].includes(role) || !n.name) continue;
+    contrastChecked++;
+    try {
+      const described = await cdp(tab.id, "DOM.describeNode", { backendNodeId }).catch(() => null);
+      const nodeId = described && described.node ? described.node.nodeId : null;
+      if (typeof nodeId !== "number") continue;
+      const colors = await cdp(tab.id, "CSS.getBackgroundColors", { nodeId }).catch(() => null);
+      const bgStack = Array.isArray(colors?.backgroundColors) ? colors.backgroundColors : [];
+      const bg = bgStack.length ? bgStack[bgStack.length - 1] : null;
+      let fg = null;
+      const resolved = await cdp(tab.id, "DOM.resolveNode", { backendNodeId }).catch(() => null);
+      const objectId = resolved && resolved.object ? resolved.object.objectId : null;
+      if (objectId) {
+        const fgRes = await cdp(tab.id, "Runtime.callFunctionOn", {
+          objectId, functionDeclaration: "function(){ try { return getComputedStyle(this).color; } catch (e) { return null; } }", returnByValue: true,
+        }).catch(() => null);
+        fg = fgRes && fgRes.result && typeof fgRes.result.value === "string" ? fgRes.result.value : null;
+        await cdp(tab.id, "Runtime.releaseObject", { objectId }).catch(() => undefined);
+      }
+      if (fg && bg && (fg.includes("rgba") ? !fg.endsWith(", 0)") : true)) {
+        const ratio = contrastRatioOf(fg, bg);
+        if (ratio !== null && ratio < 4.5) {
+          counts.lowContrast++;
+          violations.push({ role, name: String(n.name).slice(0, 80), issue: "low-contrast", backendNodeId, reason: `text contrast ${ratio.toFixed(2)} < 4.5 (${fg} on ${bg})` });
+        }
+      }
+    } catch {}
+  }
+  const result = {
+    summary,
+    counts,
+    violations: violations.slice(0, A11Y_AUDIT_MAX_VIOLATIONS),
+    violationCount: violations.length,
+    capped: violations.length >= A11Y_AUDIT_MAX_VIOLATIONS,
   };
   if (pauseNote) result.pausedAutoResumed = pauseNote;
   return result;
@@ -6088,6 +7863,49 @@ async function dispatch(action, params) {
       return chromeCpuProfile({ ...params, action: "stop" });
     case "coverage.get":
       return chromeCoverage(params);
+    // ---- P2: audits / trace / heap / replay / storage / breakpoints / ime / virtual / visual ----
+    case "dom.snapshot":
+      return chromeDomSnapshot(params);
+    case "css.audit":
+      return chromeCssAudit(params);
+    case "a11y.audit":
+      return chromeA11yAudit(params);
+    case "tracing.start":
+      return chromeTrace({ ...params, action: "start" });
+    case "tracing.stop":
+      return chromeTrace({ ...params, action: "stop" });
+    case "tracing.getCategories":
+      return chromeTrace({ ...params, action: "getCategories" });
+    case "heap.snapshot":
+      return chromeHeapSnapshot(params);
+    case "heap.samplingStart":
+      return chromeAllocationProfile({ ...params, action: "samplingStart" });
+    case "heap.samplingStop":
+      return chromeAllocationProfile({ ...params, action: "samplingStop" });
+    case "heap.samplingProfile":
+      return chromeAllocationProfile({ ...params, action: "samplingProfile" });
+    case "session.record":
+      return chromeRecordSession({ ...params, action: "record" });
+    case "session.export":
+      return chromeRecordSession({ ...params, action: "export" });
+    case "background.service":
+      return chromeBackgroundService(params);
+    case "storage.watch":
+      return chromeWatchStorage(params);
+    case "debug.eventBreak":
+      return chromeEventBreakpoint(params);
+    case "debug.domBreak":
+      return chromeDomBreakpoint(params);
+    case "page.ime":
+      return chromeImeCompose(params);
+    case "page.virtualTime":
+      return chromeVirtualTime(params);
+    case "page.deviceMatrix":
+      return chromeDeviceMatrix(params);
+    case "page.mhtml":
+      return chromeSnapshotMhtml(params);
+    case "network.certificate":
+      return chromeNetworkTls(params);
     case "page.perfMetrics":
       return chromePerfMetrics(params);
     case "storage.op":

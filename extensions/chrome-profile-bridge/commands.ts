@@ -1430,3 +1430,198 @@ export function formatCoverage(result: Record<string, unknown>): string {
 	return truncateText(lines.join("\n"));
 }
 
+// =================== P2 formatters (TOOL_CONTRACTS §7 rows 60–75) ===================
+
+export function formatDomSnapshot(result: Record<string, unknown>): string {
+	if (result.snapshotTooLarge) return `DOM snapshot too large (${formatBytes(Number(result.snapshotTooLarge) || 0)}) — summary only. ${String(result.hint ?? "")}`;
+	const s = (result.summary ?? {}) as Record<string, unknown>;
+	return `DOM snapshot: ${Number(s.documentCount) || 0} document(s), ${Number(s.totalNodes) || 0} nodes, ${Number(s.stringPool) || 0} string-pool entries (${formatBytes(Number(s.bytes) || 0)}).`;
+}
+
+export function formatCssAudit(result: Record<string, unknown>): string {
+	const counts = (result.counts ?? {}) as Record<string, unknown>;
+	const issues = Array.isArray(result.issues) ? (result.issues as Array<Record<string, unknown>>) : [];
+	const lines = [
+		`CSS audit (${Number(counts.scanned) || 0} elements scanned, ${issues.length} issues${result.capped ? ", capped" : ""}):`,
+		`  overlap=${Number(counts.overlap) || 0} zero-size=${Number(counts.zeroSize) || 0} truncated=${Number(counts.truncated) || 0} low-contrast=${Number(counts.lowContrast) || 0} hidden=${Number(counts.hidden) || 0}`,
+	];
+	for (const i of issues.slice(0, 25)) {
+		lines.push(`  [${String(i.kind ?? "?")}] ${compactLine(String(i.hint ?? ""), 60)} — ${compactLine(String(i.detail ?? ""), 90)}`);
+	}
+	if (issues.length > 25) lines.push(`  … ${issues.length - 25} more`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatAccessibilityAudit(result: Record<string, unknown>): string {
+	const counts = (result.counts ?? {}) as Record<string, unknown>;
+	const violations = Array.isArray(result.violations) ? (result.violations as Array<Record<string, unknown>>) : [];
+	const summary = (result.summary ?? {}) as Record<string, unknown>;
+	const lines = [
+		`A11y audit (AX nodes ${Number(summary.total) || 0}, ignored ${Number(summary.ignored) || 0}; violations ${Number(result.violationCount) || 0}${result.capped ? ", capped" : ""}):`,
+		`  missing-name=${Number(counts.missingName) || 0} missing-alt=${Number(counts.missingAlt) || 0} unlabeled-input=${Number(counts.unlabeledInput) || 0} empty-link=${Number(counts.emptyLink) || 0} low-contrast=${Number(counts.lowContrast) || 0}`,
+	];
+	for (const v of violations.slice(0, 20)) {
+		lines.push(`  [${String(v.issue ?? "?")}] ${String(v.role ?? "")}${v.name ? ` "${compactLine(String(v.name), 40)}"` : ""} — ${compactLine(String(v.reason ?? ""), 80)}`);
+	}
+	if (violations.length > 20) lines.push(`  … ${violations.length - 20} more`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatTraceSummary(result: Record<string, unknown>): string {
+	if (result.recording) return `Trace recording started (${((result.categories ?? []) as unknown[]).length} categories). Call chrome_trace stop to export.`;
+	if (result.lost) return `Trace recording lost: ${String(result.error ?? "")}`;
+	const summary = (result.summary ?? {}) as Record<string, unknown>;
+	const top = Array.isArray(summary.topSelfTime) ? (summary.topSelfTime as Array<Record<string, unknown>>) : [];
+	const lines = [
+		`Trace (${Number(result.eventCount) || 0} events, ${formatBytes(Number(result.bytes) || 0)}${result.truncated ? ", truncated (recent tail kept)" : ""}${result.dataLoss ? ", dataLoss" : ""}):`,
+	];
+	if (top.length) {
+		lines.push("Top self-time events:");
+		for (const t of top.slice(0, 10)) {
+			lines.push(`  ${String(t.name ?? "?")} — ${(Number(t.selfUs) / 1000).toFixed(2)}ms ×${Number(t.count) || 0}`);
+		}
+	}
+	const ft = (summary.frameTotals ?? {}) as Record<string, unknown>;
+	const frameParts = Object.entries(ft).filter(([, v]) => Number(v) > 0).map(([k, v]) => `${k}=${(Number(v) / 1000).toFixed(1)}ms`);
+	if (frameParts.length) lines.push(`Frame work: ${frameParts.join(" ")}`);
+	if (Number(summary.longestTaskMs) > 0) lines.push(`Longest task: ${Number(summary.longestTaskMs)}ms (${Number((summary.longTasks as unknown[] | undefined)?.length || 0)} tasks >50ms)`);
+	lines.push(`  full trace: ${Number(result.bytes) || 0} bytes — written to file by the host.`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatHeapSummary(result: Record<string, unknown>): string {
+	if (result.snapshotTooLarge) return `Heap snapshot ${formatBytes(Number(result.snapshotTooLarge) || 0)} exceeds the bridge cap — summary only. ${String(result.hint ?? "")}`;
+	const s = (result.summary ?? {}) as Record<string, unknown>;
+	const top = Array.isArray(s.topSelfSize) ? (s.topSelfSize as Array<Record<string, unknown>>) : [];
+	const lines = [
+		`Heap snapshot (${Number(s.nodeCount) || 0} nodes, ${Number(s.edgeCount) || 0} edges, ${Number(s.chunkCount) || 0} chunks, ${formatBytes(Number(result.bytes) || 0)}${s.truncated ? ", truncated" : ""}):`,
+	];
+	for (const t of top.slice(0, 10)) {
+		lines.push(`  ${compactLine(String(t.name ?? ""), 70) || "(anonymous)"} [${String(t.type ?? "?")}] — ${formatBytes(Number(t.selfSize) || 0)} self`);
+	}
+	if (Number(s.selfSizeBytes) > 0) lines.push(`  total scanned self size: ${formatBytes(Number(s.selfSizeBytes))}`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatAllocationProfile(result: Record<string, unknown>): string {
+	if (result.lost) return `Allocation sampling lost: ${String(result.error ?? "")}`;
+	if (result.sampling) return `Heap allocation sampling started. Call chrome_allocation_profile samplingStop to collect.`;
+	const top = Array.isArray(result.topSelfSize) ? (result.topSelfSize as Array<Record<string, unknown>>) : [];
+	const lines = [`Allocation profile (${Number(result.sampleCount) || 0} samples, ${formatBytes(Number(result.totalSelfSize) || 0)} total self size, ${Number(result.nodeCount) || 0} nodes):`];
+	for (const t of top.slice(0, 10)) {
+		lines.push(`  ${compactLine(String(t.functionName ?? ""), 60) || "(anonymous)"} ${compactLine(String(t.url ?? ""), 60)}:${t.lineNumber ?? ""} — ${formatBytes(Number(t.selfSize) || 0)}`);
+	}
+	if (result.profileTooLarge) lines.push(`  (full profile ${formatBytes(Number(result.profileTooLarge) || 0)} too large to inline — summary only)`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatSessionExport(result: Record<string, unknown>): string {
+	if (result.recording && !result.eventCount) return `Session recording started (window ${Number(result.durationMs) || 0}ms). Call chrome_record_session export to collect the timeline.`;
+	return `Session recording: ${Number(result.eventCount) || 0} network/console events, ${Number(result.mutationCount) || 0} DOM mutations, ${Number(result.screenshotCount) || 0} screenshots over ${Math.round(Number(result.durationMs) || 0)}ms${result.truncated ? " (truncated)" : ""}.`;
+}
+
+export function formatBackgroundService(result: Record<string, unknown>): string {
+	const action = String(result.action ?? "");
+	if (action === "list") {
+		const services = Array.isArray(result.services) ? (result.services as string[]) : [];
+		return `Background services: ${services.join(", ")}`;
+	}
+	if (action === "events") {
+		const events = Array.isArray(result.events) ? (result.events as Array<Record<string, unknown>>) : [];
+		const lines = [`Background service ${String(result.service ?? "")}: ${events.length} event(s)`];
+		for (const e of events.slice(-10)) {
+			lines.push(`  ${new Date(Number(e.timestamp) || 0).toISOString()} [${String(e.eventName ?? "?")}] ${compactLine(String(e.origin ?? ""), 50)} ${e.instanceId ? `#${compactLine(String(e.instanceId), 24)}` : ""}`);
+		}
+		return truncateText(lines.join("\n"));
+	}
+	return `Background service ${String(result.service ?? "")}: ${result.observing ? "observing" : "stopped"} (${String(result.mode ?? "")}${result.mode ? " mode" : ""}).`;
+}
+
+export function formatStorageWatch(result: Record<string, unknown>): string {
+	if (result.events !== undefined && Array.isArray(result.events)) {
+		const diff = (result.diff ?? {}) as Record<string, unknown>;
+		const dbA = Array.isArray(diff.databasesAdded) ? (diff.databasesAdded as string[]) : [];
+		const dbR = Array.isArray(diff.databasesRemoved) ? (diff.databasesRemoved as string[]) : [];
+		const cA = Array.isArray(diff.cachesAdded) ? (diff.cachesAdded as string[]) : [];
+		const cR = Array.isArray(diff.cachesRemoved) ? (diff.cachesRemoved as string[]) : [];
+		const parts = [];
+		if (dbA.length) parts.push(`databases +${dbA.join(",")}`);
+		if (dbR.length) parts.push(`databases -${dbR.join(",")}`);
+		if (cA.length) parts.push(`caches +${cA.join(",")}`);
+		if (cR.length) parts.push(`caches -${cR.join(",")}`);
+		return `Storage watch ${String(result.origin ?? "")}: ${Number(result.count) || 0} change event(s)${parts.length ? ` — ${parts.join(", ")}` : ""}.`;
+	}
+	return `Storage watch ${result.watching ? "active" : "inactive"}${result.origin ? ` for ${String(result.origin)}` : ""} (tracking ${((result.tracking ?? []) as string[]).join("/")}).`;
+}
+
+export function formatEventBreakpoint(result: Record<string, unknown>): string {
+	if (result.captured) {
+		const frames = Array.isArray(result.stack) ? (result.stack as Array<Record<string, unknown>>) : [];
+		const lines = [`Captured event breakpoint stack (${result.eventNames ?? "*"}, ${frames.length} frames):`];
+		for (const f of frames.slice(0, 15)) {
+			lines.push(`  ${String(f.functionName ?? "(anonymous)")} ${compactLine(String(f.url ?? ""), 60)}:${f.lineNumber ?? ""}`);
+		}
+		return truncateText(lines.join("\n"));
+	}
+	return `Event breakpoints ${String(result.action ?? "")}: ${((result.active ?? []) as string[]).join(", ") || "(none)"} (${Number(result.count) || 0} active).`;
+}
+
+export function formatDomBreakpoint(result: Record<string, unknown>): string {
+	if (result.captured) {
+		const frames = Array.isArray(result.stack) ? (result.stack as Array<Record<string, unknown>>) : [];
+		const lines = [`Captured DOM breakpoint stack (${String(result.type ?? "")}, ${frames.length} frames):`];
+		for (const f of frames.slice(0, 15)) {
+			lines.push(`  ${String(f.functionName ?? "(anonymous)")} ${compactLine(String(f.url ?? ""), 60)}:${f.lineNumber ?? ""}`);
+		}
+		return truncateText(lines.join("\n"));
+	}
+	return `DOM breakpoints ${String(result.action ?? "")}: ${((result.active ?? []) as string[]).join(", ") || "(none)"} (${Number(result.count) || 0} active).`;
+}
+
+export function formatImeCompose(result: Record<string, unknown>): string {
+	if (result.committed) return `IME committed${result.text ? `: "${String(result.text)}"` : ""}.`;
+	return `IME composition set: "${String(result.text ?? "")}" (selection ${Number(result.selectionStart) ?? 0}–${Number(result.selectionEnd) ?? 0}).`;
+}
+
+export function formatVirtualTime(result: Record<string, unknown>): string {
+	if (!result.active && result.action === "status") return "Virtual time: inactive.";
+	if (result.action === "reset") return "Virtual time reset (natural time restored).";
+	const state = result.budgetExpired ? "budget expired" : "active";
+	return `Virtual time ${String(result.action ?? "")}: policy=${String(result.policy ?? "")} budget=${result.budgetMs === null || result.budgetMs === undefined ? "unbounded" : `${Number(result.budgetMs)}ms`} (${state}).`;
+}
+
+export function formatDeviceMatrix(result: Record<string, unknown>): string {
+	const profiles = Array.isArray(result.profiles) ? (result.profiles as Array<Record<string, unknown>>) : [];
+	const lines = [`Device matrix (${profiles.length} profile(s)${result.capped ? ", capped" : ""}):`];
+	for (const p of profiles) {
+		const em = (p.emulation ?? {}) as Record<string, unknown>;
+		if (p.error) lines.push(`  ${String(p.name ?? "?")} — error: ${compactLine(String(p.error), 70)}`);
+		else lines.push(`  ${String(p.name ?? "?")} — ${Number(em.width) || 0}x${Number(em.height) || 0} dpr=${Number(em.deviceScaleFactor) || 1}${p.screenshot ? ", screenshot" : ""} (perf metrics ${Array.isArray(p.perfMetrics) ? (p.perfMetrics as unknown[]).length : 0})`);
+	}
+	return truncateText(lines.join("\n"));
+}
+
+export function formatMhtml(result: Record<string, unknown>): string {
+	if (!result.supported) return `MHTML export unsupported: ${String(result.reason ?? "")} — ${String(result.hint ?? "")}`;
+	if (result.tooLarge) return `MHTML too large for the bridge (${Number(result.base64Length) || 0} base64 chars). ${String(result.hint ?? "")}`;
+	return `MHTML archive generated (${Math.round((Number(result.base64Length) || 0) * 0.75)} bytes) — written to file.`;
+}
+
+export function formatNetworkTls(result: Record<string, unknown>): string {
+	const lines = [`TLS certificate info (best-effort)${result.origin ? ` for ${String(result.origin)}` : ""}:`];
+	if (Array.isArray(result.tableNames)) {
+		const names = result.tableNames as string[];
+		lines.push(`  subject/SAN names (${names.length}${result.tableNamesCapped ? "+capped" : ""}): ${names.slice(0, 12).join(", ")}`);
+	}
+	const sd = (result.securityDetails ?? {}) as Record<string, unknown>;
+	if (sd.subjectName) {
+		lines.push(`  certificate: ${String(sd.subjectName)} issued by ${String(sd.issuer ?? "")} (${String(sd.protocol ?? "")})`);
+		if (sd.validFrom != null && sd.validTo != null) lines.push(`  validity: ${new Date(Number(sd.validFrom) * 1000).toISOString()} → ${new Date(Number(sd.validTo) * 1000).toISOString()}`);
+		if (Array.isArray(sd.sanList) && (sd.sanList as string[]).length) lines.push(`  SANs: ${(sd.sanList as string[]).slice(0, 8).join(", ")}`);
+	}
+	if (result.degraded) lines.push(`  degraded: ${String(result.error ?? "")}`);
+	if (result.securityDetailsError) lines.push(`  ${String(result.securityDetailsError)}`);
+	return truncateText(lines.join("\n"));
+}
+
+
