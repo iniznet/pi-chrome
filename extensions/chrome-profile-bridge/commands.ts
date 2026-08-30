@@ -235,6 +235,51 @@ export function formatChromeInspect(inspect: any): string {
 }
 
 // ---------------------------------------------------------------------------
+// chrome_network_initiator_chain formatter (P0; pure, host-free)
+// ---------------------------------------------------------------------------
+// Renders the SW's buildInitiatorChain response as the DevTools-style ancestor chain
+// "Document → script:line:col → request" with stack hints, plus dependents when requested.
+// The response shape is defined in TOOL_CONTRACTS.md §5.21.
+export function formatInitiatorChain(result: Record<string, unknown>): string {
+	if (!result || typeof result !== "object") return safeJson(result);
+	const lines: string[] = [];
+	const url = String(result.url ?? "");
+	const method = String(result.method ?? "GET");
+	lines.push(`Request ${method} ${url}${result.requestId ? ` (${String(result.requestId)})` : ""}`);
+	const ambiguous = result.ambiguous as { matched?: number; candidates?: string[] } | undefined;
+	if (ambiguous) {
+		lines.push(`⚠ ${ambiguous.matched ?? 0} captured requests match the URL filter; showing the most recent (candidates: ${(ambiguous.candidates ?? []).join(", ")}).`);
+	}
+	const chain = Array.isArray(result.chain) ? (result.chain as Array<Record<string, unknown>>) : [];
+	const nodes = [...chain.map(chainNodeLine), `${method} ${url}`];
+	lines.push(`Initiator chain: ${nodes.join("\n  → ")}`);
+	if (!chain.length) lines.push("  (this request's trigger was not linked to another captured request)");
+	const init = result.initiator as Record<string, unknown> | null | undefined;
+	if (init) {
+		const stack = Array.isArray(init.stack) ? (init.stack as Array<{ functionName?: string; url?: string; lineNumber?: number | null; columnNumber?: number | null }>) : [];
+		if (stack.length) {
+			const top = stack.slice(0, 4).map((f) => `${f.functionName || "(anonymous)"} @ ${f.url}:${f.lineNumber ?? "?"}:${f.columnNumber ?? "?"}`);
+			lines.push(`Triggering stack: ${top.join("\n  " )}${stack.length > 4 ? "\n  …" : ""}`);
+		}
+	}
+	if (Array.isArray(result.dependents)) {
+		const count = typeof result.dependentCount === "number" ? result.dependentCount : (result.dependents as unknown[]).length;
+		lines.push(`Dependents (${count}${result.dependentsTruncated ? ", truncated" : ""}):`);
+		for (const d of (result.dependents as Array<Record<string, unknown>>).slice(0, 12)) lines.push(`  → ${String(d.method ?? "GET")} ${String(d.url ?? "")}`);
+	}
+	return truncateText(lines.join("\n"));
+}
+
+function chainNodeLine(node: Record<string, unknown>): string {
+	const init = node.initiator as Record<string, unknown> | null | undefined;
+	const loc =
+		init && typeof init.lineNumber === "number"
+			? `:${init.lineNumber}${typeof init.columnNumber === "number" ? `:${init.columnNumber}` : ""}`
+			: "";
+	return `${String(node.method ?? "GET")} ${String(node.url ?? "")}${loc}`;
+}
+
+// ---------------------------------------------------------------------------
 // Tab list / tab formatters (host-side, pure)
 // ---------------------------------------------------------------------------
 // The bridge's `tab.list` action now returns BOTH the user's open tabs and the named-handle

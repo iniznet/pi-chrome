@@ -21,6 +21,7 @@ import {
 	formatChromeInspect,
 	formatChromeSnapshot,
 	formatIncludedSnapshotText,
+	formatInitiatorChain,
 	formatTab,
 	formatTabList,
 	recordHistory,
@@ -821,6 +822,7 @@ const CHROME_TOOL_NAMES = [
 	"chrome_network_capture",
 	"chrome_network_block",
 	"chrome_network_export",
+	"chrome_network_initiator_chain",
 	"chrome_screenshot",
 	"chrome_hover",
 	"chrome_drag",
@@ -2336,6 +2338,29 @@ Usage rules:
 				],
 				details: { path: outputPath, count, pageEntries: result.pageEntries, cdpEntries: result.cdpEntries, truncated: result.truncated, captureMode: result.mode } as unknown as Record<string, unknown>,
 			};
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_network_initiator_chain",
+		label: "Chrome Network Initiator Chain",
+		description:
+			"Rebuild the DevTools-style Request-initiator chain for one captured request from the CDP Network-domain capture store (enable capture with chrome_network_capture, then reload the page): who triggered this request — document → loader script → calling function — walking up to the frame's document request, with an optional reverse scan for the requests it triggered (dependents). Request initiators are captured with their URL, line/column, and a capped JS call stack; the response is a root-first ancestor chain plus the triggering stack. Requires network capture to have been on while the request was made.",
+		promptSnippet: "Trace which document/script triggered a network request (Request-initiator chain).",
+		parameters: Type.Object({
+			requestId: Type.Optional(Type.String({ description: "Request id from chrome_list_network_requests / chrome_network_capture (cdpEntries[].requestId). One of requestId / requestUrlIncludes is required." })),
+			requestUrlIncludes: Type.Optional(Type.String({ description: "Substring of the request URL to build the chain for (alternative to requestId). When several captured requests match, the most recent is used and the result is marked ambiguous." })),
+			includeDependents: Type.Optional(Type.Boolean({ description: "Also reverse-scan the capture store for requests this one triggered (dependents), capped at 50." })),
+			targetId: Type.Optional(Type.String({ description: "Tab whose captured network store to read." })),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean({ description: "If true, run silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." })),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("network.initiatorChain", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatInitiatorChain(result) }], details: { result: result as Json } };
 		},
 	});
 

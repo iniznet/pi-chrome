@@ -304,7 +304,7 @@ const dialogWaiters = new Set(); // tabId with an in-flight chrome_dialog wait
 // =================== device/UA/touch emulation ===================
 // Emulation overrides live on the CDP target and die with the debugger attach, so after
 // page.emulate set we extend the attach keepalive (and remember what we set) until cleared.
-const emulatedTabs = new Map(); // tabId -> { width, height, deviceScaleFactor, mobile, touch, ua, platform }
+const emulatedTabs = new Map(); // tabId -> { width, height, deviceScaleFactor, mobile, touch, ua, platform, acceptLanguage }
 const EMULATE_ATTACH_KEEPALIVE_MS = 10 * 60 * 1000;
 
 // =================== downloads ===================
@@ -331,11 +331,276 @@ const networkModeTabs = new Set(); // tabId with opt-in persistent CDP Network c
 const blockedUrlsPerTab = new Map(); // tabId -> string[] patterns last applied via Network.setBlockedURLs
 const cdpNetworkEntries = new Map(); // tabId -> Map<requestId, entry>
 
+// =================== M0 shared plumbing: keepalive mode registry ===================
+// Long-lived modes (network capture, emulation, blocked URLs — later throttle/headers/media/
+// pseudo/console-capture/input-lock/breakpoints/interception/tracing/heap/recording) each:
+//   1. register here so the idle-detach sweep keeps the debugger attach alive while active,
+//   2. tear down centrally in onDetach (never leave stale per-tab state behind),
+//   3. declare a re-apply hook so a fresh attach (cdp() auto-recover or a later command) can
+//      restore the CDP overrides that die with the session — the ensureNetworkCapture pattern.
+// Mode intent is persisted to chrome.storage.session so a Chrome-initiated detach (DevTools
+// opens, user cancels the attach) or an MV3 worker suspend does not silently drop an active
+// mode; the next command on that tab restores + re-applies it (risk #1 / #2).
+const INITIATOR_STACK_MAX_FRAMES = 20;
+const INITIATOR_PARENT_DEPTH = 3;
+const INITIATOR_CHAIN_MAX_DEPTH = 16;
+const INITIATOR_CHAIN_MAX_DEPENDENTS = 50;
+const NODE_RESOLVE_OBJECT_GROUP = "pi-chrome-node-resolve";
+const KEEPALIVE_MODE_STORAGE_KEY = "piChromeKeepaliveModes";
+const PAUSED_KEEPALIVE_MS = 24 * 60 * 60 * 1000; // paused pages are re-extended each sweep tick
+const MODE_NETWORK = "network";
+const MODE_EMULATE = "emulate";
+const MODE_BLOCKED_URLS = "blockedUrls";
+const MODE_THROTTLE = "throttle";
+const MODE_HEADERS = "headers";
+const MODE_MEDIA = "media";
+const MODE_PSEUDO = "pseudo";
+const MODE_CONSOLE_CAPTURE = "consoleCapture";
+const MODE_INPUT_LOCK = "inputLock";
+const MODE_PAUSED = "paused";
+const MODE_TRACING = "tracing";
+const MODE_HEAP_RECORDING = "heapRecording";
+const MODE_BREAKPOINTS = "breakpoints";
+const MODE_INTERCEPT = "intercept";
+const MODE_RECORD_SESSION = "sessionRecord";
+
+// Per-tab paused-page state (Debugger.paused / Debugger.resumed). While paused the main thread
+// is frozen: evaluate/snapshot/input would hang forever, so ensurePageUsable auto-resumes first
+// and the idle-detach sweep exempts paused tabs (a detach force-resumes and silently loses the
+// pause). See TOOL_CONTRACTS.md §3.5.
+const pausedTabs = new Map(); // tabId -> { reason, callFrames, timestamp }
+const pauseResumeEvents = []; // bounded diagnostics ring, like attachDebugLog
+function recordPauseResumeEvent(entry) {
+  pauseResumeEvents.push({ ...entry, t: Date.now() });
+  if (pauseResumeEvents.length > 20) pauseResumeEvents.shift();
+}
+
+const keepaliveModes = {
+  [MODE_NETWORK]: {
+    keepaliveMs: NETWORK_MODE_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => (networkModeTabs.has(tabId) ? { enabled: true, blockedUrls: blockedUrlsPerTab.get(tabId) || [] } : null),
+    restore: (tabId, snap) => {
+      if (snap && snap.enabled) {
+        networkModeTabs.add(tabId);
+        if (Array.isArray(snap.blockedUrls)) blockedUrlsPerTab.set(tabId, snap.blockedUrls);
+      }
+    },
+    reapply: async (tabId, snap) => {
+      if (snap && snap.enabled) await ensureNetworkCapture(tabId);
+    },
+    onDetach: (tabId) => {
+      networkModeTabs.delete(tabId);
+      blockedUrlsPerTab.delete(tabId);
+    },
+  },
+  [MODE_EMULATE]: {
+    keepaliveMs: EMULATE_ATTACH_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => (emulatedTabs.has(tabId) ? { ...emulatedTabs.get(tabId) } : null),
+    restore: (tabId, snap) => { if (snap) emulatedTabs.set(tabId, snap); },
+    reapply: async (tabId, snap) => { if (snap) await applyEmulationOverrides(tabId, snap); },
+    onDetach: (tabId) => emulatedTabs.delete(tabId),
+  },
+  [MODE_BLOCKED_URLS]: {
+    keepaliveMs: NETWORK_MODE_KEEPALIVE_MS,
+    persist: false,
+    snapshot: (tabId) => (blockedUrlsPerTab.has(tabId) ? { urls: blockedUrlsPerTab.get(tabId) || [] } : null),
+    restore: (tabId, snap) => { if (snap && Array.isArray(snap.urls)) blockedUrlsPerTab.set(tabId, snap.urls); },
+    reapply: async (tabId, snap) => {
+      if (snap && Array.isArray(snap.urls) && snap.urls.length) {
+        await cdp(tabId, "Network.setBlockedURLs", { urls: snap.urls }).catch(() => undefined);
+      }
+    },
+    onDetach: (tabId) => blockedUrlsPerTab.delete(tabId),
+  },
+  [MODE_PAUSED]: {
+    // A paused page must never idle-detach (detaching force-resumes it, losing the pause).
+    keepaliveMs: PAUSED_KEEPALIVE_MS,
+    persist: false,
+    snapshot: () => null,
+    restore: () => {},
+    reapply: null,
+    onDetach: (tabId) => { pausedTabs.delete(tabId); },
+  },
+};
+
+// Per-tab active mode membership. The idle-detach sweep consults this; onDetach drains it.
+const modesPerTab = new Map(); // tabId -> Set<modeId>
+let keepaliveIntentHydrated = false;
+
+function modesForTab(tabId) {
+  let set = modesPerTab.get(tabId);
+  if (!set) { set = new Set(); modesPerTab.set(tabId, set); }
+  return set;
+}
+
+function registerMode(tabId, modeId) {
+  const desc = keepaliveModes[modeId];
+  if (!desc) return;
+  modesForTab(tabId).add(modeId);
+  const entry = attachedTabs.get(tabId);
+  if (entry) extendAttachKeepalive(tabId, entry);
+  void persistKeepaliveIntent();
+}
+
+function unregisterMode(tabId, modeId) {
+  const set = modesPerTab.get(tabId);
+  if (set) {
+    set.delete(modeId);
+    if (set.size === 0) modesPerTab.delete(tabId);
+  }
+  const entry = attachedTabs.get(tabId);
+  if (entry) extendAttachKeepalive(tabId, entry);
+  void persistKeepaliveIntent();
+}
+
+// Recompute the attach's detachAt from the longest keepalive among active modes (default idle
+// window when none). Paused tabs use PAUSED_KEEPALIVE_MS and are re-extended by the sweep.
+function extendAttachKeepalive(tabId, entry) {
+  let keepalive = 0;
+  const set = modesPerTab.get(tabId);
+  if (set) {
+    for (const modeId of set) {
+      const desc = keepaliveModes[modeId];
+      if (desc && desc.keepaliveMs > keepalive) keepalive = desc.keepaliveMs;
+    }
+  }
+  entry.detachAt = Date.now() + (keepalive > 0 ? keepalive : INPUT_IDLE_DETACH_MS);
+}
+
+// Centralized per-tab teardown for onDetach / detachDebugger: run each active mode's onDetach
+// hook (frees CDP-dependent state), drop the per-tab membership. Persisted intent is retained
+// so the next command on this tab restores + re-applies the modes.
+function cleanupModesForTab(tabId) {
+  const set = modesPerTab.get(tabId);
+  if (set) {
+    for (const modeId of set) {
+      const desc = keepaliveModes[modeId];
+      if (desc && typeof desc.onDetach === "function") desc.onDetach(tabId);
+    }
+    modesPerTab.delete(tabId);
+  }
+}
+
+// Re-apply active modes after a FRESH attach (CDP domain state died with the old session).
+async function reapplyModesForTab(tabId) {
+  const set = modesPerTab.get(tabId);
+  if (!set) return;
+  for (const modeId of set) {
+    const desc = keepaliveModes[modeId];
+    if (!desc || typeof desc.reapply !== "function") continue;
+    try {
+      await desc.reapply(tabId, desc.snapshot ? desc.snapshot(tabId) : null);
+    } catch (error) {
+      console.warn(`[pi-chrome] re-apply of mode ${modeId} on tab ${tabId} failed: ${String(error?.message || error)}`);
+    }
+  }
+}
+
+// Restore persisted mode intent after a fresh attach (survived Chrome-initiated detach / worker
+// suspend), then re-apply the CDP overrides. Idempotent within a worker lifetime.
+async function restoreModesForTab(tabId) {
+  await hydrateKeepaliveIntent();
+  if (!modesPerTab.has(tabId)) {
+    try {
+      const stored = await chrome.storage?.session?.get?.(KEEPALIVE_MODE_STORAGE_KEY);
+      const saved = stored && stored[KEEPALIVE_MODE_STORAGE_KEY];
+      const modeSnaps = saved && saved[String(tabId)];
+      if (modeSnaps && typeof modeSnaps === "object") {
+        for (const [modeId, snap] of Object.entries(modeSnaps)) {
+          const desc = keepaliveModes[modeId];
+          if (!desc || typeof desc.restore !== "function") continue;
+          try { desc.restore(tabId, snap); } catch {}
+          modesForTab(tabId).add(modeId);
+        }
+      }
+    } catch {}
+  }
+  await reapplyModesForTab(tabId);
+}
+
+async function persistKeepaliveIntent() {
+  try {
+    const obj = {};
+    for (const [tabId, set] of modesPerTab) {
+      const modeSnaps = {};
+      for (const modeId of set) {
+        const desc = keepaliveModes[modeId];
+        if (!desc || !desc.persist || typeof desc.snapshot !== "function") continue;
+        const snap = desc.snapshot(tabId);
+        if (snap !== null && snap !== undefined) modeSnaps[modeId] = snap;
+      }
+      if (Object.keys(modeSnaps).length) obj[String(tabId)] = modeSnaps;
+    }
+    await chrome.storage?.session?.set?.({ [KEEPALIVE_MODE_STORAGE_KEY]: obj });
+  } catch {
+    // Persistence is best-effort: mode intent loss only degrades re-apply, never correctness.
+  }
+}
+
+// One-time per-worker hydrate: restore persisted mode intent into the in-memory stores so a
+// restarted SW keeps its long-lived modes (MV3 suspend risk #1).
+async function hydrateKeepaliveIntent() {
+  if (keepaliveIntentHydrated) return;
+  keepaliveIntentHydrated = true;
+  try {
+    const stored = await chrome.storage?.session?.get?.(KEEPALIVE_MODE_STORAGE_KEY);
+    const saved = stored && stored[KEEPALIVE_MODE_STORAGE_KEY];
+    if (saved && typeof saved === "object") {
+      for (const [tabIdStr, modeSnaps] of Object.entries(saved)) {
+        const tabId = Number(tabIdStr);
+        if (!Number.isInteger(tabId) || !modeSnaps || typeof modeSnaps !== "object") continue;
+        for (const [modeId, snap] of Object.entries(modeSnaps)) {
+          const desc = keepaliveModes[modeId];
+          if (!desc || typeof desc.restore !== "function") continue;
+          try { desc.restore(tabId, snap); } catch {}
+          modesForTab(tabId).add(modeId);
+        }
+      }
+    }
+  } catch {
+    // Ignore: treat as "no persisted mode intent".
+  }
+}
+
+// Resume a paused page before a command that would deadlock on the frozen main thread
+// (evaluate / snapshot / input / screenshot). Returns a note { wasPaused, reason, ... } or null
+// so callers can surface "page is paused" prominently. Never throws: a failed resume falls
+// through to the CDP command's own timeout instead of silently hanging (constraint #3).
+async function ensurePageUsable(tabId, label) {
+  const paused = pausedTabs.get(tabId);
+  if (!paused) return null;
+  try {
+    await cdpRaw(tabId, "Debugger.resume", {});
+  } catch (error) {
+    console.warn(`[pi-chrome] auto-resume before ${label} failed on tab ${tabId}: ${String(error?.message || error)}`);
+  }
+  pausedTabs.delete(tabId);
+  unregisterMode(tabId, MODE_PAUSED);
+  const note = { wasPaused: true, reason: paused.reason, resumedBefore: label, at: Date.now() };
+  recordPauseResumeEvent({ tabId, ...note });
+  return note;
+}
+
+// Run `fn` under the paused-page rail and merge any resume note into an object result.
+async function withPauseRail(tabId, label, fn) {
+  const note = await ensurePageUsable(tabId, label);
+  const result = await fn();
+  if (note && result && typeof result === "object" && !Array.isArray(result)) {
+    result.pausedAutoResumed = note;
+  }
+  return result;
+}
+
 function inputStatus() {
   return {
     attachedTabs: Array.from(attachedTabs.keys()),
     permissionGranted: typeof chrome !== "undefined" && !!chrome.debugger,
     networkCaptureTabs: Array.from(networkModeTabs.keys()),
+    activeModes: Array.from(modesPerTab.entries()).map(([tabId, set]) => ({ tabId, modes: Array.from(set) })),
+    pausedTabs: Array.from(pausedTabs.keys()),
+    recentPauseResumes: pauseResumeEvents.slice(),
   };
 }
 
@@ -375,7 +640,9 @@ async function attachDebugger(tabId) {
   if (!chrome.debugger) throw new Error("chrome.debugger API unavailable; reload the extension to grant the new permission");
   if (attachedTabs.has(tabId)) {
     const entry = attachedTabs.get(tabId);
-    entry.detachAt = Date.now() + INPUT_IDLE_DETACH_MS;
+    // Active keepalive modes (network capture, emulation, paused page, ...) extend the attach
+    // lifetime instead of the default idle-detach window.
+    extendAttachKeepalive(tabId, entry);
     return entry;
   }
   // Before each attach, force-detach any stale CDP target this extension owns on the tab.
@@ -451,9 +718,12 @@ async function attachDebugger(tabId) {
       else resolve(result);
     });
   }), CDP_COMMAND_TIMEOUT_MS, "CDP Page.enable").catch(() => undefined);
-  // Emulation overrides live on the CDP target and die when the debugger detaches; extend the
-  // keepalive for emulated tabs so chrome_emulate settings survive past the normal idle detach.
-  if (emulatedTabs.has(tabId)) entry.detachAt = Date.now() + EMULATE_ATTACH_KEEPALIVE_MS;
+  // M0: restore + re-apply persisted keepalive modes (network capture, emulation, ...) whose CDP
+  // domain state died with the previous session (risk #2). Best-effort: a re-apply failure is
+  // logged, never fatal — the mode intent is still restored for the next attempt.
+  await restoreModesForTab(tabId).catch((error) => {
+    console.warn(`[pi-chrome] restore modes on tab ${tabId} failed: ${String(error?.message || error)}`);
+  });
   return entry;
 }
 
@@ -501,14 +771,14 @@ if (chrome.debugger && chrome.debugger.onDetach) {
     if (tabId !== undefined) {
       attachedTabs.delete(tabId);
       // A detach kills every CDP domain on the target: pending JS dialogs are dismissed by Chrome
-      // and Emulation overrides are reset, so forget what we knew about this tab. Network-mode
-      // flags and blocked-URL patterns die with the attach too; captured entries are retained so
-      // chrome_network_export still has data after the mode was turned off or Chrome detached us.
+      // and Emulation overrides are reset, so forget what we knew about this tab. M0 keepalive
+      // registry centralizes the per-tab teardown (network capture flags, blocked-URL patterns,
+      // emulation state, paused state) via each mode's onDetach hook. Captured entries are
+      // retained so chrome_network_export still has data after the mode was turned off or Chrome
+      // detached us. Persisted mode intent is kept so the next command restores + re-applies it.
       pendingDialogs.delete(tabId);
       dialogWaiters.delete(tabId);
-      emulatedTabs.delete(tabId);
-      networkModeTabs.delete(tabId);
-      blockedUrlsPerTab.delete(tabId);
+      cleanupModesForTab(tabId);
     }
     if (reason === "canceled_by_user") {
       console.warn(`[pi-chrome] debugger canceled by user on tab ${tabId}; Chrome input will reattach on next call`);
@@ -568,6 +838,10 @@ function handleCdpNetworkEvent(tabId, method, params) {
     if (typeof params.timestamp === "number") entry.requestTimestamp = params.timestamp;
     if (params.documentURL) entry.documentURL = String(params.documentURL);
     if (params.frameId) entry.frameId = String(params.frameId);
+    // M0: keep the FULL initiator object (type/url/line/column + CAPPED stack with parent chains)
+    // instead of only the type string — chrome_network_initiator_chain rebuilds the DevTools-style
+    // request-initiator tree from it (gap report §4.3 / TOOL_CONTRACTS §3.4).
+    if (params.initiator) entry.initiator = captureInitiator(params.initiator);
     if (params.initiator && params.initiator.type) entry.initiatorType = String(params.initiator.type);
     tabEntries.set(requestId, entry);
     trimCdpNetworkEntries(tabEntries);
@@ -609,6 +883,41 @@ function handleCdpNetworkEvent(tabId, method, params) {
   }
 }
 
+// Normalize a Network.requestWillBeSent initiator into a capped, serializable record so
+// chrome_network_initiator_chain can rebuild the DevTools-style request-initiator tree. The full
+// CDP initiator carries { type, url, lineNumber, columnNumber, stack { callFrames, parent } } and
+// is discarded today — only the type string survives. We keep the origin of the triggering
+// script/document plus a CAPPED call stack (functionName/url/line/column), following parent
+// chains to depth INITIATOR_PARENT_DEPTH with a hard frame budget (bounded ring, risk #11).
+function captureInitiator(initiator) {
+  if (!initiator || typeof initiator !== "object") return null;
+  const record = { type: String(initiator.type || "") };
+  if (typeof initiator.url === "string" && initiator.url) record.url = initiator.url;
+  if (typeof initiator.lineNumber === "number") record.lineNumber = initiator.lineNumber;
+  if (typeof initiator.columnNumber === "number") record.columnNumber = initiator.columnNumber;
+  if (initiator.stack && typeof initiator.stack === "object") {
+    const frames = [];
+    let stack = initiator.stack;
+    let depth = 0;
+    while (stack && depth <= INITIATOR_PARENT_DEPTH && frames.length < INITIATOR_STACK_MAX_FRAMES) {
+      const callFrames = Array.isArray(stack.callFrames) ? stack.callFrames : [];
+      for (const cf of callFrames) {
+        if (frames.length >= INITIATOR_STACK_MAX_FRAMES) break;
+        frames.push({
+          functionName: typeof cf.functionName === "string" ? cf.functionName : "",
+          url: typeof cf.url === "string" ? cf.url : "",
+          lineNumber: typeof cf.lineNumber === "number" ? cf.lineNumber : null,
+          columnNumber: typeof cf.columnNumber === "number" ? cf.columnNumber : null,
+        });
+      }
+      stack = stack.parent || null;
+      depth++;
+    }
+    record.stack = frames;
+  }
+  return record;
+}
+
 function objectToHeaderList(headers) {
   if (!headers || typeof headers !== "object") return [];
   return Object.entries(headers).map(([name, value]) => ({ name, value: String(value) }));
@@ -646,6 +955,30 @@ if (chrome.debugger && chrome.debugger.onEvent) {
       }
       return;
     }
+    if (method === "Debugger.paused") {
+      // Record the pause so ensurePageUsable can auto-resume before any evaluate/snapshot/input
+      // command and the idle-detach sweep exempts the tab (a detach would force-resume, losing
+      // the pause). Call frames are preview-capped (bounded buffers, risk #11); the full stack is
+      // re-derivable via Debugger.getStackTrace when a debugger tool needs it.
+      pausedTabs.set(tabId, {
+        reason: String(eventParams?.reason || "other"),
+        callFrames: Array.isArray(eventParams?.callFrames)
+          ? eventParams.callFrames.map((cf) => ({
+              functionName: String(cf?.functionName || ""),
+              url: String(cf?.url || ""),
+              lineNumber: typeof cf?.lineNumber === "number" ? cf.lineNumber : null,
+              columnNumber: typeof cf?.columnNumber === "number" ? cf.columnNumber : null,
+            })).slice(0, 50)
+          : [],
+        timestamp: Date.now(),
+      });
+      registerMode(tabId, MODE_PAUSED);
+      return;
+    }
+    if (method === "Debugger.resumed") {
+      if (pausedTabs.delete(tabId)) unregisterMode(tabId, MODE_PAUSED);
+      return;
+    }
     if (method.startsWith("Network.")) handleCdpNetworkEvent(tabId, method, eventParams);
   });
 }
@@ -657,9 +990,11 @@ setInterval(() => {
       // A pending modal dialog is dismissed by Chrome on detach; keep the attach alive so the
       // agent can still reach it with chrome_dialog after the triggering command returns.
       if (pendingDialogs.has(tabId)) { entry.detachAt = now + 2000; continue; }
-      // Network-mode capture (chrome_network_capture on) must NOT idle-detach: the CDP Network
-      // domain dies with the attach, silently ending document/static capture mid-session.
-      if (networkModeTabs.has(tabId)) { entry.detachAt = now + NETWORK_MODE_KEEPALIVE_MS; continue; }
+      // M0 keepalive registry: any active mode (network capture, emulation, paused page, ...)
+      // exempts the tab from idle-detach — the CDP domain state dies with the attach, silently
+      // ending capture / overrides / the pause mid-session.
+      const modes = modesPerTab.get(tabId);
+      if (modes && modes.size > 0) { extendAttachKeepalive(tabId, entry); continue; }
       void detachDebugger(tabId);
     }
   }
@@ -889,6 +1224,10 @@ function cdpIsSyntaxError(details) {
 // frame's viewport, while getBoundingClientRect inside a sub-frame is relative to that frame's
 // own viewport — so frame-local coords must be translated before dispatching (subframe-coords).
 async function resolveTargetInTab(tabId, params) {
+  // Paused-page rail (M0): synthetic input dispatched to a Debugger.paused page hangs — the
+  // frozen main thread never handles the injected target script or the CDP input. Auto-resume
+  // first and surface the pause in the returned resolution object.
+  const pauseNote = await ensurePageUsable(tabId, "input");
   // A uid from a merged sub-frame snapshot carries an "el-f<frameId>-<n>" prefix; resolve the
   // target inside the owning frame so selectors/uid lookups run against the right document.
   const frameUid = params.uid ? parseFrameUid(params.uid) : null;
@@ -936,6 +1275,7 @@ async function resolveTargetInTab(tabId, params) {
       v.frameOffset = { dx: offset.dx, dy: offset.dy, method: offset.method || "page-walk" };
     }
   }
+  if (pauseNote && v && typeof v === "object") v.pausedAutoResumed = pauseNote;
   return v;
 }
 
@@ -1638,6 +1978,101 @@ async function resolveFileInputInFrame(tabId, frameId, selector, localUid) {
   if (!requested.nodeId) throw new Error("Could not resolve file input node in sub-frame");
   return { objectId, nodeId: requested.nodeId };
 }
+
+// =================== M0: generic uid/selector -> CDP nodeId resolver ===================
+// nodeIds are document-scoped and invalidated by navigation, so they are NEVER cached across
+// messages: every command re-resolves through Runtime.evaluate (top frame) or DOM.getFrameOwner
+// (sub-frame uid) + DOM.requestNode. A stale uid (element removed from the DOM since the
+// snapshot) surfaces a clear "take a fresh snapshot" error instead of a confusing CDP failure.
+//
+// Returns { objectId, nodeId, frameId }. Callers MUST Runtime.releaseObject the objectId when
+// they no longer need the remote reference (risk #6 remote-object leaks).
+async function resolveCdpNode(tabId, params, opts = {}) {
+  const selector = params && params.selector !== undefined ? params.selector : null;
+  const uid = params && params.uid !== undefined ? params.uid : null;
+  const frameUid = uid ? parseFrameUid(uid) : null;
+  const frameId = frameUid ? frameUid.frameId : (opts.frameId || 0);
+  const localUid = frameUid ? frameUid.localUid : uid;
+  const { objectId } = frameId > 0
+    ? await resolveNodeInFrame(tabId, frameId, selector, localUid)
+    : await resolveNodeTopFrame(tabId, selector, localUid);
+  if (!objectId) throw new Error("Element not found in the live document");
+  await cdp(tabId, "DOM.enable", {}).catch(() => undefined);
+  const requested = await cdp(tabId, "DOM.requestNode", { objectId });
+  if (!requested.nodeId) throw new Error("Could not resolve element node (DOM.requestNode returned no nodeId)");
+  return { objectId, nodeId: requested.nodeId, frameId };
+}
+
+// Top-frame resolution. Returns { objectId } or throws a fresh-snapshot error for stale uids.
+async function resolveNodeTopFrame(tabId, selector, uid) {
+  const expression = `(() => {
+    const selector = ${JSON.stringify(selector ?? null)};
+    const uid = ${JSON.stringify(uid ?? null)};
+    const state = window.__PI_CHROME_STATE__;
+    const el = uid && state && state.elements ? state.elements[uid] : (selector ? document.querySelector(selector) : null);
+    if (!el) return "__piNotFound";
+    if (!el.isConnected) return "__piStale";
+    el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    return el;
+  })()`;
+  const evaluated = await cdp(tabId, "Runtime.evaluate", {
+    expression,
+    objectGroup: NODE_RESOLVE_OBJECT_GROUP,
+    includeCommandLineAPI: false,
+    returnByValue: false,
+    userGesture: false,
+  });
+  if (evaluated.exceptionDetails) throw new Error(`Could not resolve element: ${evaluated.exceptionDetails.text || "evaluation failed"}`);
+  const result = evaluated.result;
+  if (result && result.value === "__piStale") {
+    throw new Error(`Snapshot uid ${uid} refers to an element that is no longer connected to the document — take a fresh chrome_snapshot and retry.`);
+  }
+  if (result && result.value === "__piNotFound" || !result || !result.objectId) {
+    const reason = uid ? `snapshot uid ${uid}` : `selector ${selector}`;
+    throw new Error(`No element found in the live document for ${reason} — take a fresh chrome_snapshot or check the selector.`);
+  }
+  return { objectId: result.objectId };
+}
+
+// Sub-frame (same-origin) resolution via DOM.getFrameOwner -> contentDocument. Cross-origin
+// (OOPIF) frames cannot expose contentDocument to the top frame — surface a clear error instead
+// of silently resolving against the wrong document (risk #7 OOPIF routing).
+async function resolveNodeInFrame(tabId, frameId, selector, localUid) {
+  await cdp(tabId, "DOM.enable", {}).catch(() => undefined);
+  const owner = await cdp(tabId, "DOM.getFrameOwner", { frameId });
+  if (!owner || typeof owner.nodeId !== "number") {
+    throw new Error("Could not resolve the sub-frame's owner element (the frame may have navigated away)");
+  }
+  const ownerObj = await cdp(tabId, "DOM.resolveNode", { nodeId: owner.nodeId });
+  if (!ownerObj?.object?.objectId) throw new Error("Could not resolve the sub-frame's document");
+  const found = await cdp(tabId, "Runtime.callFunctionOn", {
+    objectId: ownerObj.object.objectId,
+    functionDeclaration: `function(selector, uid) {
+      const doc = this.contentDocument;
+      if (!doc) return "__piNotFound";
+      const state = doc.defaultView && doc.defaultView.__PI_CHROME_STATE__;
+      let el = uid && state && state.elements ? state.elements[uid] : null;
+      if (!el && selector) el = doc.querySelector(selector);
+      if (!el) return "__piNotFound";
+      if (!el.isConnected) return "__piStale";
+      try { el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" }); } catch {}
+      return el;
+    }`,
+    arguments: [{ value: selector }, { value: localUid }],
+    returnByValue: false,
+  });
+  await cdp(tabId, "Runtime.releaseObject", { objectId: ownerObj.object.objectId }).catch(() => undefined);
+  if (found.exceptionDetails) throw new Error(`Could not resolve element in sub-frame: ${found.exceptionDetails.text || "evaluation failed"}`);
+  const result = found.result;
+  if (result && result.value === "__piStale") {
+    throw new Error(`Snapshot uid ${localUid} refers to an element that is no longer connected in frame ${frameId} — take a fresh chrome_snapshot and retry.`);
+  }
+  if ((result && result.value === "__piNotFound") || !result || !result.objectId) {
+    const reason = localUid ? `snapshot uid ${localUid}` : `selector ${selector}`;
+    throw new Error(`No element found in frame ${frameId} for ${reason} — cross-origin (OOPIF) frames cannot be reached for DOM resolution.`);
+  }
+  return { objectId: result.objectId };
+}
 // ===============================================================
 
 // --- bridge polling state ---
@@ -2098,26 +2533,32 @@ async function groupTab(tab, title, color) {
 }
 
 // =================== CDP Network-domain commands (feat-cdp-network / feat-har) ===================
-// enableNetworkDomain deliberately does NOT route through cdpRaw: its timeout path force-detaches,
-// which would tear down the persistent attach we are building (same policy as the Page.enable
-// call inside attachDebugger).
-async function enableNetworkDomain(tabId) {
+// Non-destructive CDP domain enable (M0): mirrors the enableNetworkDomain policy so a slow or
+// failing <domain>.enable NEVER force-detaches the attach (the cdpRaw timeout path tears down the
+// session). Domain enables are idempotent, so this is safe to call after every (re)attach — every
+// new CDP domain (CSS, Runtime, Debugger, Log, Fetch, ...) MUST be enabled through this helper.
+async function enableCdpDomain(tabId, domain) {
   await withTimeout(new Promise((resolve, reject) => {
-    chrome.debugger.sendCommand(attachedTabs.get(tabId)?.debuggee || { tabId }, "Network.enable", {}, (result) => {
+    chrome.debugger.sendCommand(attachedTabs.get(tabId)?.debuggee || { tabId }, `${domain}.enable`, {}, (result) => {
       if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
       else resolve(result);
     });
-  }), CDP_COMMAND_TIMEOUT_MS, "CDP Network.enable");
+  }), CDP_COMMAND_TIMEOUT_MS, `CDP ${domain}.enable`);
+}
+
+async function enableNetworkDomain(tabId) {
+  return enableCdpDomain(tabId, "Network");
 }
 
 // Opt a tab into persistent CDP Network capture: attach (if needed), mark the attach as
 // network-mode (the idle-detach sweep skips it), enable the Network domain, and re-apply any
-// blocked-URL patterns previously set (Network.setBlockedURLs dies with the attach).
+// blocked-URL patterns previously set (Network.setBlockedURLs dies with the attach). M0: the
+// mode registers in the keepalive registry (keepalive + persist + re-apply-on-re-attach).
 async function ensureNetworkCapture(tabId) {
   const entry = await attachDebugger(tabId);
   entry.networkMode = true;
-  entry.detachAt = Date.now() + NETWORK_MODE_KEEPALIVE_MS;
   networkModeTabs.add(tabId);
+  registerMode(tabId, MODE_NETWORK);
   if (!cdpNetworkEntries.has(tabId)) cdpNetworkEntries.set(tabId, new Map());
   await enableNetworkDomain(tabId);
   const blocked = blockedUrlsPerTab.get(tabId);
@@ -2128,6 +2569,7 @@ async function ensureNetworkCapture(tabId) {
 
 async function disableNetworkCapture(tabId) {
   networkModeTabs.delete(tabId);
+  unregisterMode(tabId, MODE_NETWORK);
   const entry = attachedTabs.get(tabId);
   if (entry) {
     entry.networkMode = false;
@@ -2399,6 +2841,132 @@ async function exportNetworkHar(tab, params) {
   };
 }
 
+// =================== network.initiatorChain (chrome_network_initiator_chain, P0) ===================
+// Rebuild the DevTools-style Request-initiator chain for one captured request: the request that
+// fetched the script/document that triggered it, walking up to the frame's document request
+// (ancestors), with an optional reverse scan for dependents (requests this one triggered). Works
+// on the CDP capture store (cdpNetworkEntries), which keeps the full initiator record (M0).
+// Pure top-level function so the unit harness can vm-drive it directly (foundation-smoke).
+
+// The URL that links this request to its parent in the initiator chain: initiator.url for
+// parser/script/preload, falling back to the first stack frame's script URL (a "script"
+// initiator without a url still carries the call stack), then to the most recent redirect hop.
+function initiatorLinkUrl(entry, byUrl) {
+  const init = entry && entry.initiator ? entry.initiator : null;
+  if (init && typeof init.url === "string" && init.url && byUrl.has(init.url)) return init.url;
+  if (init && Array.isArray(init.stack)) {
+    for (const frame of init.stack) {
+      if (frame && typeof frame.url === "string" && frame.url && byUrl.has(frame.url)) return frame.url;
+    }
+  }
+  if (entry && Array.isArray(entry.redirects) && entry.redirects.length) {
+    const last = entry.redirects[entry.redirects.length - 1];
+    if (last && typeof last.url === "string" && byUrl.has(last.url)) return last.url;
+  }
+  return null;
+}
+
+function chainNodeFor(entry) {
+  return {
+    requestId: entry.requestId,
+    url: entry.url || "",
+    method: entry.method || "GET",
+    resourceType: entry.resourceType || "",
+    status: typeof entry.status === "number" ? entry.status : null,
+    initiator: entry.initiator || null,
+  };
+}
+
+// Walk `entry`'s ancestor chain and report whether it reaches `targetRequestId` (reverse scan).
+function reachesInitiatorTarget(stored, byUrl, entry, targetRequestId) {
+  let current = entry;
+  const visited = new Set([current.requestId]);
+  let hops = 0;
+  while (current && hops < INITIATOR_CHAIN_MAX_DEPTH) {
+    const linkUrl = initiatorLinkUrl(current, byUrl);
+    const parent = linkUrl ? byUrl.get(linkUrl) : null;
+    if (!parent || visited.has(parent.requestId)) break;
+    if (parent.requestId === targetRequestId) return true;
+    visited.add(parent.requestId);
+    current = parent;
+    hops++;
+  }
+  return false;
+}
+
+function collectInitiatorDependents(stored, byUrl, targetRequestId) {
+  const dependents = [];
+  for (const [rid, entry] of stored) {
+    if (rid === targetRequestId) continue;
+    if (reachesInitiatorTarget(stored, byUrl, entry, targetRequestId)) dependents.push(rid);
+    if (dependents.length >= INITIATOR_CHAIN_MAX_DEPENDENTS) break;
+  }
+  return { list: dependents, count: dependents.length, truncated: dependents.length >= INITIATOR_CHAIN_MAX_DEPENDENTS };
+}
+
+// Pick the target entry by requestId (exact) or requestUrlIncludes (substring; latest match wins
+// and ambiguity is reported). Throws with a helpful message when nothing matches.
+function pickInitiatorTarget(stored, params) {
+  if (typeof params.requestId === "string" && params.requestId) {
+    const entry = stored.get(params.requestId);
+    if (!entry) {
+      throw new Error(`No CDP network entry with requestId ${params.requestId} (entries older than the ${CDP_NETWORK_MAX_ENTRIES_PER_TAB}-entry cap may have been evicted)`);
+    }
+    return { requestId: params.requestId, entry };
+  }
+  const needle = typeof params.requestUrlIncludes === "string" && params.requestUrlIncludes ? params.requestUrlIncludes : "";
+  if (!needle) {
+    throw new Error("chrome_network_initiator_chain requires requestId or requestUrlIncludes");
+  }
+  const matches = Array.from(stored.values()).filter((e) => String(e.url || "").includes(needle));
+  if (!matches.length) throw new Error(`No captured CDP network request whose URL includes "${needle}"`);
+  const sorted = matches.slice().sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+  const latest = sorted[0];
+  return {
+    requestId: latest.requestId,
+    entry: latest,
+    ambiguous: sorted.length > 1 ? { matched: sorted.length, candidates: sorted.slice(0, 5).map((e) => e.requestId) } : undefined,
+  };
+}
+
+// Build the initiator chain response for a capture store (Map<requestId, entry>) + params.
+function buildInitiatorChain(stored, params) {
+  const byUrl = new Map();
+  for (const entry of stored.values()) {
+    if (entry && !byUrl.has(entry.url)) byUrl.set(entry.url, entry);
+  }
+  const target = pickInitiatorTarget(stored, params);
+  const ancestors = [];
+  const visited = new Set([target.requestId]);
+  let current = target.entry;
+  let hops = 0;
+  while (current && hops < INITIATOR_CHAIN_MAX_DEPTH) {
+    const linkUrl = initiatorLinkUrl(current, byUrl);
+    const parent = linkUrl ? byUrl.get(linkUrl) : null;
+    if (!parent || visited.has(parent.requestId)) break;
+    visited.add(parent.requestId);
+    ancestors.push(parent);
+    current = parent;
+    hops++;
+  }
+  ancestors.reverse(); // root-first: document/loader before the request that triggered ours
+  const dependents = params.includeDependents
+    ? collectInitiatorDependents(stored, byUrl, target.requestId)
+    : null;
+  return {
+    requestId: target.requestId,
+    url: target.entry.url || "",
+    method: target.entry.method || "GET",
+    resourceType: target.entry.resourceType || "",
+    status: typeof target.entry.status === "number" ? target.entry.status : null,
+    initiator: target.entry.initiator || null,
+    chain: ancestors.map(chainNodeFor),
+    ...(target.ambiguous ? { ambiguous: target.ambiguous } : {}),
+    ...(dependents ? { dependents: dependents.list.map((rid) => chainNodeFor(stored.get(rid))), dependentCount: dependents.count, dependentsTruncated: dependents.truncated } : {}),
+    chainDepthCapped: hops >= INITIATOR_CHAIN_MAX_DEPTH,
+  };
+}
+
 async function dispatch(action, params) {
   switch (action) {
     case "tab.version":
@@ -2632,6 +3200,19 @@ async function dispatch(action, params) {
         else if (body && body.error) entry.bodyError = body.error;
       }
       return { ...entry };
+    }
+    case "network.initiatorChain": {
+      // chrome_network_initiator_chain: rebuild the DevTools-style Request-initiator tree for one
+      // captured request (ancestor chain + optional reverse dependents) from the CDP capture
+      // store, which keeps the full initiator record captured at requestWillBeSent (M0).
+      const tab = await getTabByParams(params);
+      const stored = cdpNetworkEntries.get(tab.id);
+      if (!stored || stored.size === 0) {
+        throw new Error(
+          "No CDP network entries captured for this tab — enable chrome_network_capture and reload the page before asking for an initiator chain",
+        );
+      }
+      return buildInitiatorChain(stored, params);
     }
     case "network.export": {
       const tab = await getTabByParams(params);
@@ -2937,6 +3518,13 @@ const INJECTED_HELPERS = new Set(["getPiChromeState", "installPiChromeInstrument
 async function executeInTab(params, func, args) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
+  // Paused-page rail (M0): a Debugger.paused page freezes the main thread; the injected page
+  // script would hang until its timeout. Auto-resume first and surface the pause prominently.
+  const pauseNote = await ensurePageUsable(tab.id, "in-page command");
+  const mergePauseNote = (v) => {
+    if (pauseNote && v && typeof v === "object" && !Array.isArray(v)) v.pausedAutoResumed = pauseNote;
+    return v;
+  };
 
   // Phase 1: define the helpers and the action function under the page's
   // window.__piChromeHelpers namespace via CDP Runtime.evaluate. This bypasses page CSP
@@ -2967,7 +3555,7 @@ async function executeInTab(params, func, args) {
     }
     const envelope = res && res.result && res.result.value;
     if (envelope && envelope.ok === false) throw new Error(envelope.error || "Chrome page script failed");
-    return envelope && envelope.ok === true ? envelope.value : undefined;
+    return mergePauseNote(envelope && envelope.ok === true ? envelope.value : undefined);
   }
   const results = await executeScriptTimed({
     target: { tabId: tab.id },
@@ -2990,7 +3578,7 @@ async function executeInTab(params, func, args) {
   if (envelope && typeof envelope === "object" && envelope.ok === false) {
     throw new Error(envelope.error || "Chrome page script failed");
   }
-  return envelope?.value;
+  return mergePauseNote(envelope?.value);
 }
 
 // Serializer for page.evaluate results. Embedded (via .toString()) into the CDP-evaluated
@@ -3026,6 +3614,9 @@ async function evaluateInTab(params) {
 // on every 250ms iteration — tab-enumeration).
 async function evaluateInResolvedTab(tab, params) {
   if (params.foreground) await bringToFront(tab);
+  // Paused-page rail (M0): Runtime.evaluate on a Debugger.paused page hangs until the CDP
+  // timeout. Auto-resume first; the pause is surfaced via console.warn + the diagnostics ring.
+  const pauseNote = await ensurePageUsable(tab.id, "evaluate");
   const expression = String(params.expression ?? "");
   const stringifySrc = `(${piEvalStringify.toString()})`;
   // Wrap the user expression so the result is run through piEvalStringify in-page before it
@@ -3053,6 +3644,9 @@ async function evaluateInResolvedTab(tab, params) {
     if (v.kind === "symbol") return `[Symbol: ${v.description}]`;
     if (v.kind === "bigint") return v.value;
     if (v.kind === "error") throw new Error(`${v.name}: ${v.message}\n${v.stack || ""}`);
+  }
+  if (pauseNote) {
+    console.warn(`[pi-chrome] page was paused (${pauseNote.reason}); auto-resumed before evaluate`);
   }
   return v;
 }
@@ -3243,6 +3837,9 @@ async function snapshotInTab(params) {
   const resolution = {};
   const tab = await getTabByParams(params, { resolution });
   if (params.foreground) await bringToFront(tab);
+  // Paused-page rail (M0): the snapshot script injected into a Debugger.paused page never runs;
+  // auto-resume first and surface the pause in the snapshot result.
+  const pauseNote = await ensurePageUsable(tab.id, "snapshot");
   // Trailing budget args are the service-worker-side hookup for the snippet's single budgeted
   // TreeWalker pass (node + wall-clock budgets): the values are passed positionally (args 8/9)
   // and read by snapshot_injected.js when it grows optional params (budget-exhausted).
@@ -3264,6 +3861,9 @@ async function snapshotInTab(params) {
   await mergeSubframeSnapshots(tab, snapshot, args);
   if (snapshot && typeof snapshot === "object" && isBlankAutomationTarget(tab, params, resolution)) {
     snapshot._blankAutomationTab = true;
+  }
+  if (pauseNote && snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)) {
+    snapshot.pausedAutoResumed = pauseNote;
   }
   return snapshot;
 }
@@ -3440,6 +4040,13 @@ function waitForTabComplete(tabId, timeoutMs) {
 async function takeScreenshot(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
+  // Paused-page rail (M0): capture commands sent to a Debugger.paused page hang (the renderer
+  // cannot composite a frame); auto-resume first and surface the pause in the result.
+  const pauseNote = await ensurePageUsable(tab.id, "screenshot");
+  const mergePauseNote = (obj) => {
+    if (pauseNote && obj && typeof obj === "object" && !Array.isArray(obj)) obj.pausedAutoResumed = pauseNote;
+    return obj;
+  };
   // Element-scoped screenshots (feat-element-screenshot): resolve uid/selector to a viewport
   // rect and capture through the attached CDP debugger, which works on inactive tabs — so
   // background mode never activates the tab (no focus/restore churn like captureVisibleTab).
@@ -3483,7 +4090,7 @@ async function takeScreenshot(params) {
       format: params.format || "png",
       quality: params.format === "jpeg" ? params.quality : undefined,
     });
-    return { dataUrl, tab: await formatTab(tab) };
+    return mergePauseNote({ dataUrl, tab: await formatTab(tab) });
   } finally {
     // Restore the previous active tab before returning so the user is not left on the Pi tab
     // when this was a background capture (screenshot-tiles).
@@ -4750,21 +5357,16 @@ async function handleDialogNow(tabId, info, params) {
 
 // =================== chrome_emulate (feat-emulate) ===================
 // Device metrics / UA / touch emulation via CDP Emulation.* on the session automation tab.
-// Emulation overrides live on the CDP target, so after `set` we extend the attach keepalive and
-// remember the state so `clear` (or a re-attach) can reset it.
+// Emulation overrides live on the CDP target, so after `set` we register MODE_EMULATE (extends
+// the attach keepalive + persists intent + re-applies on re-attach) and remember the state so
+// `clear` (or a re-attach) can reset it. Extracted apply/clear helpers are the re-apply hooks.
 async function chromeEmulate(params) {
   const tab = await getTabByParams(params);
   await attachDebugger(tab.id);
   if (params.action === "clear") {
-    await cdp(tab.id, "Emulation.clearDeviceMetricsOverride").catch(() => undefined);
-    await cdp(tab.id, "Emulation.setTouchEmulationEnabled", { enabled: false }).catch(() => undefined);
-    if (params.ua) {
-      try {
-        await cdp(tab.id, "Emulation.setUserAgentOverride", { userAgent: String(params.ua) });
-        await cdp(tab.id, "Network.setUserAgentOverride", { userAgent: String(params.ua) }).catch(() => undefined);
-      } catch {}
-    }
+    await clearEmulationOverrides(tab.id, params);
     emulatedTabs.delete(tab.id);
+    unregisterMode(tab.id, MODE_EMULATE);
     return { action: "clear", cleared: true };
   }
   const width = Math.max(200, Math.round(Number(params.width) || 1280));
@@ -4774,24 +5376,49 @@ async function chromeEmulate(params) {
   // Touch emulation is ON by default when setting metrics: the touch benchmark requires real
   // TouchEvents, which the renderer only synthesizes while touch emulation is enabled.
   const touch = params.touch !== false;
-  await cdp(tab.id, "Emulation.setDeviceMetricsOverride", {
-    width, height, deviceScaleFactor, mobile,
-    screenWidth: width, screenHeight: height,
+  const overrides = {
+    width, height, deviceScaleFactor, mobile, touch,
+    ua: params.ua ? String(params.ua) : null,
+    platform: params.platform ? String(params.platform) : null,
+    acceptLanguage: params.acceptLanguage ? String(params.acceptLanguage) : null,
+  };
+  await applyEmulationOverrides(tab.id, overrides);
+  emulatedTabs.set(tab.id, overrides);
+  registerMode(tab.id, MODE_EMULATE);
+  return { action: "set", width, height, deviceScaleFactor, mobile, touch, ua: params.ua ? String(params.ua) : null };
+}
+
+// Apply a full emulation override snapshot (used by chromeEmulate set AND the M0 re-apply hook).
+async function applyEmulationOverrides(tabId, o) {
+  if (!o || typeof o !== "object") return;
+  await cdp(tabId, "Emulation.setDeviceMetricsOverride", {
+    width: o.width || 1280, height: o.height || 800,
+    deviceScaleFactor: o.deviceScaleFactor || 1, mobile: o.mobile === true,
+    screenWidth: o.width || 1280, screenHeight: o.height || 800,
     positionX: 0, positionY: 0,
   });
-  if (params.ua) {
-    await cdp(tab.id, "Emulation.setUserAgentOverride", {
-      userAgent: String(params.ua),
-      ...(params.platform ? { platform: String(params.platform) } : {}),
-      ...(params.acceptLanguage ? { acceptLanguage: String(params.acceptLanguage) } : {}),
+  if (o.ua) {
+    await cdp(tabId, "Emulation.setUserAgentOverride", {
+      userAgent: String(o.ua),
+      ...(o.platform ? { platform: String(o.platform) } : {}),
+      ...(o.acceptLanguage ? { acceptLanguage: String(o.acceptLanguage) } : {}),
     });
-    await cdp(tab.id, "Network.setUserAgentOverride", { userAgent: String(params.ua) }).catch(() => undefined);
+    await cdp(tabId, "Network.setUserAgentOverride", { userAgent: String(o.ua) }).catch(() => undefined);
   }
-  await cdp(tab.id, "Emulation.setTouchEmulationEnabled", { enabled: touch, maxTouchPoints: touch ? 5 : 1 });
-  const entry = attachedTabs.get(tab.id);
-  if (entry) entry.detachAt = Date.now() + EMULATE_ATTACH_KEEPALIVE_MS;
-  emulatedTabs.set(tab.id, { width, height, deviceScaleFactor, mobile, touch, ua: params.ua ? String(params.ua) : null, platform: params.platform ? String(params.platform) : null });
-  return { action: "set", width, height, deviceScaleFactor, mobile, touch, ua: params.ua ? String(params.ua) : null };
+  await cdp(tabId, "Emulation.setTouchEmulationEnabled", { enabled: o.touch !== false, maxTouchPoints: o.touch !== false ? 5 : 1 });
+}
+
+// Reset emulation overrides. Preserves the legacy chromeEmulate clear semantics: a `ua` passed
+// alongside clear re-applies a UA override after metrics are reset.
+async function clearEmulationOverrides(tabId, params) {
+  await cdp(tabId, "Emulation.clearDeviceMetricsOverride").catch(() => undefined);
+  await cdp(tabId, "Emulation.setTouchEmulationEnabled", { enabled: false }).catch(() => undefined);
+  if (params && params.ua) {
+    try {
+      await cdp(tabId, "Emulation.setUserAgentOverride", { userAgent: String(params.ua) });
+      await cdp(tabId, "Network.setUserAgentOverride", { userAgent: String(params.ua) }).catch(() => undefined);
+    } catch {}
+  }
 }
 
 // =================== chrome_storage (feat-storage) ===================
@@ -5012,13 +5639,18 @@ function cdpRemoteValue(obj) {
 async function chromePerfMetrics(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
+  // Paused-page rail (M0): Performance.getMetrics needs the renderer, which a Debugger.paused
+  // page freezes — auto-resume first.
+  const pauseNote = await ensurePageUsable(tab.id, "perf metrics");
   await attachDebugger(tab.id);
   await cdp(tab.id, "Performance.enable").catch(() => undefined);
   const res = await cdp(tab.id, "Performance.getMetrics");
   const metrics = Array.isArray(res?.metrics)
     ? res.metrics.map((m) => ({ name: m.name, value: m.value }))
     : [];
-  return { metrics, tab: await formatTab(tab) };
+  const result = { metrics, tab: await formatTab(tab) };
+  if (pauseNote) result.pausedAutoResumed = pauseNote;
+  return result;
 }
 
 function normalizeKey(key) {
