@@ -56,6 +56,24 @@ We benchmark in public — see [`../test-suite/`](../test-suite). Where exact sc
 5. **Multi-session shared bridge.** Planner + worker + audit Pi sessions all drive the same Chrome concurrently.
 6. **Stable element uids.** `chrome_snapshot` returns deterministic uids you can pass to subsequent actions — similar to BrowserGym's `bid`, but built into the snapshot tool itself.
 
+### The P0 DevTools toolset: a debugger, not a clicker
+
+The P0 batch adds a 21-tool DevTools surface on the same extension bridge — no new permissions. These positioning bullets are grounded in tools that ship in the P0 batch, not roadmap:
+
+1. **Causality, not logs.** `chrome_network_initiator_chain` rebuilds the DevTools request-initiator tree (document → loader → script → call-frame) for any captured request, and `chrome_network_summary` turns the same capture into waterfall analytics — the agent gets *why* a request fired and *who* fired it.
+2. **Renderer truth instead of heuristics.** `chrome_computed_style`, `chrome_box_model`, and `chrome_dom_at_point` answer "why is this hidden / offset / intercepting" with engine-computed styles, box-model quads, and a real `DOM.getNodeForLocation` hit-test (shadow-DOM and `pointer-events` aware) — the in-page `occluderAt` heuristic is no longer the only answer.
+3. **A live runtime, not a snapshot.** `chrome_get_properties` expands objects DevTools-style (previews, own/inherited, getter descriptors) and `chrome_watch_expression` polls live expressions — watch a value change instead of re-snapshotting the page.
+4. **Reproducible style contexts.** `chrome_emulate_media` (dark mode, reduced-motion, forced-colors, print, contrast, vision deficiency, focus, CPU throttle) plus `chrome_emulate`'s locale / timezone / geolocation / idle overrides make "dark + reduced-motion at 375px" one command away — and the overrides survive re-attach via the keepalive registry.
+5. **A network control plane.** `chrome_network_throttle` (offline / latency / throughput) and `chrome_network_cache` flip connection conditions without touching DevTools.
+6. **Memory hygiene.** `chrome_collect_garbage` + `chrome_memory_counters` (the DevTools DOM-counters trio + heap sizes) give leak runs a clean baseline and evidence to report.
+7. **Deterministic visual QA.** `chrome_full_page_screenshot` (one-shot `captureBeyondViewport`) removes the tile-stitch focus churn, and `chrome_scroll_to` returns a post-scroll rect + visibility verdict instead of a blind scroll.
+8. **Storage triage.** `chrome_indexeddb_query` opens the IndexedDB surface (index/range queries, counts, metadata, store clearing) that the storage tools previously only listed.
+9. **Event forensics.** `chrome_event_listeners` inventories every listener on a node (type, source, `useCapture`, `passive`, `once`) — the first step in "why does this never fire".
+10. **Environment fingerprint.** `chrome_browser_info` (version / OS / UA / command line) and `chrome_targets` (every CDP target: pages, workers, service workers, extensions) give the agent — and your bug report — full context in one call.
+11. **Real HTML5 drop.** `chrome_drop` dispatches `Input.dispatchDragEvent` with a real `DataTransfer` payload (string and file items), so drop handlers actually fire — synthetic mouse moves never did.
+
+Combined with the shared M0 plumbing underneath (uid/selector → CDP nodeId resolver, keepalive mode registry, non-destructive domain enable, paused-page auto-resume rail), this is the foundation of the roadmap's P1/P2 batches: full Debugger breakpoints/stepping, WebSocket frames, Fetch interception, tracing, heap snapshots, and session replay.
+
 ---
 
 ## Axis 2 — agent frameworks (built on top of axis 1)

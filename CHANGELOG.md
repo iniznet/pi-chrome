@@ -2,6 +2,51 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## Unreleased — P0 DevTools batch
+
+The first milestone of the 75-tool debugging/analysis roadmap
+(`tasks/devtools-gap-report.md`): pi-chrome grows from an automation harness
+into an agent-driven DevTools surface. Everything rides the existing bridge +
+`chrome.debugger` plumbing — **no new manifest permissions**. 19 new tools, 2
+extended (`chrome_emulate`, plus `chrome_network_initiator_chain` landing here).
+
+- **Renderer truth.** `chrome_computed_style` (full/filtered computed-style maps
+  for a uid/selector), `chrome_box_model` (content/padding/border/margin quads),
+  `chrome_dom_at_point` (renderer hit-test at x,y — shadow-DOM and
+  `pointer-events` aware), `chrome_node_html` (outerHTML + full attribute list).
+- **JS runtime inspection.** `chrome_get_properties` (DevTools-style object
+  expansion with previews and getter descriptors), `chrome_watch_expression`
+  (live-expression polling time-series), `chrome_event_listeners` (listener
+  inventory with `useCapture` / `passive` / `once`).
+- **Style & environment emulation.** `chrome_emulate_media` (prefers-color-scheme,
+  reduced-motion, forced-colors, print, prefers-contrast, vision deficiency,
+  focus, auto-dark, CPU throttle) and extended `chrome_emulate` (locale,
+  timezone, geolocation, idle overrides) — persisted and re-applied across the
+  MV3 keepalive.
+- **Network control & causality.** `chrome_network_summary` (waterfall/aggregate
+  analytics from existing capture), `chrome_network_cache` (HTTP-cache on/off),
+  `chrome_network_throttle` (offline/latency/throughput),
+  `chrome_network_initiator_chain` (the DevTools request-initiator chain tree:
+  document → loader → script → call-frame, plus reverse dependents). Network
+  capture now stores the full `initiator` object including capped stack/parent
+  chains instead of only `initiatorType`.
+- **Memory hygiene.** `chrome_collect_garbage` (forced GC baseline) and
+  `chrome_memory_counters` (DOM-counters trio + heap sizes + leak-prep hook).
+- **Storage triage.** `chrome_indexeddb_query` — index/range queries, counts,
+  clear store, delete entries, metadata — via extended `chrome_storage` actions.
+- **Input & visual QA.** `chrome_drop` (real HTML5 drag-and-drop with
+  `DataTransfer` string/file items), `chrome_full_page_screenshot` (one-shot
+  `captureBeyondViewport:true` with scale/jpeg/clip variants), `chrome_scroll_to`
+  (deterministic scroll-into-view + post-scroll rect/visibility verdict).
+- **Browser & target intelligence.** `chrome_browser_info` (version/OS/UA/
+  command-line fingerprint) and `chrome_targets` (full CDP target listing —
+  pages, workers, service workers, extensions — no attach needed).
+- **M0 shared plumbing (foundation).** uid/selector → CDP nodeId resolver
+  (`resolveCdpNode`), keepalive mode registry (`keepaliveModes`/`modesPerTab`),
+  non-destructive domain-enable helper (`enableCdpDomain`), paused-state tracker
+  + auto-resume rail (`ensurePageUsable`), and full initiator capture
+  (`captureInitiator`) — the foundation the P1/P2 batches build on.
+
 ## 0.15.47 — 2026-08-28
 
 - **Snapshot/inspect work on restricted-scheme URLs.** `chrome_snapshot` (and `chrome_evaluate`, console/network, `chrome_wait_for`) previously failed on a freshly created automation tab with `Cannot access contents of url "about:blank"` — `chrome.scripting.executeScript` cannot inject into browser-internal/opaque origins (`about:`, `chrome:`, `edge:`, `devtools:`, `view-source:`, `file:`) even with `<all_urls>`. These pages now fall back to the CDP debugger path (`Runtime.evaluate`, which bypasses the host-permission check), so the agent can snapshot/inspect a blank automation tab. The restricted detection resolves the authoritative tab URL, so an automation target with an empty `url` is still routed through the fallback instead of failing.

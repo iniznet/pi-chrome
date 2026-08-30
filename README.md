@@ -71,8 +71,46 @@ Second doctor run should show all checks passing.
 - Capture screenshots for bugs, PRs, and demos.
 - Inspect console logs and captured `fetch`/`XMLHttpRequest` responses.
 - Manage tabs without taking over your active window.
+- Debug like DevTools: computed styles, box models, real hit-tests, event listeners, object expansion, live-expression watching, request-initiator chains, network throttling/caching, GC + memory counters, media/environment emulation, and IndexedDB queries.
 
 Tool parameters and gotchas are documented inline in Pi.
+
+---
+
+## P0 DevTools toolset
+
+The P0 batch turns pi-chrome from an automation harness into a debugging
+**toolset**. On top of the existing input / screenshot / network / storage core,
+agents now get 21 DevTools-grade primitives — no new Chrome permissions
+required (they ride the existing `debugger` permission):
+
+| Tool | Purpose |
+| --- | --- |
+| `chrome_computed_style` | Full or filtered computed-style map for a uid/selector — *why is this hidden / offset / transparent*.
+| `chrome_box_model` | Content / padding / border / margin quads + dimensions for a node.
+| `chrome_dom_at_point` | Renderer-truth hit-test at x,y (shadow-DOM and `pointer-events` aware) — no in-page heuristic.
+| `chrome_node_html` | `outerHTML` + full attribute list for a uid/selector.
+| `chrome_emulate_media` | Emulate `prefers-color-scheme`, `reduced-motion`, `forced-colors`, print, `prefers-contrast`, vision deficiency, focus, auto-dark, and CPU throttle.
+| `chrome_emulate` (extended) | Locale, timezone, geolocation, and idle overrides on top of device metrics/UA/touch.
+| `chrome_get_properties` | DevTools-style object expansion via `Runtime.getProperties` — previews, own/inherited, getter descriptors.
+| `chrome_watch_expression` | Live-expression polling — a value time-series over a duration (DevTools live-expression semantics).
+| `chrome_network_summary` | Waterfall + aggregate analytics from captured traffic: slowest, failed, status distribution, bytes by type, cache hits.
+| `chrome_network_cache` | Enable / disable the HTTP cache.
+| `chrome_network_throttle` | Offline / latency / throughput emulation.
+| `chrome_collect_garbage` | Forced GC for a clean baseline before memory metrics.
+| `chrome_memory_counters` | DevTools "DOM Counters" trio (nodes / JS listeners / documents) + heap sizes + leak-prep hook.
+| `chrome_indexeddb_query` | IndexedDB index/range queries, counts, clear store, delete entries, metadata (extended `chrome_storage` actions).
+| `chrome_event_listeners` | Event-listener inventory: type, source, `useCapture`, `passive`, `once`.
+| `chrome_drop` | Real HTML5 drag-and-drop with `DataTransfer` items/files.
+| `chrome_full_page_screenshot` | Single-shot full-page capture via `captureBeyondViewport:true` (scale / jpeg / clip variants; tile path stays as fallback).
+| `chrome_scroll_to` | Deterministic scroll-into-view + post-scroll rect / visibility verdict.
+| `chrome_browser_info` | Browser / OS / UA / command-line fingerprint.
+| `chrome_targets` | Full CDP target intelligence (pages, workers, service workers, extensions) — no attach needed.
+| `chrome_network_initiator_chain` | DevTools-style **request-initiator chain** for any captured request: who triggered it (document → loader → script → call-frame) and, optionally, what it triggered in turn.
+
+Most of these tools resolve elements by snapshot uid or CSS selector, and all of
+them honor the usual tab-resolution params (`targetId` / `urlIncludes` /
+`titleIncludes`). Full usage is documented inline in Pi.
 
 ---
 
