@@ -77,12 +77,20 @@ Tool parameters and gotchas are documented inline in Pi.
 
 ---
 
-## P0 DevTools toolset
+## DevTools toolset (75 tools)
 
-The P0 batch turns pi-chrome from an automation harness into a debugging
-**toolset**. On top of the existing input / screenshot / network / storage core,
-agents now get 21 DevTools-grade primitives — no new Chrome permissions
-required (they ride the existing `debugger` permission):
+pi-chrome is an agent-driven DevTools surface. On top of the existing input /
+screenshot / network / storage core, agents get **75 DevTools-grade
+primitives** across four batches (P0/P1A/P1B/P2) — no new Chrome permissions
+required (they all ride the existing `debugger` permission). Beyond the P0
+table below, the P1A batch adds a live debugger (breakpoints, pause/step,
+call-stack, in-frame evaluation), console/exception capture, and network
+interception/causality; P1B adds CSS cascade / a11y trees, mutation waits,
+service-worker + storage control, layout metrics, animations, PDF export and
+CPU/coverage profiling; P2 adds DOM/CSS/a11y audits, tracing and heap
+snapshots (file exports), session recording, background-service + storage
+watch, event/DOM breakpoints, virtual time, device matrices, MHTML and TLS
+surfaces. The P0 primitives:
 
 | Tool | Purpose |
 | --- | --- |

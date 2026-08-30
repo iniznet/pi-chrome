@@ -2,13 +2,20 @@
 
 All notable user-facing changes to `pi-chrome`.
 
-## Unreleased — P0 DevTools batch
+## 0.16.0 — 2026-08-30
 
-The first milestone of the 75-tool debugging/analysis roadmap
-(`tasks/devtools-gap-report.md`): pi-chrome grows from an automation harness
-into an agent-driven DevTools surface. Everything rides the existing bridge +
-`chrome.debugger` plumbing — **no new manifest permissions**. 19 new tools, 2
-extended (`chrome_emulate`, plus `chrome_network_initiator_chain` landing here).
+**The full 75-tool DevTools surface** (`tasks/devtools-gap-report.md`):
+pi-chrome grows from an automation harness into an agent-driven DevTools
+surface. Everything rides the existing bridge + `chrome.debugger` plumbing —
+**no new manifest permissions**. 54 new tools shipped across the P0 / P1A /
+P1B / P2 batches, plus the M0 shared-plumbing foundation (node resolver,
+keepalive registry, non-destructive domain enables, auto-resume pause rail,
+full initiator capture).
+
+### P0 batch (21 tools)
+
+The first milestone: 19 new tools, 2 extended (`chrome_emulate`, plus
+`chrome_network_initiator_chain` landing here).
 
 - **Renderer truth.** `chrome_computed_style` (full/filtered computed-style maps
   for a uid/selector), `chrome_box_model` (content/padding/border/margin quads),
@@ -46,6 +53,70 @@ extended (`chrome_emulate`, plus `chrome_network_initiator_chain` landing here).
   non-destructive domain-enable helper (`enableCdpDomain`), paused-state tracker
   + auto-resume rail (`ensurePageUsable`), and full initiator capture
   (`captureInitiator`) — the foundation the P1/P2 batches build on.
+
+### P1A batch (14 tools) — debugger family + console/network deep-dive
+
+- **Live debugger.** `chrome_breakpoint` (URL breakpoints, persisted across
+  re-attach), `chrome_pause`/`chrome_resume`/`chrome_step` (into/over/out),
+  `chrome_get_call_stack` (cached frames + scope previews),
+  `chrome_evaluate_in_frame` (read/write locals on a paused call frame),
+  `chrome_get_script_source`, `chrome_set_pause_on_exceptions`, and
+  `chrome_capture_fetch_stack` (one-shot XHR breakpoints that auto-resume).
+- **Console & exceptions.** `chrome_list_js_exceptions` (exception ring with
+  stacks), `chrome_console_capture` (persistent console/log/exception capture,
+  merged chronologically), `chrome_browser_log` (Log domain entries).
+- **Network deep-dive.** `chrome_network_cause` (extraInfo headers, blocked/
+  associated cookies, securityDetails, blockedReason, redirect chains),
+  `chrome_network_headers` (injected headers — values redacted from history),
+  `chrome_network_intercept` (Fetch interception with a 30s auto-continue
+  safety rail and a bounded paused-request ring), `chrome_websocket_messages`
+  (full WS frame timeline, payloads preview-capped).
+
+### P1B batch (23 tools) — CSS/A11y + input/events + storage/system/visual/perf
+
+- **CSS.** `chrome_matched_css_rules` (full cascade with origin/specificity),
+  `chrome_force_pseudo_state` (:hover/:focus etc., persisted), `chrome_media_queries`,
+  `chrome_background_colors` (contrast-aware color stack), `chrome_platform_fonts`.
+- **A11y.** `chrome_a11y_tree` (depth-pruned AX tree with role histogram,
+  summary-only for huge trees), `chrome_a11y_node` (per-node AX with ignored
+  reasons).
+- **Input/events.** `chrome_mutation_wait` (MutationObserver wait, disconnect-
+  guaranteed), `chrome_input_lock` (ignore input — auto-cleared on detach),
+  `chrome_touch_gesture` (tap/touch/pinch/scroll gestures).
+- **Storage.** `chrome_storage_usage`, `chrome_cache_storage` (CacheStorage
+  list/read/delete), `chrome_clear_site_data` (destructive gate: explicit
+  `confirm` + origin required).
+- **System/browser.** `chrome_service_worker` (list/start/stop/unregister/
+  inspect), `chrome_system_info` (version-degraded gracefully),
+  `chrome_target_evaluate` (attach→evaluate→detach on any CDP target),
+  `chrome_set_permission`.
+- **Visual/perf.** `chrome_layout_metrics` (geometry + overflow/CLS scan),
+  `chrome_animations` (list/pause/resume/seek/rate), `chrome_pdf` (file export
+  under `.pi/chrome-pdf/`, headless-gated), `chrome_cpu_profile`
+  (start/stop + top-self-time summary), `chrome_coverage` (JS+CSS unused-byte
+  tables).
+
+### P2 batch (16 tools) — full-page & audit/trace/heap/record capabilities
+
+- **Snapshots & audits.** `chrome_dom_snapshot` (DOMSnapshot capture → file),
+  `chrome_css_audit` (500-element cap), `chrome_a11y_audit` (Lighthouse-lite
+  contrast report).
+- **Profiling.** `chrome_trace` (curated Tracing categories → file with
+  plain-language hot-path summary), `chrome_heap_snapshot` (chunk-streamed
+  `.heapsnapshot` with SW-side summary parse, file export),
+  `chrome_allocation_profile` (sampling start/stop + tracking).
+- **Replay & monitoring.** `chrome_record_session` (time-correlated
+  mutation/console/network/screenshot timeline → file),
+  `chrome_background_service` (background-fetch/sync/push events),
+  `chrome_watch_storage` (IndexedDB/CacheStorage change tracking).
+- **Breakpoints & input.** `chrome_event_breakpoint` (event-listener
+  breakpoints, auto-resume rail), `chrome_dom_breakpoint` (DOM breakpoints via
+  the node resolver), `chrome_ime_compose` (IME composition).
+- **Emulation & visual.** `chrome_virtual_time` (virtual-time policy +
+  budget-expired handling; never combined with PDF), `chrome_device_matrix`
+  (per-profile emulation + screenshot artifacts), `chrome_snapshot_mhtml`
+  (MHTML archive, size-capped with clear hint),
+  `chrome_network_tls` (certificate/SAN surface).
 
 ## 0.15.47 — 2026-08-28
 
