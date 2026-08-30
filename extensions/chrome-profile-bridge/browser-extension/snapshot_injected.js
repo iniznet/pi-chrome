@@ -860,6 +860,56 @@
     return { target: summary, ancestors, nearbyText, nearbyActions, formContext, clickSuggestion };
   }
 
+  // P1B chrome_mutation_wait: MutationObserver-based wait. Self-contained Promise (disconnects
+  // the observer before resolving, bounded records + timeout) so the SW can drive it through
+  // cdpEval's awaitPromise. Reuses rememberElement/textOf for record targets.
+  function waitForMutation(element, opts) {
+    const { attributeFilter = [], childList = false, subtree = true, timeoutMs = 10000, maxRecords = 100 } = opts || {};
+    const records = [];
+    const cap = Math.max(1, Math.min(maxRecords, 200));
+    const budget = Math.max(100, Math.min(timeoutMs, 30000));
+    return new Promise((resolve) => {
+      const describeTarget = (node) => {
+        if (!node || typeof node.nodeType !== "number") return null;
+        if (node.nodeType === 1) {
+          return { tag: node.tagName ? node.tagName.toLowerCase() : "?", id: node.id || null, uid: rememberElement(node) };
+        }
+        if (node.nodeType === 3) return { text: textOf(node, 120) };
+        if (node.nodeType === 8) return { comment: true };
+        return { nodeType: node.nodeType };
+      };
+      const config = { subtree: subtree !== false };
+      if (attributeFilter.length) { config.attributes = true; config.attributeFilter = attributeFilter.slice(0, 20); }
+      else config.attributes = true;
+      if (childList) config.childList = true;
+      let settled = false;
+      const finish = (timedOut) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        observer.disconnect();
+        resolve({ timedOut, records, count: records.length, observedAttributes: attributeFilter.length ? attributeFilter.slice(0, 20) : null });
+      };
+      const observer = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          if (records.length >= cap) break;
+          records.push({
+            type: m.type,
+            target: describeTarget(m.target),
+            attributeName: m.attributeName || null,
+            oldValue: m.oldValue !== null ? String(m.oldValue).slice(0, 500) : null,
+            addedNodes: m.addedNodes.length,
+            removedNodes: m.removedNodes.length,
+          });
+        }
+        if (records.length >= cap) finish(false);
+      });
+      observer.observe(element, config);
+      const timer = setTimeout(() => finish(true), budget);
+    });
+  }
+
   globalThis.__piChromeSnapshotPage = snapshotPage;
   globalThis.__piChromeInspectTarget = inspectTarget;
+  globalThis.__piChromeWaitForMutation = waitForMutation;
 })();

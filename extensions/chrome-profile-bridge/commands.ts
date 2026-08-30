@@ -1149,3 +1149,284 @@ export class BridgeJournal {
 		}
 	}
 }
+
+// ---- P1B formatters (CSS/A11y + input/events + storage/system/visual/perf) ----
+
+export function formatMatchedRules(result: Record<string, unknown>): string {
+	const node = (result.node ?? {}) as Record<string, unknown>;
+	const rules = Array.isArray(result.matchedRules) ? (result.matchedRules as Array<Record<string, unknown>>) : [];
+	const lines = [`Matched CSS rules${node.uid ? ` for ${String(node.uid)}` : ""} (${rules.length}${result.truncated ? "+" : ""}):`];
+	for (const r of rules.slice(0, 30)) {
+		const spec = r.specificity as Array<number> | Record<string, unknown> | null | undefined;
+		let specText = "";
+		if (Array.isArray(spec)) specText = ` (${Number(spec[0] ?? 0)}-${Number(spec[1] ?? 0)}-${Number(spec[2] ?? 0)})`;
+		else if (spec) specText = ` (${Number(spec.a)}-${Number(spec.b)}-${Number(spec.c)})`;
+		const origin = r.origin ? ` [${String(r.origin)}]` : "";
+		const props = Array.isArray(r.properties) ? (r.properties as Array<Record<string, unknown>>).slice(0, 5).map((p) => `${String(p.name)}:${String(p.value)}${p.important ? "!important" : ""}`).join("; ") : "";
+		lines.push(`  ${String(r.group ?? "matched")}${origin} ${String(r.selectorText ?? "(inline)")}${specText} → ${props}${(Array.isArray(r.properties) ? r.properties.length : 0) > 5 ? " …" : ""}`);
+	}
+	if (rules.length > 30) lines.push(`  … ${rules.length - 30} more`);
+	const inline = result.inlineStyle as Record<string, unknown> | null | undefined;
+	if (inline) lines.push(`inline: ${compactLine(String(inline.cssText ?? ""), 160)}`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatPseudoState(result: Record<string, unknown>): string {
+	if (result.cleared) return "Forced pseudo-classes cleared.";
+	const classes = Array.isArray(result.forcedPseudoClasses) ? (result.forcedPseudoClasses as string[]) : [];
+	return classes.length
+		? `Forcing pseudo-classes on node: ${classes.map((c) => `:${c}`).join(" ")} (mode active, survives re-attach).`
+		: "No pseudo-classes forced (empty set clears the force).";
+}
+
+export function formatMediaQueries(result: Record<string, unknown>): string {
+	const queries = Array.isArray(result.queries) ? (result.queries as Array<Record<string, unknown>>) : [];
+	const lines = [`Media queries (${queries.length}${result.truncated ? "+" : ""}):`];
+	for (const q of queries.slice(0, 40)) {
+		const sub = Array.isArray(q.mediaList) && q.mediaList.length ? ` — ${(q.mediaList as Array<Record<string, unknown>>).map((m) => String(m.text ?? "")).join(" | ")}` : "";
+		lines.push(`  ${String(q.source ?? "?")}: ${compactLine(String(q.text ?? ""), 120)}${sub}`);
+	}
+	if (queries.length > 40) lines.push(`  … ${queries.length - 40} more`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatBackgroundColors(result: Record<string, unknown>): string {
+	const colors = Array.isArray(result.backgroundColors) ? (result.backgroundColors as string[]) : [];
+	const lines = [`Background colors (${colors.length}): ${colors.slice(0, 12).join(" → ") || "(transparent)"}`];
+	if (result.computedFontSize || result.computedFontWeight) lines.push(`  font: ${String(result.computedFontSize ?? "?")} ${String(result.computedFontWeight ?? "?")}`);
+	if (result.contrastTextColor) lines.push(`  contrast text color: ${String(result.contrastTextColor)}`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatPlatformFonts(result: Record<string, unknown>): string {
+	const fonts = Array.isArray(result.fonts) ? (result.fonts as Array<Record<string, unknown>>) : [];
+	const lines = [`Platform fonts (${fonts.length}):`];
+	for (const f of fonts.slice(0, 20)) lines.push(`  ${String(f.familyName ?? "?")}${f.isCustomFont ? " (custom)" : ""} — ${Number(f.glyphCount) || 0} glyphs`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatA11yTree(result: Record<string, unknown>): string {
+	const summary = (result.summary ?? {}) as Record<string, unknown>;
+	const nodes = Array.isArray(result.nodes) ? (result.nodes as Array<Record<string, unknown>>) : [];
+	const roles = Array.isArray(summary.roleCounts) ? (summary.roleCounts as Array<Record<string, unknown>>) : [];
+	const lines = [`AX tree (${nodes.length} nodes, depth=${Number(result.depth) ?? "?"}${result.summaryOnly ? ", summary-only" : ""}):`];
+	for (const r of roles.slice(0, 15)) lines.push(`  ${String(r.role ?? "?")}: ${Number(r.count) || 0}`);
+	lines.push(`  ignored: ${Number(summary.ignored) || 0} of ${Number(summary.total) || 0}`);
+	for (const n of nodes.slice(0, 25)) {
+		if (n.ignored) {
+			const reasons = Array.isArray(n.ignoredReasons) && n.ignoredReasons.length ? ` (ignored: ${(n.ignoredReasons as string[]).slice(0, 2).join(", ")})` : " (ignored)";
+			lines.push(`  [${String(n.nodeId ?? "?")}] ${reasons}`);
+		} else {
+			lines.push(`  [${String(n.nodeId ?? "?")}] ${String(n.role ?? "?")} "${compactLine(String(n.name ?? ""), 80)}"`);
+		}
+	}
+	if (nodes.length > 25) lines.push(`  … ${nodes.length - 25} more`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatA11yNode(result: Record<string, unknown>): string {
+	// Both the SW shape ({ ax }) and the raw-node shape ({ nodes: [...] }) are supported.
+	let ax = result.ax as Record<string, unknown> | null | undefined;
+	if (!ax && Array.isArray(result.nodes)) ax = (result.nodes as Array<Record<string, unknown>>)[0] || null;
+	if (!ax) return "No accessibility node found.";
+	const lines = [`AX node ${String(ax.nodeId ?? "")}: role=${String(ax.role ?? "?")} name="${compactLine(String(ax.name ?? ""), 100)}"`];
+	if (ax.ignored) {
+		const reasons = Array.isArray(ax.ignoredReasons) ? (ax.ignoredReasons as Array<Record<string, unknown>>) : [];
+		lines.push(`  IGNORED: ${reasons.map((r) => String(r.reason ?? "?")).join(", ") || "no reason given"}`);
+	}
+	if (ax.description) lines.push(`  description: ${compactLine(String(ax.description), 100)}`);
+	if (ax.value) lines.push(`  value: ${compactLine(String(ax.value), 100)}`);
+	const props = Array.isArray(ax.properties) ? (ax.properties as Array<Record<string, unknown>>).slice(0, 10) : [];
+	for (const p of props) lines.push(`  ${String(p.name ?? "?")}=${compactLine(String(p.value ?? ""), 80)}`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatMutationWait(result: Record<string, unknown>): string {
+	const count = Array.isArray(result.records) ? (result.records as Array<Record<string, unknown>>).length : Number(result.count ?? result.mutations) || 0;
+	if (result.timedOut) return `No mutation within the wait window (${count} record(s) captured).`;
+	const records = Array.isArray(result.records) ? (result.records as Array<Record<string, unknown>>) : [];
+	const lines = [`Mutation observed (${count} record(s)):`];
+	for (const r of records.slice(0, 10)) {
+		const t = (r.target ?? {}) as Record<string, unknown>;
+		const target = t.tag ? `${String(t.tag)}${t.id ? `#${String(t.id)}` : ""}` : String(t.text ?? "?");
+		lines.push(`  ${String(r.type ?? "?")} on ${compactLine(target, 60)}${r.attributeName ? ` [attr ${String(r.attributeName)}]` : ""}${Number(r.addedNodes) ? ` +${Number(r.addedNodes)}` : ""}${Number(r.removedNodes) ? ` -${Number(r.removedNodes)}` : ""}`);
+	}
+	return truncateText(lines.join("\n"));
+}
+
+export function formatFetchStack(result: Record<string, unknown>): string {
+	if (!result.breakpointed && !result.captured) return `No XHR/fetch captured for ${String(result.url ?? "*")} within the wait window.`;
+	const stack = Array.isArray(result.stack) ? (result.stack as Array<Record<string, unknown>>) : [];
+	const frameCount = stack.length || Number(result.frames) || 0;
+	const lines = [`XHR/fetch to ${compactLine(String(result.url ?? ""), 80)} captured (${frameCount} frames):`];
+	for (const f of stack.slice(0, 20)) lines.push(`  at ${String(f.functionName ?? "(anonymous)")} (${compactLine(String(f.url ?? ""), 80)}:${Number(f.lineNumber)})`);
+	if (stack.length > 20) lines.push(`  … ${stack.length - 20} more`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatInputLock(result: Record<string, unknown>): string {
+	return result.ignoring
+		? "User input is ignored (automation-only). Released automatically on detach."
+		: "User input accepted again.";
+}
+
+export function formatGesture(result: Record<string, unknown>): string {
+	const type = String(result.type ?? "?");
+	const extra: string[] = [];
+	if (result.x !== undefined) extra.push(`x=${Number(result.x)}`);
+	if (result.y !== undefined) extra.push(`y=${Number(result.y)}`);
+	if (result.scaleFactor !== undefined) extra.push(`scale=${Number(result.scaleFactor)}`);
+	if (result.points !== undefined) extra.push(`points=${Number(result.points)}`);
+	return `Gesture ${type} dispatched${extra.length ? ` (${extra.join(", ")})` : ""}.`;
+}
+
+export function formatStorageUsage(result: Record<string, unknown>): string {
+	const lines = [`Storage usage for ${String(result.origin ?? "?")}:`];
+	lines.push(`  usage ${formatBytes(Number(result.usage) || 0)} / quota ${formatBytes(Number(result.quota) || 0)}`);
+	const breakdown = Array.isArray(result.usageBreakdown) ? (result.usageBreakdown as Array<Record<string, unknown>>) : [];
+	for (const b of breakdown.slice(0, 15)) lines.push(`  ${String(b.storageType ?? b.type ?? "?")}: ${formatBytes(Number(b.usage) || 0)}`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatCacheStorage(result: Record<string, unknown>): string {
+	const action = String(result.action ?? "list");
+	if (action === "list") {
+		const caches = Array.isArray(result.caches) ? (result.caches as Array<Record<string, unknown>>) : [];
+		const lines = [`Cache Storage for ${String(result.origin ?? "?")} (${caches.length}):`];
+		for (const c of caches.slice(0, 30)) lines.push(`  ${String(c.cacheName ?? "?")} (${String(c.cacheId ?? "?")})`);
+		return truncateText(lines.join("\n"));
+	}
+	if (action === "read") {
+		const entries = Array.isArray(result.entries) ? (result.entries as Array<Record<string, unknown>>) : [];
+		const lines = [`Cache entries (${entries.length}${result.truncated ? "+" : ""}):`];
+		for (const e of entries.slice(0, 20)) {
+			lines.push(`  ${String(e.requestMethod ?? "GET")} ${compactLine(String(e.requestURL ?? ""), 80)} → ${Number(e.responseStatus) ?? "?"}${e.responseBodyPreview ? ` body="${compactLine(String(e.responseBodyPreview), 50)}"${e.bodyPreviewTruncated ? "…" : ""}` : ""}`);
+		}
+		return truncateText(lines.join("\n"));
+	}
+	if (action === "deleteCache") return `Cache ${String(result.cacheId ?? "?")} deleted.`;
+	if (action === "deleteEntry") return `Entry ${compactLine(String(result.requestUrl ?? ""), 80)} deleted from cache ${String(result.cacheId ?? "?")}.`;
+	return safeJson(result);
+}
+
+export function formatClearSiteData(result: Record<string, unknown>): string {
+	return `Cleared site data for ${String(result.origin ?? "?")} (${String(result.storageTypes ?? "all")})${result.httpCacheCleared ? " + HTTP cache" : ""} — confirmed cleared.`;
+}
+
+export function formatServiceWorker(result: Record<string, unknown>): string {
+	const action = String(result.action ?? "list");
+	if (action !== "list") return `Service worker ${action} succeeded.`;
+	const versions = Array.isArray(result.versions) ? (result.versions as Array<Record<string, unknown>>) : [];
+	const registrations = Array.isArray(result.registrations) ? (result.registrations as Array<Record<string, unknown>>) : [];
+	const errors = Array.isArray(result.errors) ? (result.errors as Array<Record<string, unknown>>) : [];
+	const lines = [`Service workers (${registrations.length} registration(s), ${versions.length} version(s), ${errors.length} error(s)):`];
+	for (const reg of registrations.slice(0, 10)) lines.push(`  reg ${String(reg.registrationId ?? "?")} → ${compactLine(String(reg.scopeURL ?? ""), 90)}`);
+	for (const v of versions.slice(0, 20)) {
+		lines.push(`  v${String(v.versionId ?? "?")} ${String(v.status ?? "?")}/${String(v.runningStatus ?? "?")} ${compactLine(String(v.scriptURL ?? ""), 80)}`);
+	}
+	for (const e of errors.slice(0, 10)) lines.push(`  ✗ ${compactLine(String(e.errorMessage ?? ""), 110)} (${compactLine(String(e.sourceURL ?? ""), 60)})`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatSystemInfo(result: Record<string, unknown>): string {
+	// SW shape wraps the raw SystemInfo.getInfo payload in `info`; the raw CDP shape carries
+	// modelName/gpu at the top level (a page-target attach can return either).
+	if (result.degraded && !result.info && !result.modelName) return `System info unavailable on this Chrome build (page-target attach): ${String(result.error ?? "")}`;
+	const info = (result.info as Record<string, unknown> | null | undefined) || result;
+	const lines: string[] = [];
+	if (info) {
+		if (info.modelName) lines.push(`Model: ${String(info.modelName)}`);
+		lines.push(`Platform: ${String(info.platform ?? "")} ${String(info.platformVersion ?? "")} (${String(info.arch ?? "")}) — ${String(info.osVersion ?? "")}`);
+		const gpu = info.gpu as Record<string, unknown> | null | undefined;
+		if (gpu && Array.isArray(gpu.devices)) {
+			for (const d of (gpu.devices as Array<Record<string, unknown>>).slice(0, 3)) lines.push(`  GPU: ${String(d.vendorString ?? "")} ${String(d.deviceString ?? "")} (${String(d.driverVersion ?? "")})`);
+		} else if (gpu && gpu.deviceString) {
+			lines.push(`  GPU: ${String(gpu.deviceString)}${gpu.driverVersion ? ` (${String(gpu.driverVersion)})` : ""}`);
+		}
+	}
+	if (Array.isArray(result.processes)) {
+		const procs = result.processes as Array<Record<string, unknown>>;
+		lines.push(`Processes (${procs.length}):`);
+		for (const p of procs.slice(0, 20)) lines.push(`  ${String(p.type ?? "?")} #${Number(p.id) ?? "?"} cpu=${Number(p.cpuTime) ?? 0}s`);
+	}
+	if (result.degraded) lines.push("(some SystemInfo data unavailable — degraded)");
+	return truncateText(lines.join("\n"));
+}
+
+export function formatTargetEvaluate(result: Record<string, unknown>): string {
+	if (result.ok === false) return `Evaluation failed in target ${String(result.targetId ?? "")}: ${compactLine(String((result.exception as Record<string, unknown> | undefined)?.description ?? (result.exception as Record<string, unknown> | undefined)?.text ?? "error"), 200)}`;
+	const raw = result.result;
+	// ReturnByValue values come back bare (number/string); Runtime evaluation results can be
+	// wrapped ({ value }) — unwrap so the actual value is shown, not "[object Object]".
+	const value = raw && typeof raw === "object" && "value" in (raw as Record<string, unknown>) ? (raw as Record<string, unknown>).value : raw;
+	return `→ ${compactLine(value ?? "(undefined)", 200)}`;
+}
+
+export function formatSetPermission(result: Record<string, unknown>): string {
+	return result.degraded
+		? `${String(result.permission ?? "?")} for ${String(result.origin ?? "?")} NOT set (${String(result.error ?? "unavailable on this Chrome build")}).`
+		: `Permission ${String(result.permission ?? "?")} → ${String(result.setting ?? "prompt")} for ${String(result.origin ?? "?")}.`;
+}
+
+export function formatLayoutMetrics(result: Record<string, unknown>): string {
+	const lv = result.layoutViewport as Record<string, unknown> | null | undefined;
+	const cs = (result.cssContentSize ?? result.contentSize) as Record<string, unknown> | null | undefined;
+	const lines: string[] = [];
+	if (lv) lines.push(`Layout viewport: ${Number(lv.width)}x${Number(lv.height)} @ (${Number(lv.x)},${Number(lv.y)})`);
+	if (cs) lines.push(`Content size: ${Number(cs.width)}x${Number(cs.height)}`);
+	const overflow = result.overflow as Record<string, unknown> | null | undefined;
+	if (overflow) {
+		const items = Array.isArray(overflow.items) ? (overflow.items as Array<Record<string, unknown>>) : [];
+		lines.push(`Horizontal overflow: ${Number(overflow.count) || 0} element(s)${items.length ? " —" : ""}`);
+		for (const it of items.slice(0, 10)) lines.push(`  ${String(it.hint ?? it.tag ?? "?")} (${Number(it.left) ?? "?"}..${Number(it.right) ?? "?"} vs ${Number(it.viewport) ?? "?"})`);
+	}
+	const scrollables = Array.isArray(result.scrollableContainers) ? (result.scrollableContainers as Array<Record<string, unknown>>) : [];
+	if (scrollables.length) lines.push(`Scrollable containers: ${scrollables.length} (${scrollables.slice(0, 8).map((s) => String(s.hint ?? s.tag ?? "?")).join(", ")})`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatAnimations(result: Record<string, unknown>): string {
+	const action = String(result.action ?? "list");
+	if (action === "list") {
+		const anims = Array.isArray(result.animations) ? (result.animations as Array<Record<string, unknown>>) : [];
+		const lines = [`Animations (${anims.length} live${Number(result.pausedCount) ? `, ${Number(result.pausedCount)} paused` : ""}):`];
+		for (const a of anims.slice(0, 20)) {
+			const target = (a.target ?? {}) as Record<string, unknown> | null | undefined;
+			const t = target && target.tag ? `${String(target.tag)}${target.id ? `#${String(target.id)}` : ""}` : "?";
+			lines.push(`  ${String(a.id ?? "?")}${a.name ? ` "${compactLine(String(a.name), 40)}"` : ""} [${String(a.playState ?? "?")}] on ${t} rate=${Number(a.playbackRate) ?? 1}`);
+		}
+		return truncateText(lines.join("\n"));
+	}
+	if (action === "waitSettled") return result.settled ? `Animations settled (${Number(result.elapsedMs) || 0}ms).` : `Animations still running after ${Number(result.elapsedMs) || 0}ms.`;
+	return `${action} ${result.paused !== undefined ? (result.paused ? "paused" : "resumed") : "applied"}: animation ${String(result.animationId ?? "?")}`;
+}
+
+export function formatPdfResult(result: Record<string, unknown>): string {
+	if (result.path) return `PDF written to ${String(result.path)} (${Number(result.bytes) || 0} bytes).`;
+	if (!result.supported) return `PDF export unsupported: ${String(result.reason ?? "")} — ${String(result.hint ?? "")}`;
+	if (result.tooLarge) return `PDF too large for the bridge (${Number(result.base64Length) || 0} base64 chars). ${String(result.hint ?? "")}`;
+	return `PDF generated (${Math.round((Number(result.base64Length) || 0) * 0.75)} bytes) — written to file.`;
+}
+
+export function formatCpuProfile(result: Record<string, unknown>): string {
+	if (result.lost) return `CPU profile recording lost: ${String(result.error ?? "")}`;
+	if (result.recording) return `CPU profile recording started (sampling). Call chrome_cpu_profile stop to collect.`;
+	const rows = Array.isArray(result.selfTimeByFunction) ? (result.selfTimeByFunction as Array<Record<string, unknown>>) : (Array.isArray(result.topSelfTime) ? (result.topSelfTime as Array<Record<string, unknown>>) : []);
+	const lines = [`CPU profile (${Number(result.elapsedMs) || 0}ms, ${Number(result.sampleCount) || 0} samples, ${Number(result.rowCount) || 0} functions):`];
+	for (const r of rows.slice(0, 15)) {
+		lines.push(`  ${String(r.functionName ?? "(anonymous)")} ${compactLine(String(r.url ?? ""), 70)}:${Number(r.lineNumber)} — ${Number(r.selfTimeMs)?.toFixed(2)}ms (${Number(r.pct) || 0}%)`);
+	}
+	if (result.profileTooLarge) lines.push(`  (full profile ${formatBytes(Number(result.profileTooLarge) || 0)} too large to inline — summary only)`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatCoverage(result: Record<string, unknown>): string {
+	const files = Array.isArray(result.files) ? (result.files as Array<Record<string, unknown>>) : [];
+	const lines = [`Coverage (${files.length} file(s), ${formatBytes(Number(result.totalUnusedBytes) || 0)} unused of ${formatBytes(Number(result.totalBytes) || 0)} — ${Number(result.unusedPct) || 0}%):`];
+	for (const f of files.slice(0, 25)) {
+		lines.push(`  ${compactLine(String(f.url ?? "?"), 90)}: ${formatBytes(Number(f.unusedBytes) || 0)} unused / ${formatBytes(Number(f.totalBytes) || 0)} (${Number(f.unusedPct) || 0}%) [${String(f.kind ?? "?")}]`);
+	}
+	if (files.length > 25) lines.push(`  … ${files.length - 25} more`);
+	return truncateText(lines.join("\n"));
+}
+

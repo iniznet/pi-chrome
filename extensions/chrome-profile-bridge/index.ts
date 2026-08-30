@@ -47,6 +47,29 @@ import {
 	formatTabList,
 	formatWatchSamples,
 	formatWebsocketFrames,
+	formatMatchedRules,
+	formatPseudoState,
+	formatMediaQueries,
+	formatBackgroundColors,
+	formatPlatformFonts,
+	formatA11yTree,
+	formatA11yNode,
+	formatMutationWait,
+	formatFetchStack,
+	formatInputLock,
+	formatGesture,
+	formatStorageUsage,
+	formatCacheStorage,
+	formatClearSiteData,
+	formatServiceWorker,
+	formatSystemInfo,
+	formatTargetEvaluate,
+	formatSetPermission,
+	formatLayoutMetrics,
+	formatAnimations,
+	formatPdfResult,
+	formatCpuProfile,
+	formatCoverage,
 	recordHistory,
 	safeJson,
 	summarizeParams,
@@ -833,6 +856,13 @@ const debuggerStepActionValues = ["into", "over", "out"] as const;
 const pauseOnExceptionsStateValues = ["none", "uncaught", "all"] as const;
 const interceptActionValues = ["on", "off", "list", "resolve"] as const;
 const interceptResolveActionValues = ["continue", "fulfill", "fail"] as const;
+const pseudoClassValues = ["active", "focus", "hover", "visited", "focus-visible", "focus-within", "target"] as const;
+const gestureTypeValues = ["tap", "touchMove", "pinch", "scroll"] as const;
+const cacheActionValues = ["list", "read", "delete"] as const;
+const serviceWorkerActionValues = ["list", "start", "stop", "unregister", "inspect"] as const;
+const animationActionValues = ["list", "pause", "resume", "seek", "rate", "waitSettled"] as const;
+const permissionSettingValues = ["granted", "denied", "prompt"] as const;
+const cpuProfileActionValues = ["start", "stop"] as const;
 const CHROME_TOOL_NAMES = [
 	"chrome_launch",
 	"chrome_tab",
@@ -894,6 +924,29 @@ const CHROME_TOOL_NAMES = [
 	"chrome_network_headers",
 	"chrome_network_intercept",
 	"chrome_websocket_messages",
+	"chrome_matched_css_rules",
+	"chrome_force_pseudo_state",
+	"chrome_media_queries",
+	"chrome_background_colors",
+	"chrome_platform_fonts",
+	"chrome_a11y_tree",
+	"chrome_a11y_node",
+	"chrome_mutation_wait",
+	"chrome_capture_fetch_stack",
+	"chrome_input_lock",
+	"chrome_touch_gesture",
+	"chrome_storage_usage",
+	"chrome_cache_storage",
+	"chrome_clear_site_data",
+	"chrome_service_worker",
+	"chrome_system_info",
+	"chrome_target_evaluate",
+	"chrome_set_permission",
+	"chrome_layout_metrics",
+	"chrome_animations",
+	"chrome_pdf",
+	"chrome_cpu_profile",
+	"chrome_coverage",
 	"chrome_screenshot",
 	"chrome_hover",
 	"chrome_drag",
@@ -3287,6 +3340,572 @@ Usage rules:
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const result = (await authorizedBridgeSend("network.websockets", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
 			return { content: [{ type: "text", text: formatWebsocketFrames(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_matched_css_rules",
+		label: "Chrome Matched CSS Rules",
+		description:
+			"Return the full cascade for a node (uid or selector) via CDP CSS.getMatchedStylesForNode + getInlineStylesForNode: matched rules with origin (user/author/user-agent), selector text, specificity, and property lists, plus inherited-rule groups and the inline style. Capped at 200 rules; perfect for 'why is this styled this way' debugging. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Show the matched CSS cascade (origin/specificity/selectors) for an element.",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String({ description: "Snapshot element uid (from chrome_snapshot)." })),
+			selector: Type.Optional(Type.String({ description: "CSS selector alternative to uid." })),
+			pseudoElements: Type.Optional(Type.Boolean({ description: "Include pseudo-element (:before/:after/::marker) cascade matches in the rule list (default false)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("css.matchedRules", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatMatchedRules(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_force_pseudo_state",
+		label: "Chrome Force Pseudo-Class",
+		description:
+			"Force CSS pseudo-classes (:hover/:focus/:active/:visited/:focus-visible/:focus-within/:target) on an element via CDP CSS.forcePseudoState for style debugging. The forced state is a keepalive mode: it persists across debugger re-attaches and is cleared automatically on detach; pass clear=true (or an empty forcedPseudoClasses array) to release it. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Force :hover/:focus CSS pseudo-classes on an element to inspect hover styles.",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String({ description: "Snapshot element uid." })),
+			selector: Type.Optional(Type.String({ description: "CSS selector alternative to uid." })),
+			forcedPseudoClasses: Type.Optional(Type.Array(StringEnum(pseudoClassValues), { description: "Pseudo-classes to force (e.g. [\"hover\"]). Empty array clears the force." })),
+			clear: Type.Optional(Type.Boolean({ description: "Clear the forced pseudo-classes for the node (or all when no uid/selector is given)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("css.pseudoState", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatPseudoState(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_media_queries",
+		label: "Chrome Media Queries",
+		description:
+			"List every media query in the document's stylesheets via CDP CSS.getMediaQueries: the query text, source (stylesheet link / inline / injected / linkedSheet), source URL, and the media-list conditions. Capped at 500 queries. Handy for breakpoint audits and responsive debugging. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "List the page's media queries (breakpoints, print rules).",
+		parameters: Type.Object({
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("css.mediaQueries", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatMediaQueries(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_background_colors",
+		label: "Chrome Background Colors",
+		description:
+			"Return the effective background-color stack for an element via CDP CSS.getBackgroundColors: every layer from the element up to the root (compositing order), plus computed font size/weight and (when the browser reports it) the contrast text color. The contrastTextColor field is best-effort — newer Chromes return it, older ones omit it. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Show an element's effective background-color stack (contrast debugging).",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String({ description: "Snapshot element uid." })),
+			selector: Type.Optional(Type.String({ description: "CSS selector alternative to uid." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("css.backgroundColors", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatBackgroundColors(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_platform_fonts",
+		label: "Chrome Platform Fonts",
+		description:
+			"Return the platform fonts actually used to render an element via CDP CSS.getPlatformFontsForNode: family name, whether the font is custom-loaded (@font-face), and the glyph count per family. Answers 'which font won the fallback chain'. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Show which platform fonts render an element's text.",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String({ description: "Snapshot element uid." })),
+			selector: Type.Optional(Type.String({ description: "CSS selector alternative to uid." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("css.platformFonts", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatPlatformFonts(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_a11y_tree",
+		label: "Chrome Accessibility Tree",
+		description:
+			"Return the engine's accessibility tree via CDP Accessibility.getFullAXTree: role, accessible name, description, value, properties, and per-node ignored status with reasons. Depth prunes child lists (default 8); huge trees return a summaryOnly flag with a role histogram and ignored count. Use chrome_a11y_node for a single element's full AX record. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Dump the real accessibility tree (roles, names, ignored nodes + reasons).",
+		parameters: Type.Object({
+			depth: Type.Optional(Type.Number({ description: "Max tree depth to keep childIds (default 8, max 8)." })),
+			frameId: Type.Optional(Type.String({ description: "Sub-frame id (from a snapshot frame uid or chrome_targets) to read the AX tree from; defaults to the top frame." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("a11y.tree", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatA11yTree(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_a11y_node",
+		label: "Chrome Accessibility Node",
+		description:
+			"Return the accessibility record for ONE element (uid or selector) via CDP Accessibility.getPartialAXTree: role, name, description, value, properties, and ignored reasons with related backend node ids. Engine truth for 'is this label read / why is this node skipped by the screen reader'. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Inspect one element's accessibility record (role, name, ignored reasons).",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String({ description: "Snapshot element uid." })),
+			selector: Type.Optional(Type.String({ description: "CSS selector alternative to uid." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("a11y.node", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatA11yNode(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_mutation_wait",
+		label: "Chrome Mutation Wait",
+		description:
+			"Wait for a real DOM mutation on an element (uid or selector) using a MutationObserver injected in-page (attributeFilter/childList/subtree controls), returning the first bounded batch of mutation records (target tag/id/uid, attribute name + old value, added/removed node counts). Times out after timeoutMs (max 30s) with the records captured so far; the observer always disconnects before returning. Great for waiting on async UI updates instead of polling. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Wait for a DOM mutation (attribute/child change) on an element.",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String({ description: "Snapshot element uid to observe." })),
+			selector: Type.Optional(Type.String({ description: "CSS selector alternative to uid." })),
+			attributeFilter: Type.Optional(Type.Array(Type.String(), { description: "Only report attribute mutations for these attribute names (default: all attributes)." })),
+			childList: Type.Optional(Type.Boolean({ description: "Also observe child-list additions/removals (default false)." })),
+			subtree: Type.Optional(Type.Boolean({ description: "Observe the subtree (default true)." })),
+			timeoutMs: Type.Optional(Type.Number({ description: "Wait budget in ms (default 10000, max 30000)." })),
+			maxRecords: Type.Optional(Type.Number({ description: "Stop after this many mutation records (default 100, max 100)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.mutationWait", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatMutationWait(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_capture_fetch_stack",
+		label: "Chrome Capture Fetch Stack",
+		description:
+			"Capture the JavaScript call stack that fires an XHR/fetch matching url (default *) — the 'what code made this request' superpower. Sets a TEMPORARY XHR breakpoint via DOMDebugger.setXHRBreakpoint, waits (up to timeoutMs, max 30s) for Debugger.paused with reason XHR, snapshots the stack, auto-resumes the page, and removes the breakpoint in finally — the page is never left paused. Returns an error (and removes the breakpoint) when no matching request fires in time. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "What code fired this fetch/XHR? (temporary breakpoint + stack + auto-resume)",
+		parameters: Type.Object({
+			url: Type.Optional(Type.String({ description: "URL substring pattern to break on (default * = any XHR/fetch)." })),
+			timeoutMs: Type.Optional(Type.Number({ description: "Wait window in ms (default 10000, max 30000)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("debug.xhrBreak", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatFetchStack(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_input_lock",
+		label: "Chrome Input Lock",
+		description:
+			"Suppress (ignore:true) or release (ignore:false) all real user input on the tab via CDP Input.setIgnoreInputEvents, so a human cannot race the automation mid-run. While locked the attach is held (idle-detach suspended) and the lock is AUTO-CLEARED on detach — the page can never stay locked after the session ends. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Lock out real user input while automating (auto-released on detach).",
+		parameters: Type.Object({
+			ignore: Type.Boolean({ description: "true = ignore all user input; false = accept input again." }),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("input.setIgnore", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatInputLock(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_touch_gesture",
+		label: "Chrome Touch Gesture",
+		description:
+			"Dispatch multi-touch gestures via CDP: tap (x,y), touchMove (multi-point start + optional movePoints), pinch (x,y,scale), and scroll (x,y, distances). Enables touch emulation first so the renderer synthesizes real TouchEvents; pinch/scroll use Input.synthesize*Gesture. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Send a touch gesture (tap / multi-touch move / pinch / scroll).",
+		parameters: Type.Object({
+			type: StringEnum(gestureTypeValues),
+			x: Type.Optional(Type.Number({ description: "X coordinate (tap/pinch/scroll)." })),
+			y: Type.Optional(Type.Number({ description: "Y coordinate (tap/pinch/scroll)." })),
+			scale: Type.Optional(Type.Number({ description: "Pinch scale factor (pinch only)." })),
+			points: Type.Optional(Type.Array(Type.Object({ x: Type.Number(), y: Type.Number(), id: Type.Optional(Type.Number()) }), { description: "Multi-touch start points (touchMove)." })),
+			movePoints: Type.Optional(Type.Array(Type.Object({ x: Type.Number(), y: Type.Number(), id: Type.Optional(Type.Number()) }), { description: "Multi-touch move targets (touchMove; default: +40px down)." })),
+			xDistance: Type.Optional(Type.Number({ description: "Horizontal scroll distance (scroll)." })),
+			yDistance: Type.Optional(Type.Number({ description: "Vertical scroll distance (scroll, default 200)." })),
+			relativeSpeed: Type.Optional(Type.Number({ description: "Pinch relative speed (pinch)." })),
+			preventFling: Type.Optional(Type.Boolean({ description: "Prevent fling at scroll end (scroll, default true)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.gesture", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatGesture(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_storage_usage",
+		label: "Chrome Storage Usage",
+		description:
+			"Return per-origin storage usage vs quota via CDP Storage.getUsageAndQuota: total usage/quota and the type breakdown (local_storage, indexeddb, cache_storage, service_workers, ...). Origin defaults to the resolved tab's origin; pass an explicit origin to inspect another. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "How much of the origin's storage quota is used (per storage type)?",
+		parameters: Type.Object({
+			origin: Type.Optional(Type.String({ description: "Origin to inspect (default: the resolved tab's origin)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("storage.usage", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatStorageUsage(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_cache_storage",
+		label: "Chrome Cache Storage",
+		description:
+			"Inspect and manage the Cache Storage API for an origin via CDP CacheStorage: list caches, read entries (request/response headers, status, and a 2KB response-body preview — bodies stay truncated, redaction discipline), delete a single entry (requestUrl) or a whole cache (cacheId only). Response bodies are never inlined beyond the preview cap. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "List / read / delete Cache Storage API entries for an origin.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(cacheActionValues)),
+			origin: Type.Optional(Type.String({ description: "Origin (default: the resolved tab's origin)." })),
+			cacheId: Type.Optional(Type.String({ description: "Cache id from the list action (read/delete)." })),
+			requestUrl: Type.Optional(Type.String({ description: "Entry URL filter for read, or the exact entry to delete." })),
+			requestMethod: Type.Optional(Type.String({ description: "Request method for deleteEntry (default GET)." })),
+			pageSize: Type.Optional(Type.Number({ description: "Entries per read page (default 100, max 200)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("cache.op", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatCacheStorage(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_clear_site_data",
+		label: "Chrome Clear Site Data",
+		description:
+			"DESTRUCTIVE: wipe an origin's site data via CDP Storage.clearDataForOrigin plus the browser HTTP cache. This tool is gated — it refuses to run unless BOTH confirm:true and an explicit origin are passed, and it never clears without an origin. Pass storageTypes to narrow (default \"all\") and clearHttpCache:false to skip the HTTP-cache wipe. This wipes cookies, localStorage, IndexedDB, cache storage and service-worker data for the origin — there is no undo.",
+		promptSnippet: "Clear an origin's site data (destructive — requires confirm:true + explicit origin).",
+		parameters: Type.Object({
+			confirm: Type.Boolean({ description: "Must be true — this is destructive and irreversible." }),
+			origin: Type.String({ description: "Origin to clear, e.g. https://example.com (required — refusing to clear without one)." }),
+			storageTypes: Type.Optional(Type.String({ description: "Storage types to clear (default \"all\"; CDP StorageType list)." })),
+			clearHttpCache: Type.Optional(Type.Boolean({ description: "Also clear the browser HTTP cache (default true)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("storage.clearSiteData", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatClearSiteData(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_service_worker",
+		label: "Chrome Service Worker",
+		description:
+			"Inspect and control service workers via CDP ServiceWorker: list (registrations, versions with runningStatus/status/scriptURL, and reported errors — a bounded 500-event ring fed while the domain is enabled), start/stop a worker by versionId, unregister a scope (scopeURL), or open inspectWorker for a version. Versions/registrations appear once ServiceWorker.enable starts emitting events on this tab. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "List / start / stop / unregister service workers for the tab's origin.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(serviceWorkerActionValues)),
+			versionId: Type.Optional(Type.String({ description: "Service worker version id (start/stop/inspect)." })),
+			scopeURL: Type.Optional(Type.String({ description: "Registration scope URL (unregister)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			if (params.action === "list") {
+				const result = (await authorizedBridgeSend("serviceworker.list", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+				return { content: [{ type: "text", text: formatServiceWorker(result) }], details: { result: result as Json } };
+			}
+			const result = (await authorizedBridgeSend("serviceworker.action", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatServiceWorker(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_system_info",
+		label: "Chrome System Info",
+		description:
+			"Return Chrome's view of the machine via CDP SystemInfo.getInfo (arch, model, platform, OS version, GPU devices + feature status) and, with processes:true, SystemInfo.getProcessInfo (per-process id/type/cpuTime/commandLine). Both are version-dependent from a page-target attach — they degrade gracefully (degraded:true) instead of failing. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "OS/CPU/GPU info + per-process CPU/memory table.",
+		parameters: Type.Object({
+			processes: Type.Optional(Type.Boolean({ description: "Also fetch the per-process table (SystemInfo.getProcessInfo)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("system.info", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatSystemInfo(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_target_evaluate",
+		label: "Chrome Evaluate In Target",
+		description:
+			"Evaluate an expression inside a NON-page CDP target (service worker, dedicated/shared worker — targetId from chrome_targets) by attaching chrome.debugger to { targetId }, running Runtime.evaluate, and detaching in finally. ReturnByValue defaults on; expression exceptions come back as ok:false with the exception description, never thrown. Attachments are tracked in an attachedTargets map cleaned up on detach. Runs via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Evaluate inside a worker/service-worker target (targetId from chrome_targets).",
+		parameters: Type.Object({
+			targetId: Type.String({ description: "CDP target id from chrome_targets (worker/service_worker/other)." }),
+			expression: Type.String({ description: "JavaScript expression to evaluate in the target." }),
+			returnByValue: Type.Optional(Type.Boolean({ default: true })),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("target.evaluate", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatTargetEvaluate(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_set_permission",
+		label: "Chrome Set Permission",
+		description:
+			"Grant, deny, or reset-to-prompt a browser permission for an origin via CDP Browser.setPermission (geolocation, notifications, camera, microphone, ...). From a page-target attach the method is version-dependent — when the browser rejects it the tool returns degraded:true with the error instead of failing. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Grant/deny/prompt a permission (geolocation, notifications, camera) for an origin.",
+		parameters: Type.Object({
+			origin: Type.String({ description: "Origin to set the permission for, e.g. https://example.com." }),
+			permission: Type.String({ description: "Permission name, e.g. geolocation, notifications, camera, microphone." }),
+			setting: Type.Optional(StringEnum(permissionSettingValues)),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("browser.setPermission", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatSetPermission(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_layout_metrics",
+		label: "Chrome Layout Metrics",
+		description:
+			"Document-level layout geometry via CDP Page.getLayoutMetrics (layout/visual viewports, content size, CSS content size) plus an in-page scan for horizontal-overflow elements (tag/hint/left/right vs viewport) and scrollable containers (scrollWidth vs clientWidth, overflowX). Overflow/CLS-oriented: cap 100 items each. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Viewport + content geometry with horizontal-overflow and scrollable-container scan.",
+		parameters: Type.Object({
+			detectOverflow: Type.Optional(Type.Boolean({ description: "Scan for horizontal-overflow elements (default true; set false to skip the scan)." })),
+			detectCLS: Type.Optional(Type.Boolean({ description: "Also report cumulative layout shift (performance layout-shift entries, when available)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.layoutMetrics", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatLayoutMetrics(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_animations",
+		label: "Chrome Animations",
+		description:
+			"Control CSS/WAAPI animations via CDP Animation + in-page document.getAnimations: list (live animations with id/playState/rate/currentTime/target + a bounded CDP event log), pause/resume/seek/rate one animation by id, and waitSettled (polls until no animation is running, up to timeoutMs). Pausing an animation joins the keepalive registry (cleared on detach) so a re-attach never silently resumes it. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "List / pause / resume / seek animations, or wait for them to settle.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(animationActionValues)),
+			animationId: Type.Optional(Type.String({ description: "Animation id from the list action (pause/resume/seek/rate)." })),
+			currentTime: Type.Optional(Type.Number({ description: "Seek target time in ms (seek)." })),
+			playbackRate: Type.Optional(Type.Number({ description: "Playback rate (rate)." })),
+			timeoutMs: Type.Optional(Type.Number({ description: "Settle-wait budget in ms (waitSettled, default 10000, max 30000)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("page.animations", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatAnimations(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_pdf",
+		label: "Chrome Print to PDF",
+		description:
+			"Export the page as a PDF via CDP Page.printToPDF and write it to a file under .pi/chrome-pdf/<timestamp>.pdf (customize with path). Feature-tests the headless gate: headed Chrome returns supported:false instead of an empty file. Options: landscape, paperWidth/Height (inches), margins, printBackground, scale, pageRanges, header/footer templates. PDFs are written to disk by the host — never inlined beyond the 8MB bridge cap (tooLarge is surfaced instead). Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Export the page to a PDF file (headless Chrome required).",
+		parameters: Type.Object({
+			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-pdf/<timestamp>.pdf." })),
+			landscape: Type.Optional(Type.Boolean()),
+			paperWidth: Type.Optional(Type.Number({ description: "Paper width in inches (default 8.5)." })),
+			paperHeight: Type.Optional(Type.Number({ description: "Paper height in inches (default 11)." })),
+			marginTop: Type.Optional(Type.Number()),
+			marginBottom: Type.Optional(Type.Number()),
+			marginLeft: Type.Optional(Type.Number()),
+			marginRight: Type.Optional(Type.Number()),
+			printBackground: Type.Optional(Type.Boolean()),
+			preferCSSPageSize: Type.Optional(Type.Boolean()),
+			generateTaggedPDF: Type.Optional(Type.Boolean()),
+			displayHeaderFooter: Type.Optional(Type.Boolean()),
+			scale: Type.Optional(Type.Number({ description: "Print scale 0.1–2 (default 1)." })),
+			pageRanges: Type.Optional(Type.String({ description: "Paper ranges, e.g. '1-3,5'." })),
+			headerTemplate: Type.Optional(Type.String()),
+			footerTemplate: Type.Optional(Type.String()),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
+			const cwd = workspaceCwd(ctx);
+			const defaultPath = join(cwd, ".pi", "chrome-pdf", `${new Date().toISOString().replace(/[:.]/g, "-")}.pdf`);
+			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
+			const result = (await authorizedBridgeSend("page.pdf", withBackground(params), 90_000, signal)) as {
+				supported?: boolean;
+				data?: string;
+				reason?: string;
+				hint?: string;
+				tooLarge?: boolean;
+				base64Length?: number;
+				pageSize?: unknown;
+			};
+			if (!result.supported || typeof result.data !== "string") {
+				throw new Error(`chrome_pdf: ${result.reason ?? "unsupported"}. ${result.hint ?? ""}`);
+			}
+			await mkdir(dirname(outputPath), { recursive: true });
+			await writeFile(outputPath, Buffer.from(result.data, "base64"));
+			return {
+				content: [{ type: "text", text: `PDF written to ${outputPath} (${Math.round((result.base64Length ?? 0) * 0.75)} bytes).` }],
+				details: { path: outputPath, bytes: Math.round((result.base64Length ?? 0) * 0.75), pageSize: result.pageSize } as unknown as Record<string, unknown>,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_cpu_profile",
+		label: "Chrome CPU Profile",
+		description:
+			"Record and analyze a JavaScript CPU profile via CDP Profiler: start begins sampling (hold the debugger attach via keepalive while recording, with an optional samplingInterval µs), stop collects Profiler.stop and returns a top-self-time summary (function, url, self-time ms, % of total). The full profile JSON is inlined only when it fits under the bridge caps; otherwise summary-first with profileTooLarge. Stop before the attach drops or the recording is lost (surfaced as lost:true). Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Record a CPU profile and get the top-self-time hot-path summary.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(cpuProfileActionValues)),
+			samplingInterval: Type.Optional(Type.Number({ description: "Sampling interval in microseconds (start; default 1000, min 50)." })),
+			maxBufferSize: Type.Optional(Type.Number({ description: "Maximum profile buffer size in bytes (start; the profile is collected only up to this budget)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			if (params.action === "stop") {
+				const result = (await authorizedBridgeSend("profiler.cpuStop", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+				return { content: [{ type: "text", text: formatCpuProfile(result) }], details: { result: result as Json } };
+			}
+			const result = (await authorizedBridgeSend("profiler.cpuStart", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatCpuProfile(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_coverage",
+		label: "Chrome Coverage",
+		description:
+			"Dead-code report via CDP Profiler.getBestEffortCoverage (JS) + CSS rule-usage tracking (startRuleUsageTracking/takeCoverageDelta): per-file used/unused bytes, unused %, and per-function totals for JS files, sorted by unused bytes descending (cap 500 files). The actionable 'drop 214KB of dead CSS/JS' evidence tool. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Which files/bytes are unused JS/CSS on this page?",
+		parameters: Type.Object({
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("coverage.get", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatCoverage(result) }], details: { result: result as Json } };
 		},
 	});
 
