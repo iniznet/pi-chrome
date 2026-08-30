@@ -387,6 +387,178 @@ export function formatEventListeners(result: Record<string, unknown>): string {
 	return truncateText(lines.join("\n"));
 }
 
+// ---- P1A formatters (Debugger family + console/exceptions + network deep-dive) ----
+
+export function formatBreakpointResult(result: Record<string, unknown>): string {
+	const action = String(result.action ?? "");
+	if (action === "list") {
+		const bps = Array.isArray(result.breakpoints) ? (result.breakpoints as Array<Record<string, unknown>>) : [];
+		const lines = [`Breakpoints (${bps.length}):`];
+		for (const b of bps) lines.push(`  ${String(b.breakpointId ?? "?")} ${String(b.url ?? b.scriptId ?? "")}:${Number(b.lineNumber)}${b.condition ? ` if ${String(b.condition)}` : ""}`);
+		const poe = result.pauseOnExceptions;
+		if (poe) lines.push(`Pause on exceptions: ${String(poe)}`);
+		return truncateText(lines.join("\n"));
+	}
+	const bp = result.breakpoint as Record<string, unknown> | undefined;
+	if (action === "set" && bp) {
+		return `Breakpoint set: ${String(bp.breakpointId ?? "")} at ${String(bp.url ?? bp.scriptId ?? "")}:${Number(bp.lineNumber)}${bp.condition ? ` if ${String(bp.condition)}` : ""} (${Number(result.count) || 0} active)`;
+	}
+	if (action === "remove") return `Breakpoint removed: ${String(result.removed ?? "")} (${Number(result.count) || 0} active)`;
+	return safeJson(result);
+}
+
+export function formatPauseState(result: Record<string, unknown>): string {
+	if (result.resumed !== undefined) {
+		return result.resumed ? "Page resumed (debugger running)." : `Not paused: ${String(result.note ?? "page is not paused")}.`;
+	}
+	const frames = Array.isArray(result.callFrames) ? (result.callFrames as Array<Record<string, unknown>>) : [];
+	if (!result.paused) return `Page is not paused.`;
+	const lines = [`Page paused (${String(result.reason ?? "other")}${result.alreadyPaused ? ", already paused" : ""}). ${frames.length} frame(s):`];
+	for (const f of frames.slice(0, 10)) lines.push(`  ${String(f.functionName ?? "(anonymous)")} at ${compactLine(f.url, 80)}:${Number(f.lineNumber)}`);
+	if (frames.length > 10) lines.push(`  … ${frames.length - 10} more`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatCallStack(result: Record<string, unknown>): string {
+	const frames = Array.isArray(result.frames) ? (result.frames as Array<Record<string, unknown>>) : [];
+	const lines = [`Call stack (${frames.length} frames, reason=${String(result.reason ?? "")}):`];
+	for (const f of frames) {
+		const head = `#${lines.length - 1} ${String(f.functionName ?? "(anonymous)")} ${compactLine(f.url, 80)}:${Number(f.lineNumber)}:${Number(f.columnNumber)}`;
+		lines.push(head);
+		const scopes = Array.isArray(f.scopes) ? (f.scopes as Array<Record<string, unknown>>) : [];
+		for (const s of scopes.slice(0, 3)) {
+			const props = Array.isArray(s.properties) ? (s.properties as Array<Record<string, unknown>>) : [];
+			if (!props.length) continue;
+			const rendered = props.slice(0, 8).map((p) => `${String(p.name)}=${compactLine(p.value ?? "", 40)}`).join(", ");
+			lines.push(`    [${String(s.type ?? "")}] ${rendered}${s.overflow ? " …" : ""}`);
+		}
+	}
+	return truncateText(lines.join("\n"));
+}
+
+export function formatJsExceptions(result: Record<string, unknown>): string {
+	const list = Array.isArray(result.exceptions) ? (result.exceptions as Array<Record<string, unknown>>) : [];
+	const lines = [`JS exceptions (${list.length}${result.cleared ? `, ${Number(result.cleared)} cleared` : ""}):`];
+	for (const e of list.slice(0, 30)) {
+		const loc = e.url ? ` ${compactLine(String(e.url), 70)}:${Number(e.lineNumber)}` : "";
+		lines.push(`  ✗ ${String(e.text ?? "Error")}${loc}`);
+		const top = Array.isArray(e.stackTrace) ? (e.stackTrace as Array<Record<string, unknown>>)[0] : null;
+		if (top) lines.push(`      at ${String(top.functionName ?? "(anonymous)")} (${compactLine(String(top.url ?? ""), 70)}:${Number(top.lineNumber)})`);
+	}
+	if (list.length > 30) lines.push(`  … ${list.length - 30} more`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatConsoleCapture(result: Record<string, unknown>): string {
+	const entries = Array.isArray(result.entries) ? (result.entries as Array<Record<string, unknown>>) : [];
+	const totals = (result.totals ?? {}) as Record<string, unknown>;
+	const head = `Console capture ${result.enabled ? "ON" : "OFF"}: ${entries.length} entr${entries.length === 1 ? "y" : "ies"} (${Number(totals.console) || 0} console, ${Number(totals.exceptions) || 0} exceptions, ${Number(totals.log) || 0} log)`;
+	const lines = [head];
+	for (const e of entries.slice(-25)) {
+		const when = new Date(Number(e.timestamp) || 0).toISOString().slice(11, 23);
+		if (e.family === "exception") {
+			lines.push(`  [${when}] EXC ${compactLine(String(e.text ?? "Error"), 110)}`);
+		} else if (e.family === "log") {
+			lines.push(`  [${when}] ${String(e.level ?? "info").toUpperCase()} ${compactLine(String(e.text ?? ""), 110)}`);
+		} else {
+			const args = Array.isArray(e.args) ? (e.args as Array<Record<string, unknown>>).map((a) => compactLine(a.value ?? a.description ?? "", 60)).join(" ") : "";
+			lines.push(`  [${when}] ${String(e.type ?? "log")} ${args}`);
+		}
+	}
+	return truncateText(lines.join("\n"));
+}
+
+export function formatBrowserLog(result: Record<string, unknown>): string {
+	const entries = Array.isArray(result.entries) ? (result.entries as Array<Record<string, unknown>>) : [];
+	const lines = [`Browser log entries (${entries.length}${result.cleared ? `, ${Number(result.cleared)} cleared` : ""}):`];
+	for (const e of entries.slice(-30)) {
+		const loc = e.url ? ` ${compactLine(String(e.url), 70)}:${Number(e.lineNumber)}` : "";
+		lines.push(`  [${String(e.source ?? "")}] ${String(e.level ?? "info").toUpperCase()} ${compactLine(String(e.text ?? ""), 120)}${loc}`);
+	}
+	return truncateText(lines.join("\n"));
+}
+
+export function formatNetworkCause(result: Record<string, unknown>): string {
+	const failure = (result.failure ?? {}) as Record<string, unknown>;
+	const lines = [`Request ${String(result.method ?? "GET")} ${compactLine(String(result.url ?? ""), 100)}`];
+	lines.push(`  → status ${result.status ?? "(no response)"}${result.ambiguous ? " (ambiguous match)" : ""}`);
+	if (failure.errorText || failure.blockedReason) {
+		const cause: string[] = [];
+		if (failure.blockedReason) cause.push(`blockedReason=${String(failure.blockedReason)}`);
+		if (failure.errorText) cause.push(String(failure.errorText));
+		if (failure.canceled) cause.push("canceled");
+		lines.push(`  FAILED: ${cause.join(", ")}`);
+	}
+	const initiator = result.initiator as Record<string, unknown> | undefined;
+	if (initiator) {
+		const stack = Array.isArray(initiator.stack) ? (initiator.stack as Array<Record<string, unknown>>)[0] : null;
+		if (stack) lines.push(`  initiator: ${String(stack.functionName ?? "(anonymous)")} ${compactLine(String(stack.url ?? ""), 70)}:${Number(stack.lineNumber)}`);
+		else if (initiator.url) lines.push(`  initiator: ${compactLine(String(initiator.url), 90)}`);
+	}
+	const reqCookies = Array.isArray(result.blockedRequestCookies) ? result.blockedRequestCookies : [];
+	const respCookies = Array.isArray(result.blockedCookies) ? result.blockedCookies : [];
+	if (reqCookies.length || respCookies.length) lines.push(`  blocked cookies: ${reqCookies.length} request / ${respCookies.length} response`);
+	const sec = result.securityDetails as Record<string, unknown> | null | undefined;
+	if (sec) lines.push(`  TLS: ${compactLine(String(sec.subjectName ?? ""), 60)} → ${compactLine(String(sec.issuer ?? ""), 60)} (${String(sec.protocol ?? "")}/${String(sec.cipher ?? "")})`);
+	const redirects = Array.isArray(result.redirects) ? (result.redirects as Array<Record<string, unknown>>) : [];
+	if (redirects.length) lines.push(`  redirect chain: ${redirects.map((r) => `${String(r.status ?? "")} ${compactLine(String(r.url ?? ""), 60)}`).join(" → ")}`);
+	return truncateText(lines.join("\n"));
+}
+
+export function formatNetworkHeaders(result: Record<string, unknown>): string {
+	const summary = (result.summary ?? {}) as Record<string, unknown>;
+	const names = Array.isArray(summary.names) ? (summary.names as string[]) : [];
+	return result.clear
+		? "Extra HTTP headers cleared."
+		: `Injecting ${Number(summary.count) || 0} extra HTTP header(s): ${names.join(", ") || "(none)"}. Values are redacted.`;
+}
+
+export function formatInterceptStatus(result: Record<string, unknown>): string {
+	if (result.resolved !== undefined) {
+		return result.resolved
+			? `Request ${String(result.requestId)} ${String(result.action)}d.`
+			: `Could not resolve request ${String(result.requestId)}.`;
+	}
+	if (!result.enabled) return "Fetch interception disabled.";
+	const patterns = Array.isArray(result.patterns) ? (result.patterns as string[]) : [];
+	return `Fetch interception ON (${patterns.join(", ") || "*"}): ${Number(result.pausedCount) || 0} paused request(s), ${Number(result.resolvedCount) || 0} resolved. Paused requests auto-continue after 30s.`;
+}
+
+export function formatWebsocketFrames(result: Record<string, unknown>): string {
+	const frames = Array.isArray(result.frames) ? (result.frames as Array<Record<string, unknown>>) : [];
+	const lines = [`WebSocket frames (${frames.length} of ${Number(result.totalCaptured) || frames.length}${result.captureMode ? ", capture on" : ""}):`];
+	for (const f of frames.slice(-30)) {
+		const when = new Date(Number(f.timestamp) || 0).toISOString().slice(11, 23);
+		let line = `  [${when}] ${String(f.direction ?? "")}`;
+		if (f.direction === "sent" || f.direction === "received") {
+			line += ` opcode=${f.opcode}${f.payloadPreview !== undefined ? ` payload=${compactLine(String(f.payloadPreview), 60)}${f.payloadTruncated ? "…" : ""}` : ""}`;
+		} else if (f.direction === "created") {
+			line += ` ${compactLine(String(f.url ?? ""), 80)}`;
+		} else if (f.direction === "response") {
+			line += ` ${compactLine(String(f.statusText ?? ""), 60)}`;
+		}
+		lines.push(line);
+	}
+	return truncateText(lines.join("\n"));
+}
+
+export function formatScriptSource(result: Record<string, unknown>): string {
+	if (result.listed) {
+		const scripts = Array.isArray(result.scripts) ? (result.scripts as Array<Record<string, unknown>>) : [];
+		const lines = [`Scripts (${scripts.length}):`];
+		for (const s of scripts.slice(0, 40)) lines.push(`  ${String(s.scriptId ?? "?")} ${compactLine(String(s.url ?? "(inline)"), 90)}`);
+		if (scripts.length > 40) lines.push(`  … ${scripts.length - 40} more`);
+		return truncateText(lines.join("\n"));
+	}
+	return truncateText(`Script ${String(result.scriptId ?? "")} ${compactLine(String(result.url ?? ""), 90)}${result.truncated ? " (truncated)" : ""}:\n${String(result.source ?? "")}`);
+}
+
+export function formatEvalFrameResult(result: Record<string, unknown>): string {
+	if (result.ok === false) return `Evaluation failed: ${compactLine(String((result.exception as Record<string, unknown> | undefined)?.description ?? (result.exception as Record<string, unknown> | undefined)?.text ?? "error"), 200)}`;
+	const r = result.result as Record<string, unknown> | undefined;
+	return `→ ${compactLine(r?.value ?? r?.description ?? "(undefined)", 200)}`;
+}
+
 export function formatTargetList(result: Record<string, unknown>): string {
 	const targets = Array.isArray(result.targets) ? (result.targets as Array<Record<string, unknown>>) : [];
 	const lines = [`CDP targets (${targets.length}):`];

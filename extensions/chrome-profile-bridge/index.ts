@@ -24,17 +24,29 @@ import {
 	formatIncludedSnapshotText,
 	formatInitiatorChain,
 	formatBoxModel,
+	formatBreakpointResult,
 	formatBrowserInfo,
+	formatBrowserLog,
+	formatCallStack,
+	formatConsoleCapture,
 	formatDomAtPoint,
+	formatEvalFrameResult,
 	formatEventListeners,
 	formatIndexedDbResult,
+	formatInterceptStatus,
+	formatJsExceptions,
 	formatMemoryCounters,
+	formatNetworkCause,
+	formatNetworkHeaders,
 	formatNetworkSummary,
+	formatPauseState,
 	formatProperties,
+	formatScriptSource,
 	formatTargetList,
 	formatTab,
 	formatTabList,
 	formatWatchSamples,
+	formatWebsocketFrames,
 	recordHistory,
 	safeJson,
 	summarizeParams,
@@ -816,6 +828,11 @@ const printEmulationValues = ["emulate", "no-override"] as const;
 const visionDeficiencyValues = ["achromatopsia", "blurredVision", "deuteranopia", "protanopia", "tritanopia"] as const;
 const scrollBlockValues = ["start", "center", "end", "nearest"] as const;
 const targetFilterValues = ["page", "worker", "service_worker", "shared_worker", "other", "all"] as const;
+const breakpointActionValues = ["set", "remove", "list"] as const;
+const debuggerStepActionValues = ["into", "over", "out"] as const;
+const pauseOnExceptionsStateValues = ["none", "uncaught", "all"] as const;
+const interceptActionValues = ["on", "off", "list", "resolve"] as const;
+const interceptResolveActionValues = ["continue", "fulfill", "fail"] as const;
 const CHROME_TOOL_NAMES = [
 	"chrome_launch",
 	"chrome_tab",
@@ -862,6 +879,21 @@ const CHROME_TOOL_NAMES = [
 	"chrome_scroll_to",
 	"chrome_browser_info",
 	"chrome_targets",
+	"chrome_breakpoint",
+	"chrome_pause",
+	"chrome_resume",
+	"chrome_step",
+	"chrome_get_call_stack",
+	"chrome_evaluate_in_frame",
+	"chrome_get_script_source",
+	"chrome_set_pause_on_exceptions",
+	"chrome_list_js_exceptions",
+	"chrome_console_capture",
+	"chrome_browser_log",
+	"chrome_network_cause",
+	"chrome_network_headers",
+	"chrome_network_intercept",
+	"chrome_websocket_messages",
 	"chrome_screenshot",
 	"chrome_hover",
 	"chrome_drag",
@@ -2915,6 +2947,346 @@ Usage rules:
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const result = (await authorizedBridgeSend("target.list", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
 			return { content: [{ type: "text", text: formatTargetList(result) }], details: { result: result as Json } };
+		},
+	});
+
+	// ---- P1A: Debugger family (M5) + console/exceptions + network deep-dive (M6) ----
+
+	pi.registerTool({
+		name: "chrome_breakpoint",
+		label: "Chrome JS Breakpoint",
+		description:
+			"Set, remove, or list JavaScript breakpoints via CDP Debugger.setBreakpointByUrl / removeBreakpoint: url (or scriptId) + 0-based lineNumber + optional condition. Breakpoints persist across debugger re-attaches (re-applied automatically) and keep the tab's attach alive while set. Hitting a breakpoint pauses the page — other tools auto-resume first, so nothing hangs; use chrome_get_call_stack / chrome_evaluate_in_frame while paused. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Set a JS breakpoint (url + line) to pause execution for call-stack inspection.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(breakpointActionValues)),
+			url: Type.Optional(Type.String({ description: "Script URL to break in (alternative to scriptId)." })),
+			scriptId: Type.Optional(Type.String({ description: "Debugger scriptId to break in (alternative to url)." })),
+			lineNumber: Type.Optional(Type.Number({ description: "0-based line number. Required for action=set." })),
+			condition: Type.Optional(Type.String({ description: "Optional breakpoint condition (expression evaluated when hit)." })),
+			breakpointId: Type.Optional(Type.String({ description: "Breakpoint id to remove (action=remove)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("debug.breakpoint", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatBreakpointResult(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_pause",
+		label: "Chrome Pause (Debugger)",
+		description:
+			"Pause JavaScript execution on the resolved tab via CDP Debugger.pause and return the cached call stack. While paused the page's main thread is frozen: other tools (evaluate/snapshot/click) auto-resume it first so nothing hangs, and the idle-detach sweep exempts paused tabs so the pause is never lost to a detach. Call chrome_get_call_stack / chrome_step / chrome_evaluate_in_frame while paused, then chrome_resume. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Pause JS execution and read the current call stack.",
+		parameters: Type.Object({
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("debug.pause", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatPauseState(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_resume",
+		label: "Chrome Resume (Debugger)",
+		description:
+			"Resume JavaScript execution on a paused tab via CDP Debugger.resume (the unstick tool). Idempotent: a page that is not paused reports resumed:false with a note. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Resume a paused Chrome page (unstick tool).",
+		parameters: Type.Object({
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("debug.resume", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatPauseState(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_step",
+		label: "Chrome Debugger Step",
+		description:
+			"Step through paused JavaScript via CDP Debugger.stepInto / stepOver / stepOut and return the refreshed call stack. Requires the page to be paused (chrome_pause or a breakpoint hit); errors otherwise. Each step lands in a new pause, so the page stays paused across steps. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Step into/over/out of paused JS execution.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(debuggerStepActionValues)),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("debug.step", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatCallStack(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_get_call_stack",
+		label: "Chrome Call Stack",
+		description:
+			"Read the paused page's JavaScript call stack: frames capped at 50 with function name, url, line/column, scriptId, and per-frame scope value previews (up to 3 scopes × 20 properties each, preview-capped). Requires the page to be paused. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Inspect the paused page's JS call stack with scope values.",
+		parameters: Type.Object({
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("debug.callStack", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatCallStack(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_evaluate_in_frame",
+		label: "Chrome Evaluate In Call Frame",
+		description:
+			"Evaluate an expression in a specific paused call frame via CDP Debugger.evaluateOnCallFrame (read/write locals in that frame's scope). Requires the page to be paused and a callFrameId from chrome_get_call_stack. Expression errors are returned as ok:false with the exception description, never thrown. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Evaluate an expression inside a paused call frame (read/write locals).",
+		parameters: Type.Object({
+			callFrameId: Type.String({ description: "callFrameId from chrome_get_call_stack." }),
+			expression: Type.String({ description: "JavaScript expression to evaluate in the frame." }),
+			returnByValue: Type.Optional(Type.Boolean({ default: true, description: "Return the value by value (JSON-serializable) instead of a remote object reference." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("debug.evalFrame", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatEvalFrameResult(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_get_script_source",
+		label: "Chrome Script Source",
+		description:
+			"Read the source text of a script by Debugger scriptId (cap 2MB, truncated flag set beyond) or list the script inventory (scriptId -> url, line spans) with list=true and no scriptId. The inventory is populated from Debugger.scriptParsed events while the attach is alive. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Read a script's source by scriptId or list loaded scripts.",
+		parameters: Type.Object({
+			scriptId: Type.Optional(Type.String({ description: "Debugger scriptId from the script inventory / call stack / breakpoint locations." })),
+			list: Type.Optional(Type.Boolean({ description: "Return the script inventory (metadata only) instead of source text." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("debug.scriptSource", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatScriptSource(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_set_pause_on_exceptions",
+		label: "Chrome Pause On Exceptions",
+		description:
+			"Configure exception breakpoints via CDP Debugger.setPauseOnExceptions: none / uncaught (default) / all. The state persists across debugger re-attaches and is re-applied automatically. Use all only when actively debugging a specific throw — chatty pages can flood paused events (bounded buffers apply). Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Pause on uncaught/all/none JavaScript exceptions.",
+		parameters: Type.Object({
+			state: Type.Optional(StringEnum(pauseOnExceptionsStateValues)),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("debug.pauseOnExceptions", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return {
+				content: [{ type: "text", text: `Pause on exceptions: ${String(result.state ?? "uncaught")}.` }],
+				details: { result: result as Json },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_list_js_exceptions",
+		label: "Chrome JS Exceptions Ledger",
+		description:
+			"List JavaScript exceptions and unhandled rejections captured at the CDP level (Runtime.exceptionThrown) with message, url, line/column, exception preview, and a capped stack trace. The ring holds up to 500 entries, fills while the Runtime domain is enabled, and survives until cleared — pass clear=true to reset it and limit to cap the returned window (max 500). Full stacks include sub-frames. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "List captured JS exceptions with full stacks (CDP-level ledger).",
+		parameters: Type.Object({
+			clear: Type.Optional(Type.Boolean({ description: "Clear the captured exception ring after reading." })),
+			limit: Type.Optional(Type.Number({ description: "Max exceptions to return (default all captured, max 500)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("debug.exceptions", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatJsExceptions(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_console_capture",
+		label: "Chrome Console Capture (persistent mode)",
+		description:
+			"Turn persistent console capture on/off for the resolved tab: Runtime.consoleAPICalled + exceptionThrown + Log.entryAdded are buffered into bounded rings (500 each) with object previews and stacks, merged chronologically in the response. This is a keepalive mode (network.capture-style): while on, the tab's debugger attach stays open and the intent survives Chrome-initiated detaches / MV3 worker suspends, re-applying automatically on re-attach. Pass clear=true to drop the captured rings, limit to cap the returned window. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Enable persistent console/exception/log capture (keepalive mode).",
+		parameters: Type.Object({
+			enabled: Type.Boolean({ description: "true = start console capture (keepalive mode on); false = stop and return to the idle-detach model." }),
+			clear: Type.Optional(Type.Boolean({ description: "Drop the captured console/exception/log rings for the resolved tab." })),
+			limit: Type.Optional(Type.Number({ description: "Max merged entries to return (default all captured)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("console.capture", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatConsoleCapture(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_browser_log",
+		label: "Chrome Browser Log",
+		description:
+			"List browser-level log entries captured via CDP Log.enable (CSP/COOP/mixed-content/worker/network errors) with level, source, text, url, and line. The ring holds up to 500 entries and fills while the Log domain is enabled; pass clear=true to reset it, limit to cap the returned window (max 500). Shares its ring with chrome_console_capture. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "List browser-level log entries (CSP/COOP/mixed-content/worker errors).",
+		parameters: Type.Object({
+			clear: Type.Optional(Type.Boolean({ description: "Clear the captured log ring after reading." })),
+			limit: Type.Optional(Type.Number({ description: "Max entries to return (default all captured, max 500)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("log.list", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatBrowserLog(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_network_cause",
+		label: "Chrome Network Request Cause",
+		description:
+			"Explain WHY a captured request failed or behaved oddly: extraInfo headers, associated/blocked cookies, initiator JS stack, redirect chain, TLS security details, and the failure record (errorText, blockedReason, corsErrorStatus, canceled) plus a best-effort certificate chain via Network.getCertificate. Reads the CDP capture store (enable chrome_network_capture and reload first); targets a request by requestId or requestUrlIncludes (substring, latest match, ambiguity flagged). Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Root-cause a failed/blocked network request (cookies, security, initiator, redirects).",
+		parameters: Type.Object({
+			requestId: Type.Optional(Type.String({ description: "Request id from chrome_list_network_requests / chrome_network_capture (cdpEntries[].requestId). One of requestId / requestUrlIncludes is required." })),
+			requestUrlIncludes: Type.Optional(Type.String({ description: "Substring of the request URL to analyze (alternative to requestId)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("network.cause", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatNetworkCause(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_network_headers",
+		label: "Chrome Extra HTTP Headers",
+		description:
+			"Inject extra HTTP headers on every request from the resolved tab via CDP Network.setExtraHTTPHeaders (headers: {name: value}), or clear them (clear=true / empty headers). Injected header VALUES are always redacted from the response (names + count only) and from history. The header set persists across re-attaches (keepalive mode) while non-empty. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Inject or clear extra HTTP headers (values always redacted).",
+		parameters: Type.Object({
+			headers: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Extra HTTP headers to inject, e.g. { 'X-Api-Key': '...' }. Values never echo back." })),
+			clear: Type.Optional(Type.Boolean({ description: "Clear injected extra HTTP headers." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("network.headers", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatNetworkHeaders(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_network_intercept",
+		label: "Chrome Network Intercept (Fetch domain)",
+		description:
+			"Intercept and control network requests via the CDP Fetch domain: action=on enables interception (urlPatterns, default '*' pauses all), action=list shows currently paused requests, action=resolve continues / fulfills / fails one paused request (resolveAction=continue|fulfill|fail; fail uses errorReason, fulfill takes responseCode/responseHeaders/body). SAFETY: every paused request auto-continues after 30 seconds so an unresolved interception can never wedge the page's network stack; the paused-request ring is bounded (200) and the mode keeps the attach alive + re-applies on re-attach. Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "Intercept requests (pause/continue/fulfill/fail) with a 30s auto-continue safety rail.",
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(interceptActionValues)),
+			patterns: Type.Optional(Type.Array(Type.String(), { description: "URL patterns to pause (e.g. ['*://api.example/*']); default '*' pauses all requests." })),
+			requestId: Type.Optional(Type.String({ description: "Paused request id to resolve (action=resolve)." })),
+			resolveAction: Type.Optional(StringEnum(interceptResolveActionValues)),
+			responseCode: Type.Optional(Type.Number({ description: "HTTP status for fulfill (default 200)." })),
+			responseHeaders: Type.Optional(Type.Array(Type.Object({ name: Type.String(), value: Type.String() }), { description: "Response headers for fulfill." })),
+			body: Type.Optional(Type.String({ description: "Response body for fulfill (base64-encoded for binary)." })),
+			errorReason: Type.Optional(Type.String({ description: "Network.ErrorReason for fail, e.g. BlockedByClient / Aborted / TimedOut (default BlockedByClient)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const kind = `network.intercept.${params.action ?? "on"}` as const;
+			const result = (await authorizedBridgeSend(kind, withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatInterceptStatus(result) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_websocket_messages",
+		label: "Chrome WebSocket Messages",
+		description:
+			"List WebSocket connections and frames captured via CDP Network.webSocket* events while network capture mode is on: handshake, status, per-frame direction (sent/received/ping/pong), opcode, mask, and a size-capped payload preview (2KB). The ring holds up to 2000 frames; pass clear=true to reset it and limit to cap the returned window. Payloads are preview-only by default (secrets stay truncated, redaction discipline). Runs on the resolved tab via the companion extension; requires /chrome authorize.",
+		promptSnippet: "List captured WebSocket frames (handshake, opcode, payload previews).",
+		parameters: Type.Object({
+			clear: Type.Optional(Type.Boolean({ description: "Clear the captured WS frame ring after reading." })),
+			limit: Type.Optional(Type.Number({ description: "Max frames to return (default all captured, max 2000)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = (await authorizedBridgeSend("network.websockets", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as Record<string, unknown>;
+			return { content: [{ type: "text", text: formatWebsocketFrames(result) }], details: { result: result as Json } };
 		},
 	});
 

@@ -366,6 +366,49 @@ const MODE_HEAP_RECORDING = "heapRecording";
 const MODE_BREAKPOINTS = "breakpoints";
 const MODE_INTERCEPT = "intercept";
 const MODE_RECORD_SESSION = "sessionRecord";
+const MODE_PAUSE_EXCEPTIONS = "pauseExceptions";
+
+// P1A caps: debugger family + console/exceptions + network deep-dive. Bounded rings everywhere
+// mirroring CDP_NETWORK_MAX_ENTRIES_PER_TAB (2000) and the 500-entry console cap (risk #11); the
+// per-paused-request intercept timeout is the mandatory safety rail for Fetch interception (#5).
+const DEBUG_BREAKPOINTS_KEEPALIVE_MS = 60 * 60 * 1000; // breakpoints / pause-on-exceptions hold the attach
+const SCRIPT_INVENTORY_MAX = 2000; // Debugger.scriptParsed inventory cap
+const SCRIPT_SOURCE_MAX_CHARS = 2 * 1024 * 1024; // minified script payload cap (risk #4)
+const PAUSED_FRAMES_MAX = 50; // cached call-frames cap (mirrors the existing slice(0,50))
+const PAUSED_SCOPES_PER_FRAME = 3; // scope-chain previews per frame
+const CALLSTACK_SCOPE_PROPERTIES_MAX = 20; // properties previewed per scope
+const EXCEPTION_RING_MAX = 500;
+const CONSOLE_RING_MAX = 500;
+const LOG_RING_MAX = 500;
+const WS_FRAMES_MAX = 2000; // mirrors CDP_NETWORK_MAX_ENTRIES_PER_TAB
+const WS_PAYLOAD_PREVIEW_MAX = 2048; // WS payload preview cap (risk #10)
+const INTERCEPT_MODE_KEEPALIVE_MS = 60 * 60 * 1000;
+const INTERCEPT_PAUSED_TIMEOUT_MS = 30_000; // per-paused-request auto-continue (risk #5)
+const INTERCEPT_PAUSED_MAX = 200; // bounded paused-request ring
+const INTERCEPT_RESOLVED_MAX = 200;
+
+// P1A per-tab state (all in-memory; long-lived intent rides the keepalive registry).
+const breakpointsPerTab = new Map(); // tabId -> BreakpointRecord[] { breakpointId, url?, scriptId?, lineNumber, condition?, locations? }
+const scriptInventoryPerTab = new Map(); // tabId -> Map<scriptId, { scriptId, url, startLine, startColumn, endLine, endColumn, isModule, sourceMapURL }>
+const pauseOnExceptionsPerTab = new Map(); // tabId -> "none" | "uncaught" | "all"
+const runtimeExceptionsPerTab = new Map(); // tabId -> ring of Runtime.exceptionThrown summaries
+const consoleCaptureTabs = new Set(); // tabId with console.capture mode on
+const consoleEntriesPerTab = new Map(); // tabId -> ring of Runtime.consoleAPICalled summaries
+const logEntriesPerTab = new Map(); // tabId -> ring of Log.entryAdded summaries
+const headersPerTab = new Map(); // tabId -> { name: value } extra HTTP headers
+const wsFramesPerTab = new Map(); // tabId -> ring of Network.webSocket* summaries
+const interceptPerTab = new Map(); // tabId -> { patterns, paused: Map<requestId, record>, resolved: ring }
+
+function ringPush(ring, item, cap) {
+  ring.push(item);
+  if (ring.length > cap) ring.splice(0, ring.length - cap);
+}
+
+// CDP event timestamps arrive in SECONDS since epoch; normalize to ms so console/exception/log
+// rings sort cleanly and render human-readable timestamps.
+function normalizeCdpTimestamp(ts) {
+  return typeof ts === "number" ? Math.round(ts * 1000) : Date.now();
+}
 
 // Per-tab paused-page state (Debugger.paused / Debugger.resumed). While paused the main thread
 // is frozen: evaluate/snapshot/input would hang forever, so ensurePageUsable auto-resumes first
@@ -480,6 +523,123 @@ const keepaliveModes = {
     restore: () => {},
     reapply: null,
     onDetach: (tabId) => { pausedTabs.delete(tabId); },
+  },
+  [MODE_BREAKPOINTS]: {
+    // JS breakpoints die with the attach (Debugger domain state) — re-apply on re-attach from
+    // the persisted records; the onDetach hook just drops the per-tab records.
+    keepaliveMs: DEBUG_BREAKPOINTS_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => {
+      const records = breakpointsPerTab.get(tabId);
+      return records && records.length ? { breakpoints: records.map((b) => ({ ...b })) } : null;
+    },
+    restore: (tabId, snap) => {
+      if (snap && Array.isArray(snap.breakpoints) && snap.breakpoints.length) {
+        breakpointsPerTab.set(tabId, snap.breakpoints.map((b) => ({ ...b })));
+      }
+    },
+    reapply: async (tabId, snap) => {
+      if (!snap || !Array.isArray(snap.breakpoints) || !snap.breakpoints.length) return;
+      await enableCdpDomain(tabId, "Debugger").catch(() => undefined);
+      const reapplied = [];
+      for (const b of snap.breakpoints) {
+        try {
+          const res = await cdp(tabId, "Debugger.setBreakpointByUrl", {
+            ...(b.url ? { url: b.url } : {}),
+            ...(b.scriptId ? { scriptId: b.scriptId } : {}),
+            lineNumber: b.lineNumber,
+            ...(b.condition ? { condition: b.condition } : {}),
+          });
+          reapplied.push({ ...b, breakpointId: res?.breakpointId || b.breakpointId });
+        } catch {
+          // A stale breakpoint (script no longer on the page) is re-applied on the next attach.
+          reapplied.push({ ...b });
+        }
+      }
+      breakpointsPerTab.set(tabId, reapplied);
+    },
+    onDetach: (tabId) => breakpointsPerTab.delete(tabId),
+  },
+  [MODE_PAUSE_EXCEPTIONS]: {
+    // Debugger.setPauseOnExceptions state dies with the attach; persist so a re-attach restores
+    // the chosen "uncaught"/"all" behavior instead of silently reverting to the default.
+    keepaliveMs: DEBUG_BREAKPOINTS_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => (pauseOnExceptionsPerTab.has(tabId) ? { state: pauseOnExceptionsPerTab.get(tabId) } : null),
+    restore: (tabId, snap) => { if (snap && snap.state) pauseOnExceptionsPerTab.set(tabId, snap.state); },
+    reapply: async (tabId, snap) => {
+      if (!snap || !snap.state) return;
+      await enableCdpDomain(tabId, "Debugger").catch(() => undefined);
+      await cdp(tabId, "Debugger.setPauseOnExceptions", { state: snap.state }).catch(() => undefined);
+    },
+    onDetach: (tabId) => pauseOnExceptionsPerTab.delete(tabId),
+  },
+  [MODE_CONSOLE_CAPTURE]: {
+    // console.capture is a persistent mode (network.mode-style keepalive + persist + re-apply).
+    // Only the intent is persisted — the rings themselves are in-memory and best-effort across
+    // an MV3 suspend (surfaced as "recording lost" rather than silently dropped).
+    keepaliveMs: NETWORK_MODE_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => (consoleCaptureTabs.has(tabId) ? { enabled: true } : null),
+    restore: (tabId, snap) => { if (snap && snap.enabled) consoleCaptureTabs.add(tabId); },
+    reapply: async (tabId) => {
+      if (!consoleCaptureTabs.has(tabId)) return;
+      await enableCdpDomain(tabId, "Runtime").catch(() => undefined);
+      await enableCdpDomain(tabId, "Log").catch(() => undefined);
+    },
+    onDetach: (tabId) => consoleCaptureTabs.delete(tabId),
+  },
+  [MODE_HEADERS]: {
+    // Network.setExtraHTTPHeaders dies with the attach — persist + re-apply like blockedUrls.
+    keepaliveMs: NETWORK_MODE_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => {
+      const h = headersPerTab.get(tabId);
+      return h && Object.keys(h).length ? { headers: { ...h } } : null;
+    },
+    restore: (tabId, snap) => {
+      if (snap && snap.headers && typeof snap.headers === "object" && Object.keys(snap.headers).length) {
+        headersPerTab.set(tabId, { ...snap.headers });
+      }
+    },
+    reapply: async (tabId, snap) => {
+      if (!snap || !snap.headers || !Object.keys(snap.headers).length) return;
+      await enableNetworkDomain(tabId).catch(() => undefined);
+      await cdp(tabId, "Network.setExtraHTTPHeaders", { headers: snap.headers }).catch(() => undefined);
+    },
+    onDetach: (tabId) => headersPerTab.delete(tabId),
+  },
+  [MODE_INTERCEPT]: {
+    // Fetch interception: paused requests auto-continue after INTERCEPT_PAUSED_TIMEOUT_MS so an
+    // unresolved pause can never wedge the page's network stack (risk #5). Fetch.enable dies
+    // with the attach — persist the patterns and re-apply on re-attach.
+    keepaliveMs: INTERCEPT_MODE_KEEPALIVE_MS,
+    persist: true,
+    snapshot: (tabId) => {
+      const st = interceptPerTab.get(tabId);
+      return st ? { patterns: st.patterns.slice() } : null;
+    },
+    restore: (tabId, snap) => {
+      if (snap && Array.isArray(snap.patterns)) {
+        interceptPerTab.set(tabId, { patterns: snap.patterns.slice(), paused: new Map(), resolved: [] });
+      }
+    },
+    reapply: async (tabId, snap) => {
+      const st = interceptPerTab.get(tabId);
+      if (!st) return;
+      // Fetch.enable IS the domain enable (a bare enableCdpDomain("Fetch") would pause ALL
+      // requests with an empty pattern set — never do that).
+      await cdp(tabId, "Fetch.enable", { patterns: st.patterns.map((urlPattern) => ({ urlPattern })) }).catch(() => undefined);
+    },
+    onDetach: (tabId) => {
+      const st = interceptPerTab.get(tabId);
+      if (st) {
+        for (const p of st.paused.values()) clearTimeout(p.timer);
+        st.paused.clear();
+        void cdp(tabId, "Fetch.disable", {}).catch(() => undefined);
+      }
+      interceptPerTab.delete(tabId);
+    },
   },
 };
 
@@ -659,6 +819,11 @@ function inputStatus() {
     activeModes: Array.from(modesPerTab.entries()).map(([tabId, set]) => ({ tabId, modes: Array.from(set) })),
     pausedTabs: Array.from(pausedTabs.keys()),
     recentPauseResumes: pauseResumeEvents.slice(),
+    consoleCaptureTabs: Array.from(consoleCaptureTabs.keys()),
+    interceptTabs: Array.from(interceptPerTab.keys()),
+    headerTabs: Array.from(headersPerTab.keys()),
+    exceptionCounts: Array.from(runtimeExceptionsPerTab.entries()).map(([tabId, ring]) => ({ tabId, count: ring.length })),
+    wsFrameCounts: Array.from(wsFramesPerTab.entries()).map(([tabId, ring]) => ({ tabId, count: ring.length })),
   };
 }
 
@@ -855,8 +1020,8 @@ function handleCdpNetworkEvent(tabId, method, params) {
     tabEntries = new Map();
     cdpNetworkEntries.set(tabId, tabEntries);
   }
+  // Redirects re-fire requestWillBeSent with the same requestId; chain the previous hop.
   if (method === "Network.requestWillBeSent") {
-    // Redirects re-fire requestWillBeSent with the same requestId; chain the previous hop.
     const prior = tabEntries.get(requestId);
     const req = params.request || {};
     const entry = prior || {
@@ -903,6 +1068,28 @@ function handleCdpNetworkEvent(tabId, method, params) {
     if (params.initiator && params.initiator.type) entry.initiatorType = String(params.initiator.type);
     tabEntries.set(requestId, entry);
     trimCdpNetworkEntries(tabEntries);
+  } else if (method === "Network.requestWillBeSentExtraInfo") {
+    // P1A chrome_network_cause: extraInfo carries the ACTUAL request headers (with cookie blocks)
+    // and client security state — the causality surface for failed/blocked requests.
+    const entry = tabEntries.get(requestId);
+    if (!entry) return;
+    entry.requestExtraInfo = {
+      headers: objectToHeaderList(params.headers),
+      associatedCookies: Array.isArray(params.associatedCookies) ? params.associatedCookies.slice(0, 50).map((c) => ({ name: String(c?.cookie?.name || ""), domain: String(c?.cookie?.domain || ""), blockedReasons: Array.isArray(c?.blockedReasons) ? c.blockedReasons.map(String) : [], exempted: c?.exempted === true })) : [],
+      blockedRequestCookies: Array.isArray(params.blockedRequestCookies) ? params.blockedRequestCookies.slice(0, 50).map((c) => ({ name: String(c?.cookie?.name || ""), domain: String(c?.cookie?.domain || ""), blockedReasons: Array.isArray(c?.blockedReasons) ? c.blockedReasons.map(String) : [] })) : [],
+      clientSecurityState: params.clientSecurityState ? { ...params.clientSecurityState } : undefined,
+      connectTiming: params.connectTiming ? { requestTime: params.connectTiming.requestTime } : undefined,
+    };
+  } else if (method === "Network.responseReceivedExtraInfo") {
+    const entry = tabEntries.get(requestId);
+    if (!entry) return;
+    entry.responseExtraInfo = {
+      statusCode: typeof params.statusCode === "number" ? params.statusCode : null,
+      headers: objectToHeaderList(params.headers),
+      headersText: typeof params.headersText === "string" ? params.headersText.slice(0, 4000) : undefined,
+      blockedCookies: Array.isArray(params.blockedCookies) ? params.blockedCookies.slice(0, 50).map((c) => ({ name: String(c?.cookie?.name || ""), domain: String(c?.cookie?.domain || ""), blockedReasons: Array.isArray(c?.blockedReasons) ? c.blockedReasons.map(String) : [] })) : [],
+      cookiePartitionKey: params.cookiePartitionKey ? String(params.cookiePartitionKey) : undefined,
+    };
   } else if (method === "Network.responseReceived") {
     const entry = tabEntries.get(requestId);
     if (!entry) return;
@@ -914,6 +1101,8 @@ function handleCdpNetworkEvent(tabId, method, params) {
     entry.protocol = resp.protocol || "";
     entry.fromServiceWorker = resp.fromServiceWorker === true;
     entry.fromCache = resp.fromDiskCache === true || resp.fromMemoryCache === true;
+    // P1A chrome_network_cause: TLS/security details for the request (certificate, cipher, ...).
+    if (resp.securityDetails && typeof resp.securityDetails === "object") entry.securityDetails = { ...resp.securityDetails };
     if (typeof params.timestamp === "number") entry.responseTimestamp = params.timestamp;
     if (resp.timing && typeof resp.timing === "object") entry.timings = { ...resp.timing };
     if (resp.remoteIPAddress) entry.serverIPAddress = String(resp.remoteIPAddress);
@@ -930,6 +1119,10 @@ function handleCdpNetworkEvent(tabId, method, params) {
     if (!entry) return;
     entry.errorText = String(params.errorText || "Failed");
     entry.canceled = params.canceled === true;
+    // P1A chrome_network_cause: the blockedReason (cors, mixed-content, ...) + CORS error status
+    // are the "why did this fail" answers DevTools surfaces in the Network panel.
+    if (typeof params.blockedReason === "string") entry.blockedReason = params.blockedReason;
+    if (params.corsErrorStatus && typeof params.corsErrorStatus === "object") entry.corsErrorStatus = { ...params.corsErrorStatus };
     if (typeof params.timestamp === "number") entry.failedTimestamp = params.timestamp;
     entry.failedAt = Date.now();
     entry.durationMs = entry.failedAt - entry.startedAt;
@@ -938,6 +1131,9 @@ function handleCdpNetworkEvent(tabId, method, params) {
     if (!entry) return;
     entry.dataLength = (entry.dataLength || 0) + (params.dataLength || 0);
     if (typeof params.encodedDataLength === "number") entry.encodedDataLength = (entry.encodedDataLength || 0) + params.encodedDataLength;
+  } else if (method.startsWith("Network.webSocket")) {
+    // P1A chrome_websocket_messages: WebSocket lifecycle + frames are Network-domain events.
+    recordWebSocketEvent(tabId, method, params);
   }
 }
 
@@ -1017,16 +1213,26 @@ if (chrome.debugger && chrome.debugger.onEvent) {
       // Record the pause so ensurePageUsable can auto-resume before any evaluate/snapshot/input
       // command and the idle-detach sweep exempts the tab (a detach would force-resume, losing
       // the pause). Call frames are preview-capped (bounded buffers, risk #11); the full stack is
-      // re-derivable via Debugger.getStackTrace when a debugger tool needs it.
+      // re-derivable via Debugger.getStackTrace when a debugger tool needs it. P1A: each cached
+      // frame also carries callFrameId / scriptId / a capped scope chain so chrome_get_call_stack
+      // and chrome_evaluate_in_frame work without re-questioning the debugger.
       pausedTabs.set(tabId, {
         reason: String(eventParams?.reason || "other"),
         callFrames: Array.isArray(eventParams?.callFrames)
           ? eventParams.callFrames.map((cf) => ({
+              callFrameId: typeof cf?.callFrameId === "string" ? cf.callFrameId : null,
               functionName: String(cf?.functionName || ""),
               url: String(cf?.url || ""),
+              scriptId: typeof cf?.scriptId === "string" ? cf.scriptId : null,
               lineNumber: typeof cf?.lineNumber === "number" ? cf.lineNumber : null,
               columnNumber: typeof cf?.columnNumber === "number" ? cf.columnNumber : null,
-            })).slice(0, 50)
+              scopeChain: Array.isArray(cf?.scopeChain)
+                ? cf.scopeChain.slice(0, PAUSED_SCOPES_PER_FRAME).map((s) => ({
+                    type: String(s?.type || ""),
+                    object: s?.object && typeof s.object.objectId === "string" ? { objectId: s.object.objectId } : null,
+                  }))
+                : [],
+            })).slice(0, PAUSED_FRAMES_MAX)
           : [],
         timestamp: Date.now(),
       });
@@ -1035,6 +1241,66 @@ if (chrome.debugger && chrome.debugger.onEvent) {
     }
     if (method === "Debugger.resumed") {
       if (pausedTabs.delete(tabId)) unregisterMode(tabId, MODE_PAUSED);
+      return;
+    }
+    if (method === "Debugger.scriptParsed") {
+      // Bounded script inventory feeding chrome_get_script_source (scriptId -> meta). Oldest
+      // entries are evicted first so the inventory can never grow unbounded (risk #11).
+      if (!eventParams || typeof eventParams.scriptId !== "string") return;
+      let inv = scriptInventoryPerTab.get(tabId);
+      if (!inv) { inv = new Map(); scriptInventoryPerTab.set(tabId, inv); }
+      inv.set(eventParams.scriptId, {
+        scriptId: eventParams.scriptId,
+        url: String(eventParams.url || ""),
+        startLine: typeof eventParams.startLine === "number" ? eventParams.startLine : null,
+        startColumn: typeof eventParams.startColumn === "number" ? eventParams.startColumn : null,
+        endLine: typeof eventParams.endLine === "number" ? eventParams.endLine : null,
+        endColumn: typeof eventParams.endColumn === "number" ? eventParams.endColumn : null,
+        isModule: eventParams.isModule === true,
+        sourceMapURL: typeof eventParams.sourceMapURL === "string" ? eventParams.sourceMapURL : null,
+      });
+      if (inv.size > SCRIPT_INVENTORY_MAX) {
+        for (const key of Array.from(inv.keys()).slice(0, inv.size - SCRIPT_INVENTORY_MAX)) inv.delete(key);
+      }
+      return;
+    }
+    if (method === "Runtime.consoleAPICalled") {
+      // console.capture is a persistent mode: only record console API calls while the mode is on
+      // (they are very chatty). Exceptions and Log entries are recorded whenever their domains
+      // are enabled so chrome_list_js_exceptions / chrome_browser_log always see them.
+      if (!consoleCaptureTabs.has(tabId)) return;
+      const entry = summarizeConsoleApiCall(eventParams);
+      let ring = consoleEntriesPerTab.get(tabId);
+      if (!ring) { ring = []; consoleEntriesPerTab.set(tabId, ring); }
+      ringPush(ring, entry, CONSOLE_RING_MAX);
+      return;
+    }
+    if (method === "Runtime.exceptionThrown") {
+      if (!eventParams || !eventParams.exceptionDetails) return;
+      const entry = summarizeException(eventParams.exceptionDetails, eventParams.timestamp);
+      let ring = runtimeExceptionsPerTab.get(tabId);
+      if (!ring) { ring = []; runtimeExceptionsPerTab.set(tabId, ring); }
+      ringPush(ring, entry, EXCEPTION_RING_MAX);
+      return;
+    }
+    if (method === "Log.entryAdded") {
+      if (!eventParams || !eventParams.entry) return;
+      const e = eventParams.entry;
+      const entry = {
+        timestamp: normalizeCdpTimestamp(e.timestamp),
+        level: String(e.level || "info"),
+        text: String(e.text || "").slice(0, 2000),
+        source: String(e.source || ""),
+        url: String(e.url || ""),
+        lineNumber: typeof e.lineNumber === "number" ? e.lineNumber : null,
+      };
+      let ring = logEntriesPerTab.get(tabId);
+      if (!ring) { ring = []; logEntriesPerTab.set(tabId, ring); }
+      ringPush(ring, entry, LOG_RING_MAX);
+      return;
+    }
+    if (method === "Fetch.requestPaused") {
+      handleFetchRequestPaused(tabId, eventParams);
       return;
     }
     if (method.startsWith("Network.")) handleCdpNetworkEvent(tabId, method, eventParams);
@@ -3581,6 +3847,648 @@ async function chromeTargets(params) {
   return { targets: filtered, count: filtered.length };
 }
 
+// ==========================================================================
+// P1A batch: Debugger family + console/exceptions + network deep-dive
+// (TOOL_CONTRACTS §6 rows 29-42 / gap report §5.2 + §5.3)
+// ==========================================================================
+
+// ---- shared preview helpers (bounded, risk #10/#11) -----------------------
+function capObjectPreview(preview) {
+  if (!preview || typeof preview !== "object") return null;
+  const props = Array.isArray(preview.properties)
+    ? preview.properties.slice(0, 10).map((p) => ({
+        name: String(p?.name || ""),
+        type: String(p?.type || ""),
+        value: typeof p?.value === "string" ? p.value.slice(0, 200) : (p?.value !== undefined ? p.value : undefined),
+      }))
+    : [];
+  return {
+    type: String(preview.type || ""),
+    description: String(preview.description || "").slice(0, 300),
+    properties: props,
+    overflow: preview.overflow === true,
+  };
+}
+
+function capRemotePreview(remote) {
+  if (!remote || typeof remote !== "object") return { type: "undefined" };
+  const out = { type: String(remote.type || "") };
+  if (typeof remote.value === "string") out.value = remote.value.slice(0, 500);
+  else if (remote.value !== undefined) out.value = remote.value;
+  if (typeof remote.description === "string") out.description = remote.description.slice(0, 500);
+  if (remote.preview && typeof remote.preview === "object") out.preview = capObjectPreview(remote.preview);
+  return out;
+}
+
+function summarizeException(details, timestamp) {
+  const stackTrace = Array.isArray(details?.stackTrace?.callFrames)
+    ? details.stackTrace.callFrames.slice(0, 20).map((cf) => ({
+        functionName: String(cf?.functionName || ""),
+        url: String(cf?.url || ""),
+        lineNumber: typeof cf?.lineNumber === "number" ? cf.lineNumber : null,
+        columnNumber: typeof cf?.columnNumber === "number" ? cf.columnNumber : null,
+      }))
+    : [];
+  let preview = null;
+  const ex = details?.exception;
+  if (ex) {
+    if (typeof ex.description === "string") preview = { type: "description", value: ex.description.slice(0, 1000) };
+    else if (ex.preview) preview = { type: "preview", ...capObjectPreview(ex.preview) };
+    else if (ex.value !== undefined) preview = { type: "value", value: typeof ex.value === "string" ? ex.value.slice(0, 500) : String(ex.value).slice(0, 500) };
+  }
+  return {
+    timestamp: normalizeCdpTimestamp(timestamp),
+    text: String(details?.text || ""),
+    url: String(details?.url || ""),
+    lineNumber: typeof details?.lineNumber === "number" ? details.lineNumber : null,
+    columnNumber: typeof details?.columnNumber === "number" ? details.columnNumber : null,
+    exceptionId: typeof details?.exceptionId === "number" ? details.exceptionId : null,
+    stackTrace,
+    preview,
+  };
+}
+
+function summarizeConsoleApiCall(params) {
+  const args = Array.isArray(params?.args) ? params.args.slice(0, 10).map(capRemotePreview) : [];
+  const stackTrace = Array.isArray(params?.stackTrace?.callFrames)
+    ? params.stackTrace.callFrames.slice(0, 10).map((cf) => ({
+        functionName: String(cf?.functionName || ""),
+        url: String(cf?.url || ""),
+        lineNumber: typeof cf?.lineNumber === "number" ? cf.lineNumber : null,
+        columnNumber: typeof cf?.columnNumber === "number" ? cf.columnNumber : null,
+      }))
+    : [];
+  return {
+    timestamp: normalizeCdpTimestamp(params?.timestamp),
+    type: String(params?.type || "log"),
+    args,
+    stackTrace,
+    context: String(params?.context || ""),
+    executionContextId: typeof params?.executionContextId === "number" ? params.executionContextId : null,
+  };
+}
+
+function recordWebSocketEvent(tabId, method, params) {
+  const requestId = params?.requestId !== undefined ? String(params.requestId) : "";
+  if (!requestId) return;
+  let ring = wsFramesPerTab.get(tabId);
+  if (!ring) { ring = []; wsFramesPerTab.set(tabId, ring); }
+  const frame = { requestId, timestamp: normalizeCdpTimestamp(params?.timestamp) };
+  const wsFrame = params?.response || {};
+  const payloadPreview = () => {
+    if (typeof wsFrame.payloadData === "string") {
+      frame.payloadPreview = wsFrame.payloadData.slice(0, WS_PAYLOAD_PREVIEW_MAX);
+      frame.payloadTruncated = wsFrame.payloadData.length > WS_PAYLOAD_PREVIEW_MAX;
+    }
+  };
+  if (method === "Network.webSocketCreated") {
+    frame.direction = "created";
+    frame.url = String(params?.url || "");
+  } else if (method === "Network.webSocketWillSendHandshakeRequest") {
+    frame.direction = "handshake";
+    frame.headers = objectToHeaderList(params?.request?.headers).slice(0, 50);
+  } else if (method === "Network.webSocketHandshakeResponseReceived") {
+    frame.direction = "response";
+    frame.statusText = String(wsFrame.statusText || "");
+    frame.headers = objectToHeaderList(wsFrame.headers).slice(0, 50);
+  } else if (method === "Network.webSocketFrameSent" || method === "Network.webSocketFrameReceived") {
+    frame.direction = method === "Network.webSocketFrameSent" ? "sent" : "received";
+    frame.opcode = typeof wsFrame.opcode === "number" ? wsFrame.opcode : null;
+    frame.mask = wsFrame.mask === true;
+    payloadPreview();
+  } else if (method === "Network.webSocketWillSendPing" || method === "Network.webSocketReceivedPong") {
+    frame.direction = method === "Network.webSocketWillSendPing" ? "ping" : "pong";
+    payloadPreview();
+  } else if (method === "Network.webSocketClosed") {
+    frame.direction = "closed";
+  } else {
+    frame.direction = String(method).replace("Network.webSocket", "").toLowerCase();
+  }
+  ringPush(ring, frame, WS_FRAMES_MAX);
+}
+
+// Fetch.requestPaused: record the pause (bounded ring) and arm the mandatory 30s auto-timeout so
+// an unresolved interception can never wedge the page's network stack (risk #5). When interception
+// is not active for the tab, a stray paused request is auto-continued instead of lingering.
+function handleFetchRequestPaused(tabId, params) {
+  const requestId = params?.requestId !== undefined ? String(params.requestId) : "";
+  if (!requestId) return;
+  const st = interceptPerTab.get(tabId);
+  if (!st) {
+    void cdp(tabId, "Fetch.continueRequest", { requestId }).catch(() => undefined);
+    return;
+  }
+  const record = {
+    requestId,
+    url: String(params?.request?.url || ""),
+    method: String(params?.request?.method || "GET").toUpperCase(),
+    resourceType: String(params?.resourceType || ""),
+    pausedAt: Date.now(),
+    timer: null,
+  };
+  record.timer = setTimeout(() => {
+    if (!st.paused.has(requestId)) return;
+    st.paused.delete(requestId);
+    void cdp(tabId, "Fetch.continueRequest", { requestId }).catch(() =>
+      void cdp(tabId, "Fetch.failRequest", { requestId, errorReason: "Aborted" }).catch(() => undefined),
+    );
+    st.resolved.push({ requestId, action: "auto-continue-timeout", at: Date.now() });
+    if (st.resolved.length > INTERCEPT_RESOLVED_MAX) st.resolved.shift();
+  }, INTERCEPT_PAUSED_TIMEOUT_MS);
+  st.paused.set(requestId, record);
+  if (st.paused.size > INTERCEPT_PAUSED_MAX) {
+    // Bounded paused-request ring: force-continue the OLDEST pause to make room.
+    const oldest = Array.from(st.paused.values())[0];
+    if (oldest) {
+      if (oldest.timer) clearTimeout(oldest.timer);
+      st.paused.delete(oldest.requestId);
+      void cdp(tabId, "Fetch.continueRequest", { requestId: oldest.requestId }).catch(() => undefined);
+    }
+  }
+}
+
+// ---- debugger family (M5, rail-exempt by design: Debugger.* commands need the pause) -------
+async function chromeBreakpoint(params) {
+  const tab = await getTabByParams(params);
+  const action = String(params.action || "set");
+  if (action === "list") {
+    const records = breakpointsPerTab.get(tab.id) || [];
+    return {
+      breakpoints: records.map((b) => ({ ...b })),
+      count: records.length,
+      pauseOnExceptions: pauseOnExceptionsPerTab.get(tab.id) || null,
+    };
+  }
+  await attachDebugger(tab.id);
+  await enableCdpDomain(tab.id, "Debugger");
+  if (action === "set") {
+    if (typeof params.lineNumber !== "number") throw new Error("chrome_breakpoint set requires lineNumber (0-based)");
+    if (!params.url && !params.scriptId) throw new Error("chrome_breakpoint set requires url or scriptId");
+    const res = await cdp(tab.id, "Debugger.setBreakpointByUrl", {
+      ...(params.url ? { url: params.url } : {}),
+      ...(params.scriptId ? { scriptId: params.scriptId } : {}),
+      lineNumber: params.lineNumber,
+      ...(params.condition ? { condition: params.condition } : {}),
+    });
+    const record = {
+      breakpointId: String(res?.breakpointId || ""),
+      url: params.url || null,
+      scriptId: params.scriptId || null,
+      lineNumber: params.lineNumber,
+      condition: params.condition || null,
+      locations: Array.isArray(res?.locations)
+        ? res.locations.map((l) => ({ scriptId: l?.scriptId, lineNumber: l?.lineNumber, columnNumber: l?.columnNumber }))
+        : [],
+    };
+    const records = breakpointsPerTab.get(tab.id) || [];
+    records.push(record);
+    breakpointsPerTab.set(tab.id, records);
+    registerMode(tab.id, MODE_BREAKPOINTS);
+    return { action, breakpoint: record, count: records.length };
+  }
+  if (action === "remove") {
+    if (!params.breakpointId) throw new Error("chrome_breakpoint remove requires breakpointId");
+    const records = breakpointsPerTab.get(tab.id) || [];
+    const target = records.find((b) => b.breakpointId === String(params.breakpointId));
+    if (!target) throw new Error(`No breakpoint with id ${params.breakpointId} on this tab`);
+    await cdp(tab.id, "Debugger.removeBreakpoint", { breakpointId: target.breakpointId }).catch(() => undefined);
+    const remaining = records.filter((b) => b.breakpointId !== target.breakpointId);
+    breakpointsPerTab.set(tab.id, remaining);
+    if (!remaining.length) unregisterMode(tab.id, MODE_BREAKPOINTS);
+    return { action, removed: target.breakpointId, count: remaining.length };
+  }
+  throw new Error(`Unknown breakpoint action: ${action}`);
+}
+
+async function chromePause(params) {
+  const tab = await getTabByParams(params);
+  const cached = pausedTabs.get(tab.id);
+  if (cached) {
+    return { paused: true, alreadyPaused: true, reason: cached.reason, callFrames: cached.callFrames, timestamp: cached.timestamp };
+  }
+  await attachDebugger(tab.id);
+  await enableCdpDomain(tab.id, "Debugger");
+  await cdp(tab.id, "Debugger.pause");
+  // Best-effort wait for the Debugger.paused event to populate the cached stack (MODE_PAUSED is
+  // registered by the event branch; an already-resumed page simply returns the requested state).
+  const deadline = Date.now() + 800;
+  while (Date.now() < deadline) {
+    if (pausedTabs.has(tab.id)) break;
+    await sleep(30);
+  }
+  const paused = pausedTabs.get(tab.id);
+  if (!paused) return { paused: true, reason: "requested", callFrames: [], eventPending: true };
+  return { paused: true, reason: paused.reason, callFrames: paused.callFrames, timestamp: paused.timestamp };
+}
+
+async function chromeResume(params) {
+  const tab = await getTabByParams(params);
+  if (!pausedTabs.has(tab.id)) {
+    return { resumed: false, paused: false, note: "page is not paused" };
+  }
+  await cdp(tab.id, "Debugger.resume");
+  pausedTabs.delete(tab.id);
+  unregisterMode(tab.id, MODE_PAUSED);
+  return { resumed: true, paused: false };
+}
+
+async function chromeStep(params) {
+  const tab = await getTabByParams(params);
+  if (!pausedTabs.has(tab.id)) {
+    throw new Error("chrome_step requires a paused page — call chrome_pause or hit a breakpoint first");
+  }
+  const action = String(params.action || "into");
+  const method = action === "out" ? "Debugger.stepOut" : action === "over" ? "Debugger.stepOver" : "Debugger.stepInto";
+  await cdp(tab.id, method);
+  // A step fires resumed + paused; wait briefly for the new paused stack (best-effort).
+  const deadline = Date.now() + 800;
+  while (Date.now() < deadline) {
+    if (pausedTabs.has(tab.id)) break;
+    await sleep(30);
+  }
+  const updated = pausedTabs.get(tab.id);
+  return {
+    action,
+    stepped: true,
+    callFrames: updated ? updated.callFrames : [],
+    reason: updated ? updated.reason : null,
+  };
+}
+
+async function chromeGetCallStack(params) {
+  const tab = await getTabByParams(params);
+  const paused = pausedTabs.get(tab.id);
+  if (!paused) throw new Error("chrome_get_call_stack requires a paused page — call chrome_pause or hit a breakpoint first");
+  await attachDebugger(tab.id);
+  await enableCdpDomain(tab.id, "Debugger");
+  // Enrich each cached frame with scope value previews via Runtime.getProperties on the debugger-
+  // held scope objects (valid while paused; DevTools does the same). Bounded: frames <= 50,
+  // scopes <= 3, properties <= 20 per scope, previews capped.
+  const frames = [];
+  for (const cf of paused.callFrames.slice(0, PAUSED_FRAMES_MAX)) {
+    const frame = {
+      callFrameId: cf.callFrameId || null,
+      functionName: cf.functionName || "",
+      url: cf.url || "",
+      scriptId: cf.scriptId || null,
+      lineNumber: cf.lineNumber ?? null,
+      columnNumber: cf.columnNumber ?? null,
+      scopes: [],
+    };
+    const scopeChain = Array.isArray(cf.scopeChain) ? cf.scopeChain.slice(0, PAUSED_SCOPES_PER_FRAME) : [];
+    for (const scope of scopeChain) {
+      const scopeEntry = { type: String(scope.type || ""), properties: [], overflow: false };
+      if (scope.object && scope.object.objectId) {
+        try {
+          const props = await cdp(tab.id, "Runtime.getProperties", {
+            objectId: scope.object.objectId,
+            ownProperties: true,
+            generatePreview: true,
+            nonIndexedPropertiesOnly: true,
+          });
+          const list = Array.isArray(props?.result) ? props.result : [];
+          for (const p of list.slice(0, CALLSTACK_SCOPE_PROPERTIES_MAX)) {
+            scopeEntry.properties.push({
+              name: String(p?.name || ""),
+              value: capRemotePreview(p?.value),
+              enumerable: p?.enumerable !== false,
+              writable: p?.writable === true,
+            });
+          }
+          scopeEntry.overflow = list.length > CALLSTACK_SCOPE_PROPERTIES_MAX;
+        } catch {
+          scopeEntry.error = "scope inspection failed";
+        }
+      }
+      frame.scopes.push(scopeEntry);
+    }
+    frames.push(frame);
+  }
+  return { paused: true, reason: paused.reason, timestamp: paused.timestamp, frames, frameCount: frames.length };
+}
+
+async function chromeEvaluateInFrame(params) {
+  const tab = await getTabByParams(params);
+  if (!pausedTabs.has(tab.id)) {
+    throw new Error("chrome_evaluate_in_frame requires a paused page — call chrome_pause or hit a breakpoint first");
+  }
+  if (!params.callFrameId) throw new Error("chrome_evaluate_in_frame requires callFrameId from chrome_get_call_stack");
+  if (!params.expression) throw new Error("chrome_evaluate_in_frame requires expression");
+  await attachDebugger(tab.id);
+  await enableCdpDomain(tab.id, "Debugger");
+  const res = await cdp(tab.id, "Debugger.evaluateOnCallFrame", {
+    callFrameId: String(params.callFrameId),
+    expression: params.expression,
+    returnByValue: params.returnByValue !== false,
+    generatePreview: true,
+    silent: true,
+  });
+  if (res.exceptionDetails) {
+    return {
+      ok: false,
+      exception: {
+        text: String(res.exceptionDetails.text || "Error"),
+        description: String(res.exceptionDetails.exception?.description || res.exceptionDetails.exception?.value || "").slice(0, 2000),
+        lineNumber: typeof res.exceptionDetails.lineNumber === "number" ? res.exceptionDetails.lineNumber : null,
+      },
+    };
+  }
+  return { ok: true, result: capRemotePreview(res.result) };
+}
+
+async function chromeGetScriptSource(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  await enableCdpDomain(tab.id, "Debugger");
+  const inventory = scriptInventoryPerTab.get(tab.id);
+  if (params.list === true || !params.scriptId) {
+    const scripts = inventory ? Array.from(inventory.values()) : [];
+    // Metadata only — never the source text in list mode (payload discipline, risk #4).
+    return { listed: true, count: scripts.length, scripts: scripts.map((s) => ({ ...s })) };
+  }
+  const res = await cdp(tab.id, "Debugger.getScriptSource", { scriptId: String(params.scriptId) });
+  if (!res || typeof res.scriptSource !== "string") {
+    throw new Error(`Debugger.getScriptSource returned no source for scriptId ${params.scriptId} (script may have been collected)`);
+  }
+  const truncated = res.scriptSource.length > SCRIPT_SOURCE_MAX_CHARS;
+  const source = truncated
+    ? res.scriptSource.slice(0, SCRIPT_SOURCE_MAX_CHARS) + `\n[truncated ${res.scriptSource.length - SCRIPT_SOURCE_MAX_CHARS} chars]`
+    : res.scriptSource;
+  const meta = inventory ? inventory.get(String(params.scriptId)) || null : null;
+  return { scriptId: String(params.scriptId), url: meta?.url || "", source, truncated, meta };
+}
+
+async function chromeSetPauseOnExceptions(params) {
+  const tab = await getTabByParams(params);
+  const state = String(params.state || "uncaught"); // contract: default "uncaught" (risk #5)
+  if (!["none", "uncaught", "all"].includes(state)) {
+    throw new Error(`Invalid pause-on-exceptions state: ${state} (use none | uncaught | all)`);
+  }
+  await attachDebugger(tab.id);
+  await enableCdpDomain(tab.id, "Debugger");
+  await cdp(tab.id, "Debugger.setPauseOnExceptions", { state });
+  if (state === "none") {
+    pauseOnExceptionsPerTab.delete(tab.id);
+    unregisterMode(tab.id, MODE_PAUSE_EXCEPTIONS);
+  } else {
+    pauseOnExceptionsPerTab.set(tab.id, state);
+    registerMode(tab.id, MODE_PAUSE_EXCEPTIONS);
+  }
+  return { state, tabId: tab.id };
+}
+
+// ---- console / exceptions (M6 pull + mode surfaces) -----------------------------------------
+async function chromeListJsExceptions(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  // Lazy Runtime.enable so the exceptionThrown feed flows; the ring fills while the domain stays
+  // enabled (until the idle detach) and survives until cleared.
+  await enableCdpDomain(tab.id, "Runtime").catch(() => undefined);
+  const ring = runtimeExceptionsPerTab.get(tab.id) || [];
+  const cleared = params.clear === true ? ring.length : 0;
+  if (params.clear === true) runtimeExceptionsPerTab.delete(tab.id);
+  const limit = Math.min(Math.max(Number(params.limit) || 0, 0), EXCEPTION_RING_MAX);
+  const exceptions = limit > 0 ? ring.slice(-limit) : ring;
+  return { exceptions, count: exceptions.length, cleared };
+}
+
+function readConsoleCapture(tabId, limit) {
+  const consoleRing = consoleEntriesPerTab.get(tabId) || [];
+  const exceptionRing = runtimeExceptionsPerTab.get(tabId) || [];
+  const logRing = logEntriesPerTab.get(tabId) || [];
+  const max = Math.min(Math.max(Number(limit) || 0, 0), CONSOLE_RING_MAX * 3);
+  const all = [
+    ...consoleRing.map((e) => ({ ...e, family: "console" })),
+    ...exceptionRing.map((e) => ({ ...e, family: "exception" })),
+    ...logRing.map((e) => ({ ...e, family: "log" })),
+  ].sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
+  const entries = max > 0 ? all.slice(-max) : all;
+  return { entries, count: entries.length, totals: { console: consoleRing.length, exceptions: exceptionRing.length, log: logRing.length } };
+}
+
+async function chromeConsoleCapture(params) {
+  const enabled = params.enabled !== false;
+  // Disabling must not spawn an automation window just to turn the mode off.
+  const tab = enabled
+    ? await getTabByParams(params)
+    : await getTabByParams(params, { createOwnedTarget: false }).catch(() => null);
+  if (!tab) return { enabled: false, entries: [], count: 0, note: "no tab resolved" };
+  if (enabled) {
+    await attachDebugger(tab.id);
+    consoleCaptureTabs.add(tab.id);
+    registerMode(tab.id, MODE_CONSOLE_CAPTURE);
+    await enableCdpDomain(tab.id, "Runtime").catch(() => undefined);
+    await enableCdpDomain(tab.id, "Log").catch(() => undefined);
+  } else {
+    consoleCaptureTabs.delete(tab.id);
+    unregisterMode(tab.id, MODE_CONSOLE_CAPTURE);
+  }
+  if (params.clear === true) {
+    consoleEntriesPerTab.delete(tab.id);
+    logEntriesPerTab.delete(tab.id);
+    runtimeExceptionsPerTab.delete(tab.id);
+  }
+  return { enabled, tabId: tab.id, ...readConsoleCapture(tab.id, params.limit) };
+}
+
+async function chromeBrowserLog(params) {
+  const tab = await getTabByParams(params);
+  await attachDebugger(tab.id);
+  await enableCdpDomain(tab.id, "Log").catch(() => undefined);
+  const ring = logEntriesPerTab.get(tab.id) || [];
+  const cleared = params.clear === true ? ring.length : 0;
+  if (params.clear === true) logEntriesPerTab.delete(tab.id);
+  const limit = Math.min(Math.max(Number(params.limit) || 0, 0), LOG_RING_MAX);
+  const entries = limit > 0 ? ring.slice(-limit) : ring;
+  return { entries, count: entries.length, cleared };
+}
+
+// ---- network deep-dive (M6) -------------------------------------------------------------------
+function pickCapturedRequest(stored, params) {
+  if (params.requestId) {
+    const entry = stored.get(String(params.requestId));
+    if (entry) return { requestId: String(params.requestId), entry, ambiguous: [] };
+  }
+  const needle = params.requestUrlIncludes ? String(params.requestUrlIncludes) : null;
+  if (needle) {
+    const matches = [];
+    for (const entry of stored.values()) {
+      if (entry.url && entry.url.includes(needle)) matches.push(entry);
+    }
+    if (matches.length) {
+      const latest = matches[matches.length - 1];
+      return { requestId: latest.requestId, entry: latest, ambiguous: matches.length > 1 ? matches.slice(0, 5).map((m) => m.requestId) : [] };
+    }
+  }
+  throw new Error("Specify requestId or requestUrlIncludes for the request to analyze");
+}
+
+function originOfUrl(url) {
+  try { return new URL(url).origin; } catch { return null; }
+}
+
+async function chromeNetworkCause(params) {
+  const tab = await getTabByParams(params);
+  const stored = cdpNetworkEntries.get(tab.id);
+  if (!stored || stored.size === 0) {
+    throw new Error("No CDP network entries captured for this tab — enable chrome_network_capture and reload the page first");
+  }
+  const { requestId, entry, ambiguous } = pickCapturedRequest(stored, params);
+  const result = {
+    requestId,
+    url: entry.url,
+    method: entry.method,
+    resourceType: entry.resourceType,
+    status: entry.status ?? null,
+    statusText: entry.statusText ?? "",
+    mimeType: entry.mimeType ?? "",
+    fromCache: entry.fromCache === true,
+    initiator: entry.initiator ?? null,
+    redirects: Array.isArray(entry.redirects) ? entry.redirects : [],
+    requestHeaders: entry.requestExtraInfo?.headers ?? entry.requestHeaders ?? [],
+    associatedCookies: entry.requestExtraInfo?.associatedCookies ?? [],
+    blockedRequestCookies: entry.requestExtraInfo?.blockedRequestCookies ?? [],
+    responseHeaders: entry.responseExtraInfo?.headers ?? entry.responseHeaders ?? [],
+    blockedCookies: entry.responseExtraInfo?.blockedCookies ?? [],
+    securityDetails: entry.securityDetails ?? null,
+    failure: {
+      errorText: entry.errorText ?? null,
+      blockedReason: entry.blockedReason ?? null,
+      canceled: entry.canceled === true,
+      corsErrorStatus: entry.corsErrorStatus ?? null,
+    },
+    timings: entry.timings ?? {},
+    durationMs: entry.durationMs ?? null,
+    ambiguous,
+  };
+  // Best-effort certificate chain for the request origin (Network.getCertificate is a
+  // browser-level read — safe while paused).
+  try {
+    const origin = originOfUrl(entry.url);
+    if (origin) {
+      const cert = await cdp(tab.id, "Network.getCertificate", { origin }).catch(() => null);
+      if (cert && Array.isArray(cert.tableNames)) result.certificateChain = cert.tableNames.slice(0, 10);
+    }
+  } catch {}
+  return result;
+}
+
+async function chromeNetworkHeaders(params) {
+  const tab = await getTabByParams(params);
+  const hasHeaders = params.headers && typeof params.headers === "object" && Object.keys(params.headers).length > 0;
+  if (params.clear === true || !hasHeaders) {
+    headersPerTab.delete(tab.id);
+    unregisterMode(tab.id, MODE_HEADERS);
+    if (attachedTabs.has(tab.id)) {
+      try { await cdp(tab.id, "Network.setExtraHTTPHeaders", { headers: {} }); } catch {}
+    }
+    return { injected: [], clear: true, summary: { count: 0, names: [] } };
+  }
+  const headers = {};
+  for (const [name, value] of Object.entries(params.headers)) {
+    const n = String(name).trim();
+    if (n) headers[n] = String(value);
+  }
+  if (!Object.keys(headers).length) return { injected: [], clear: false, summary: { count: 0, names: [] } };
+  await attachDebugger(tab.id);
+  await enableNetworkDomain(tab.id).catch(() => undefined);
+  await cdp(tab.id, "Network.setExtraHTTPHeaders", { headers });
+  headersPerTab.set(tab.id, headers);
+  registerMode(tab.id, MODE_HEADERS);
+  // Redaction (risk #10): header VALUES never leave the SW; only names + count are reported.
+  return { injected: Object.keys(headers), clear: false, summary: { count: Object.keys(headers).length, names: Object.keys(headers) } };
+}
+
+async function disableIntercept(tabId) {
+  const st = interceptPerTab.get(tabId);
+  if (st) {
+    for (const p of st.paused.values()) clearTimeout(p.timer);
+    st.paused.clear();
+  }
+  interceptPerTab.delete(tabId);
+  unregisterMode(tabId, MODE_INTERCEPT);
+  if (attachedTabs.has(tabId)) {
+    try { await cdp(tabId, "Fetch.disable"); } catch {}
+  }
+}
+
+async function resolveInterceptedRequest(tabId, params) {
+  const st = interceptPerTab.get(tabId);
+  if (!st) throw new Error("No interception active on this tab — start it with chrome_network_intercept action=on first");
+  const requestId = params.requestId !== undefined ? String(params.requestId) : "";
+  if (!requestId) throw new Error("chrome_network_intercept resolve requires requestId");
+  const paused = st.paused.get(requestId);
+  if (!paused) throw new Error(`Request ${requestId} is not currently paused by Fetch interception`);
+  clearTimeout(paused.timer);
+  st.paused.delete(requestId);
+  const resolveAction = String(params.resolveAction || "continue");
+  try {
+    if (resolveAction === "fail") {
+      const errorReason = String(params.errorReason || "BlockedByClient");
+      await cdp(tabId, "Fetch.failRequest", { requestId, errorReason });
+    } else if (resolveAction === "fulfill") {
+      await cdp(tabId, "Fetch.fulfillRequest", {
+        requestId,
+        responseCode: Number(params.responseCode) || 200,
+        ...(Array.isArray(params.responseHeaders) && params.responseHeaders.length
+          ? { responseHeaders: params.responseHeaders.map((h) => ({ name: String(h?.name || ""), value: String(h?.value || "") })) }
+          : {}),
+        ...(params.body ? { body: String(params.body) } : {}),
+      });
+    } else {
+      await cdp(tabId, "Fetch.continueRequest", { requestId });
+    }
+    st.resolved.push({ requestId, action: resolveAction, at: Date.now() });
+    if (st.resolved.length > INTERCEPT_RESOLVED_MAX) st.resolved.shift();
+    return { resolved: true, requestId, action: resolveAction };
+  } catch (error) {
+    st.paused.set(requestId, paused); // keep the pause alive so the caller can retry
+    throw new Error(`Failed to ${resolveAction} request ${requestId}: ${String(error?.message || error)}`);
+  }
+}
+
+async function chromeNetworkIntercept(params) {
+  const action = String(params.action || "on");
+  const tab = await getTabByParams(params);
+  if (action === "off") {
+    await disableIntercept(tab.id);
+    return { enabled: false, patterns: [], pausedCount: 0 };
+  }
+  if (action === "list") {
+    const st = interceptPerTab.get(tab.id);
+    return {
+      enabled: !!st,
+      patterns: st ? st.patterns.slice() : [],
+      paused: st ? Array.from(st.paused.values()).map((p) => ({ requestId: p.requestId, url: p.url, method: p.method, resourceType: p.resourceType, pausedAt: p.pausedAt })) : [],
+      pausedCount: st ? st.paused.size : 0,
+      resolvedCount: st ? st.resolved.length : 0,
+    };
+  }
+  if (action === "resolve") {
+    return resolveInterceptedRequest(tab.id, params);
+  }
+  if (action !== "on") throw new Error(`Unknown intercept action: ${action} (use on | off | list | resolve)`);
+  const patterns = Array.isArray(params.patterns) && params.patterns.length ? params.patterns.map((p) => String(p)) : ["*"];
+  await attachDebugger(tab.id);
+  // Fetch.enable carries the patterns AND enables the domain — never send a bare Fetch.enable
+  // (an empty pattern set pauses every request).
+  await cdp(tab.id, "Fetch.enable", { patterns: patterns.map((urlPattern) => ({ urlPattern })) });
+  interceptPerTab.set(tab.id, { patterns, paused: new Map(), resolved: [] });
+  registerMode(tab.id, MODE_INTERCEPT);
+  return { enabled: true, patterns, pausedCount: 0, note: "paused requests auto-continue after 30s" };
+}
+
+async function chromeWebsocketMessages(params) {
+  const tab = await getTabByParams(params);
+  const ring = wsFramesPerTab.get(tab.id) || [];
+  const totalCaptured = ring.length;
+  const cleared = params.clear === true ? totalCaptured : 0;
+  if (params.clear === true) wsFramesPerTab.delete(tab.id);
+  const limit = Math.min(Math.max(Number(params.limit) || 0, 0), WS_FRAMES_MAX);
+  const frames = limit > 0 ? ring.slice(-limit) : ring;
+  return { frames, count: frames.length, totalCaptured, cleared, captureMode: networkModeTabs.has(tab.id) };
+}
+
 async function dispatch(action, params) {
   switch (action) {
     case "tab.version":
@@ -3756,6 +4664,42 @@ async function dispatch(action, params) {
       return chromeBrowserInfo(params);
     case "target.list":
       return chromeTargets(params);
+    // ---- P1A: Debugger family (M5) + console/exceptions + network deep-dive (M6) ----
+    case "debug.breakpoint":
+      return chromeBreakpoint(params);
+    case "debug.pause":
+      return chromePause(params);
+    case "debug.resume":
+      return chromeResume(params);
+    case "debug.step":
+      return chromeStep(params);
+    case "debug.callStack":
+      return chromeGetCallStack(params);
+    case "debug.evalFrame":
+      return chromeEvaluateInFrame(params);
+    case "debug.scriptSource":
+      return chromeGetScriptSource(params);
+    case "debug.pauseOnExceptions":
+      return chromeSetPauseOnExceptions(params);
+    case "debug.exceptions":
+      return chromeListJsExceptions(params);
+    case "console.capture":
+      return chromeConsoleCapture(params);
+    case "log.list":
+      return chromeBrowserLog(params);
+    case "network.cause":
+      return chromeNetworkCause(params);
+    case "network.headers":
+      return chromeNetworkHeaders(params);
+    case "network.intercept.on":
+    case "network.intercept.off":
+    case "network.intercept.list":
+    case "network.intercept.resolve":
+      // The wire kind IS the action (TOOL_CONTRACTS §4 row 41) — inject it so the handler does
+      // not fall back to "on" when the caller only sent resolveAction.
+      return chromeNetworkIntercept({ ...params, action: action.replace("network.intercept.", "") });
+    case "network.websockets":
+      return chromeWebsocketMessages(params);
     case "page.perfMetrics":
       return chromePerfMetrics(params);
     case "storage.op":
