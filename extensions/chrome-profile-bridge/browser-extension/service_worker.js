@@ -7464,13 +7464,25 @@ async function chromeCssAudit(params) {
       if (!el.textContent || !el.textContent.trim() || el.children.length > 2) continue;
       const cs = getComputedStyle(el);
       const fg = cs.color;
+      // Resolve the painted ground by walking to the root, not eight levels: a text
+      // node inside a list row sits ~10 parents below the page background, and the
+      // old cap fell through to white, which no palette contains.
+      const opaque = (value) => {
+        const parts = String(value || '').match(/[\d.]+/g);
+        if (!parts || parts.length < 3) return false;
+        const alpha = parts.length > 3 ? Number(parts[3]) : 1;
+        return Number.isFinite(alpha) && alpha >= 0.95;
+      };
       let bg = cs.backgroundColor;
       let walker = el;
       let depth = 0;
-      while ((bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent') && walker.parentElement && depth < 8) {
+      while (!opaque(bg) && walker.parentElement && depth < 32) {
         walker = walker.parentElement; bg = getComputedStyle(walker).backgroundColor; depth++;
       }
-      if (bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent') bg = 'rgb(255, 255, 255)';
+      if (!opaque(bg)) {
+        bg = getComputedStyle(document.documentElement).backgroundColor;
+      }
+      if (!opaque(bg)) bg = 'rgb(255, 255, 255)';
       const L1 = lum(fg), L2 = lum(bg);
       const ratio = (Math.max(L1, L2) + 0.05) / (Math.min(L1, L2) + 0.05);
       const fontSize = parseFloat(cs.fontSize) || 16;
