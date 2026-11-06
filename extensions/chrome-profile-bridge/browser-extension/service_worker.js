@@ -2357,7 +2357,7 @@ async function domClickFallback(tabId, params, cause) {
 
 async function chromeInputClick(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   try {
     await attachDebugger(tab.id);
     const resolved = await resolveTargetInTab(tab.id, params);
@@ -2398,7 +2398,7 @@ async function chromeInputClick(params) {
 
 async function chromeInputHover(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   await attachDebugger(tab.id);
   const resolved = await resolveTargetInTab(tab.id, params);
   const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
@@ -2409,7 +2409,7 @@ async function chromeInputHover(params) {
 
 async function chromeInputKey(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   await attachDebugger(tab.id);
   const key = String(params.key || "");
   if (!key) throw new Error("chrome.key: missing key");
@@ -2447,7 +2447,7 @@ async function chromeInputKey(params) {
 
 async function chromeInputType(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   await attachDebugger(tab.id);
   if (params.selector || params.uid) {
     // Focus target by clicking it first.
@@ -2552,7 +2552,7 @@ async function fillAtPoint(tabId, fieldParams, resolved) {
 
 async function chromeInputFill(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   try {
     await attachDebugger(tab.id);
     if (!(params.selector || params.uid)) throw new Error("chrome.fill: selector or uid required");
@@ -2598,7 +2598,7 @@ async function verifyFieldValue(tabId, field) {
 // Per-field outcomes include the chrome_fill result plus a best-effort value verification.
 async function chromeFillForm(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   if (!Array.isArray(params.fields) || !params.fields.length) throw new Error("chrome_fill_form: fields[] is required");
   const fields = params.fields.map((field, index) => ({
     index,
@@ -2667,7 +2667,7 @@ async function chromeFillForm(params) {
 
 async function chromeInputScroll(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   await attachDebugger(tab.id);
   const resolved = (params.selector || params.uid) ? await resolveTargetInTab(tab.id, params) : { x: 100, y: 100, rect: null };
   const x = resolved.rect ? resolved.rect.left + Math.min(resolved.rect.width, 800) / 2 : resolved.x;
@@ -2717,7 +2717,7 @@ async function chromeInputScroll(params) {
 
 async function chromeInputTap(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   await attachDebugger(tab.id);
   const resolved = (params.selector || params.uid || (typeof params.x === "number" && typeof params.y === "number"))
     ? await resolveTargetInTab(tab.id, params)
@@ -2733,7 +2733,7 @@ async function chromeInputTap(params) {
 
 async function chromeInputDrag(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   await attachDebugger(tab.id);
   const from = await resolveTargetInTab(tab.id, { selector: params.fromSelector ?? null, uid: params.fromUid ?? null, x: params.fromX ?? null, y: params.fromY ?? null });
   const to = await resolveTargetInTab(tab.id, { selector: params.toSelector ?? null, uid: params.toUid ?? null, x: params.toX ?? null, y: params.toY ?? null });
@@ -2758,7 +2758,7 @@ async function chromeInputDrag(params) {
 
 async function chromeInputUpload(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   await attachDebugger(tab.id);
   if (!(params.selector || params.uid)) throw new Error("chrome.upload: selector or uid required");
   const paths = Array.isArray(params.paths) ? params.paths.map(String) : [];
@@ -4053,7 +4053,7 @@ async function chromeGetProperties(params) {
 // and maxSamples. The loop is fully awaited (no dangling interval survives a cancel).
 async function chromeWatchExpression(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   const expression = String(params.expression ?? "");
   if (!expression) throw new Error("chrome_watch_expression requires an expression");
   const durationMs = Math.max(200, Math.min(120_000, Number(params.durationMs) || 5000));
@@ -7707,7 +7707,9 @@ async function dispatch(action, params) {
       // tab best-effort before surfacing the error so tab.new never leaves an ungrouped Pi tab.
       const groupTitle = params.groupTitle || "Pi";
       const existingGroup = await findGroupRecordByTitle(groupTitle);
-      const createParams = { url: params.url || "about:blank", active: true };
+      // A background create leaves the user on their own tab: activating a new tab raises the
+      // automation window on Windows (pi-trackers#117).
+      const createParams = { url: params.url || "about:blank", active: params.foreground === true };
       if (existingGroup && typeof existingGroup.windowId === "number") createParams.windowId = existingGroup.windowId;
       const tab = await chrome.tabs.create(createParams);
       try {
@@ -7722,8 +7724,10 @@ async function dispatch(action, params) {
       // no explicit target they act on an owned target if one exists, else error — they must never
       // fall back to (or spawn a tab just to touch) the user's active tab.
       const tab = await getTabByParams(params, { createOwnedTarget: false });
-      await chrome.windows.update(tab.windowId, { focused: true });
-      return formatTab(await chrome.tabs.update(tab.id, { active: true }));
+      // activate = make this tab the active one inside its window. Taking the OS foreground needs
+      // an explicit focusWindow (pi-trackers#117).
+      if (params.focusWindow) await focusWindow(tab);
+      return formatTab(await activateTab(tab));
     }
     case "tab.group": {
       const tab = await getTabByParams(params, { createOwnedTarget: false });
@@ -8067,7 +8071,7 @@ async function dispatch(action, params) {
       // Poll from the service worker via CDP (bypasses CSP). The old approach ran the polling
       // loop in-page with new Function() for expression checks, which fails under strict CSP.
       const tab = await getTabByParams(params);
-      if (params.foreground) await bringToFront(tab);
+      if (params.foreground) await bringToFront(tab, params.focusWindow);
       if ((params.kind === "selector" || params.kind === "expression") && !params.value) {
         throw new Error(`chrome_wait_for: value is required for kind=${params.kind}`);
       }
@@ -8124,7 +8128,7 @@ async function dispatch(action, params) {
       return executeInTab(params, probePage, []);
     case "page.navigate": {
       const tab = await getTabByParams(params);
-      if (params.foreground) await bringToFront(tab);
+      if (params.foreground) await bringToFront(tab, params.focusWindow);
       if (params.initScript) {
         // Register a one-shot document_start content script. We register, navigate, wait, then unregister.
         await registerInitScript(tab.id, params.initScript);
@@ -8334,7 +8338,7 @@ const INJECTED_HELPERS = new Set(["getPiChromeState", "installPiChromeInstrument
 
 async function executeInTab(params, func, args) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   // Paused-page rail (M0): a Debugger.paused page freezes the main thread; the injected page
   // script would hang until its timeout. Auto-resume first and surface the pause prominently.
   const pauseNote = await ensurePageUsable(tab.id, "in-page command");
@@ -8430,7 +8434,7 @@ async function evaluateInTab(params) {
 // Evaluate against an already-resolved tab (used by page.waitFor so the tab is not re-resolved
 // on every 250ms iteration — tab-enumeration).
 async function evaluateInResolvedTab(tab, params) {
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   // Paused-page rail (M0): Runtime.evaluate on a Debugger.paused page hangs until the CDP
   // timeout. Auto-resume first; the pause is surfaced via console.warn + the diagnostics ring.
   const pauseNote = await ensurePageUsable(tab.id, "evaluate");
@@ -8653,7 +8657,7 @@ async function snapshotInTab(params) {
   // automation-target path (implicit, no targetId) so a blank owned tab can be flagged.
   const resolution = {};
   const tab = await getTabByParams(params, { resolution });
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   // Paused-page rail (M0): the snapshot script injected into a Debugger.paused page never runs;
   // auto-resume first and surface the pause in the snapshot result.
   const pauseNote = await ensurePageUsable(tab.id, "snapshot");
@@ -8777,7 +8781,7 @@ async function inspectInTab(params) {
   // QoL blank-tab hint: same automation-path tracking as snapshotInTab.
   const resolution = {};
   const tab = await getTabByParams(params, { resolution });
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   const frameUid = params.uid ? parseFrameUid(params.uid) : null;
   const frameId = frameUid ? frameUid.frameId : 0;
   const args = [frameUid ? frameUid.localUid : (params.uid ?? null), params.selector ?? null, params.scrollIntoView === true];
@@ -8832,9 +8836,19 @@ if (chrome.tabs && chrome.tabs.onRemoved) {
   chrome.tabs.onRemoved.addListener((tabId) => snapshotScriptFrames.delete(tabId));
 }
 
-async function bringToFront(tab) {
+// Activating a tab makes the page usable and visible inside its own window. Taking the OS
+// foreground is a separate act, and it happens only when the CALLER asked for it: params.focusWindow
+// is set by the host for an explicit `background: false` and for nothing else. A session default
+// must never raise the window (pi-trackers#117).
+async function activateTab(tab) {
+  return chrome.tabs.update(tab.id, { active: true });
+}
+async function focusWindow(tab) {
   await chrome.windows.update(tab.windowId, { focused: true });
-  await chrome.tabs.update(tab.id, { active: true });
+}
+async function bringToFront(tab, focusWindowRequested) {
+  await activateTab(tab);
+  if (focusWindowRequested) await focusWindow(tab);
 }
 
 function waitForTabComplete(tabId, timeoutMs) {
@@ -8901,9 +8915,45 @@ async function captureFullPageViaCdp(tab, params) {
   };
 }
 
+// Viewport capture through the attached debugger. chrome.tabs.captureVisibleTab needs an active
+// tab in a FOCUSED window, so it raised the user's browser and failed with "image readback failed"
+// (or hung for 25 s) whenever Chrome sat behind another app. CDP renders the tab it is attached to,
+// focused or not, so a background capture stays silent (pi-trackers#117).
+async function captureViewportViaCdp(tab, params) {
+  await attachDebugger(tab.id);
+  const format = params.format || "png";
+  const scale = Math.max(0.1, Math.min(3, Number(params.scale) || 1));
+  const shot = await cdp(tab.id, "Page.captureScreenshot", {
+    format,
+    quality: format === "jpeg" ? (typeof params.quality === "number" ? params.quality : 90) : undefined,
+    fromSurface: true,
+    captureBeyondViewport: false,
+    scale,
+  }).catch((error) => {
+    throw new Error(`chrome_screenshot: CDP capture failed (${String(error?.message || error)})`);
+  });
+  if (!shot || typeof shot.data !== "string" || !shot.data) {
+    throw new Error("chrome_screenshot: CDP capture returned no image data");
+  }
+  const metrics = await cdp(tab.id, "Page.getLayoutMetrics", {}).catch(() => null);
+  const viewport = metrics?.cssVisualViewport || {};
+  const contentSize = metrics?.cssContentSize || {};
+  return {
+    dataUrl: `data:image/${format};base64,${shot.data}`,
+    tab: await formatTab(tab),
+    dimensions: {
+      width: viewport.clientWidth,
+      height: viewport.clientHeight,
+      viewportHeight: viewport.clientHeight,
+      dpr: contentSize.scale ?? 1,
+    },
+    captureMode: "cdp",
+  };
+}
+
 async function takeScreenshot(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   // Paused-page rail (M0): capture commands sent to a Debugger.paused page hang (the renderer
   // cannot composite a frame); auto-resume first and surface the pause in the result.
   const pauseNote = await ensurePageUsable(tab.id, "screenshot");
@@ -8913,64 +8963,22 @@ async function takeScreenshot(params) {
   };
   // Element-scoped screenshots (feat-element-screenshot): resolve uid/selector to a viewport
   // rect and capture through the attached CDP debugger, which works on inactive tabs — so
-  // background mode never activates the tab (no focus/restore churn like captureVisibleTab).
+  // background mode never activates the tab and never takes the OS foreground.
   if (params.uid || params.selector) {
     return elementScreenshot(tab, params);
   }
-  let previousActiveId;
-  if (!tab.active) {
-    const activeBefore = await chrome.tabs.query({ active: true, windowId: tab.windowId });
-    previousActiveId = activeBefore[0]?.id;
-    await chrome.tabs.update(tab.id, { active: true });
-  }
-  try {
-    if (params.fullPage) {
-      // P0 single-shot full page (chrome_full_page_screenshot, TOOL_CONTRACTS §5.17): prefer
-      // CDP Page.captureScreenshot with captureBeyondViewport — no scroll/focus churn, no
-      // lazy-load artifacts. Falls back to the tile-stitched path when the renderer rejects it
-      // (older Chrome / headless builds) or the page is extremely tall (OOM guard).
-      const single = await captureFullPageViaCdp(tab, params).catch((error) => {
-        console.warn(`[pi-chrome] CDP full-page capture failed, falling back to tiles: ${String(error?.message || error)}`);
-        return null;
-      });
-      if (single) return mergePauseNote(single);
-      // Tile-stitched full page capture: scroll, capture, paste, repeat. Defaults to jpeg (PNG
-      // tiles for tall pages are tens of MB per tile set) and caps pathological page heights.
-      const tiles = await executeInTab({ ...params, foreground: false }, captureFullPageTiles, [MAX_FULLPAGE_TILES]);
-      // captureFullPageTiles only computes scroll positions / metrics; we capture per scroll here
-      // (chrome.tabs.captureVisibleTab can't be called from MAIN world).
-      const captured = [];
-      const tilePlan = Array.isArray(tiles.tiles) ? tiles.tiles.slice(0, MAX_FULLPAGE_TILES) : [];
-      const format = params.format || "jpeg";
-      const quality = format === "jpeg" ? (typeof params.quality === "number" ? params.quality : 90) : undefined;
-      for (const tile of tilePlan) {
-        await executeInTab({ ...params, foreground: false }, scrollToY, [tile.scrollY]);
-        // Small settle delay; many sites have on-scroll animations / lazy-load.
-        await sleep(120);
-        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format, quality });
-        captured.push({ y: tile.y, dataUrl });
-      }
-      await executeInTab({ ...params, foreground: false }, scrollToY, [tiles.originalScrollY]);
-      return mergePauseNote({
-        fullPage: true,
-        tab: await formatTab(tab),
-        dimensions: { width: tiles.width, height: tiles.height, viewportHeight: tiles.viewportHeight, dpr: tiles.dpr },
-        tiles: captured,
-        tilesTruncated: Array.isArray(tiles.tiles) && tiles.tiles.length > MAX_FULLPAGE_TILES ? tiles.tiles.length - MAX_FULLPAGE_TILES : undefined,
-      });
-    }
-    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-      format: params.format || "png",
-      quality: params.format === "jpeg" ? params.quality : undefined,
+  if (params.fullPage) {
+    // Single-shot full page (chrome_full_page_screenshot, TOOL_CONTRACTS §5.17): CDP
+    // Page.captureScreenshot with captureBeyondViewport — no scroll churn, no lazy-load artifacts.
+    const single = await captureFullPageViaCdp(tab, params).catch((error) => {
+      throw new Error(`chrome_screenshot: CDP full-page capture failed (${String(error?.message || error)})`);
     });
-    return mergePauseNote({ dataUrl, tab: await formatTab(tab) });
-  } finally {
-    // Restore the previous active tab before returning so the user is not left on the Pi tab
-    // when this was a background capture (screenshot-tiles).
-    if (previousActiveId !== undefined && previousActiveId !== tab.id) {
-      await chrome.tabs.update(previousActiveId, { active: true }).catch(() => undefined);
+    if (!single) {
+      throw new Error("chrome_screenshot: full-page capture unavailable for this page (the renderer refused the single-shot capture); capture the viewport or a section instead");
     }
+    return mergePauseNote(single);
   }
+  return mergePauseNote(await captureViewportViaCdp(tab, params));
 }
 
 // Element-scoped screenshot via CDP Page.captureScreenshot {clip} on the attached debugger
@@ -9492,32 +9500,6 @@ function probePage() {
     userAgent: navigator.userAgent.slice(0, 200),
     webdriver: !!navigator.webdriver,
   };
-}
-
-function captureFullPageTiles(maxTiles) {
-  // Returns the *plan* for tile capture; the actual chrome.tabs.captureVisibleTab calls happen
-  // in the SW. We just report the scroll positions and metrics. `maxTiles` caps pathological
-  // pages (screenshot-tiles) so a 100k-px document does not produce an unbounded tile list.
-  const html = document.documentElement;
-  const body = document.body;
-  const width = Math.max(html.scrollWidth, body ? body.scrollWidth : 0, innerWidth);
-  const height = Math.max(html.scrollHeight, body ? body.scrollHeight : 0, innerHeight);
-  const viewportHeight = innerHeight;
-  const dpr = window.devicePixelRatio || 1;
-  const originalScrollY = scrollY;
-  const cap = Number.isFinite(maxTiles) && maxTiles > 0 ? Math.floor(maxTiles) : 30;
-  const tiles = [];
-  let y = 0;
-  while (y < height && tiles.length < cap) {
-    tiles.push({ y, scrollY: y });
-    y += viewportHeight;
-  }
-  return { width, height, viewportHeight, dpr, originalScrollY, tiles, tilesTruncated: tiles.length < Math.ceil(height / viewportHeight) };
-}
-
-function scrollToY(y) {
-  window.scrollTo({ top: y, left: 0, behavior: "instant" });
-  return { scrollY };
 }
 
 // MAIN-world web-storage accessors (feat-storage), run via executeInTab in the resolved tab.
@@ -10135,7 +10117,7 @@ async function clearDownloads(params) {
 // the recorded entry when one already matches, otherwise arms a waiter for the next event.
 async function handleDialogCommand(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   await attachDebugger(tab.id);
   try { await cdp(tab.id, "Page.enable"); } catch {}
   const wantedType = params.type && params.type !== "any" ? String(params.type) : null;
@@ -10603,7 +10585,7 @@ async function webStorageOperation(kind, action, params) {
 // `storage.op` wire kind — no new plumbing.
 async function indexedDBOperation(action, params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   await attachDebugger(tab.id);
   const originRes = await cdpEval(tab.id, "location.origin");
   if (originRes.exceptionDetails) {
@@ -10803,7 +10785,7 @@ function cdpRemoteValue(obj) {
 // Cheap by design: no persistent-attach change, no tracing (a later chrome_trace stages that).
 async function chromePerfMetrics(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  if (params.foreground) await bringToFront(tab, params.focusWindow);
   // Paused-page rail (M0): Performance.getMetrics needs the renderer, which a Debugger.paused
   // page freezes — auto-resume first.
   const pauseNote = await ensurePageUsable(tab.id, "perf metrics");

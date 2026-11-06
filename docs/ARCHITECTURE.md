@@ -43,11 +43,11 @@ To point pi-chrome at an existing tab, pass `targetId`, `urlIncludes`, or `title
 
 ## Background mode
 
-By default, chrome calls run in background so Chrome does not steal focus.
+By default, chrome calls run in background so Chrome does not steal focus. Activation and OS focus are separate: a background call may activate its own tab inside the Pi window, and only an explicit per-call `background: false` moves the OS foreground (pi-trackers#117). Captures go through the attached debugger, so a screenshot never needs a focused window.
 
 ```text
 /chrome background on       # background mode
-/chrome background off      # foreground/watch mode
+/chrome background off      # watch mode: activate tabs, still never take the OS foreground
 ```
 
 Per-call `background: false` brings Chrome forward for that action. Per-call `background: true` forces background.

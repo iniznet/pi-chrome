@@ -2,6 +2,16 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## Unreleased
+
+**Background calls never raise the browser** (pi-trackers#117). Activation and OS focus are now
+separate acts: a default call may activate its own Pi tab, and only an explicit
+`background: false` moves the OS foreground. `chrome_tab action=new` no longer activates the
+new tab by default. `chrome_screenshot` and `chrome_full_page_screenshot` capture through the
+attached debugger instead of `chrome.tabs.captureVisibleTab`, which needed a focused window and
+failed with "image readback failed" or hung for 25 s whenever Chrome sat behind another app. The
+scrolling tile fallback is gone; a page the debugger cannot capture reports a clear error.
+
 ## 0.16.0 — 2026-08-30
 
 **The full 75-tool DevTools surface** (`tasks/devtools-gap-report.md`):
