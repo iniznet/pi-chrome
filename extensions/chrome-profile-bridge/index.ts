@@ -1225,7 +1225,9 @@ export default function (pi: ExtensionAPI): void {
 		// withBackground() like the page.* tools do. Default to the session setting unless the
 		// caller already supplied the flag explicitly.
 		if (action.startsWith("tab.") && wireParams.foreground === undefined) {
-			wireParams = { ...wireParams, foreground: !backgroundDefault };
+			// Same rule as withBackground: the session default activates a tab, never focuses a window.
+			const wantBackground = typeof wireParams.background === "boolean" ? wireParams.background : backgroundDefault;
+			wireParams = { ...wireParams, foreground: !wantBackground, focusWindow: wireParams.background === false };
 		}
 		// Any tab Pi *uses* (page.* interactions) should join this session's group, mirroring the
 		// auto-grouping that tab.new already does. Tagging the wire params lets getTabByParams pull
@@ -1260,7 +1262,10 @@ export default function (pi: ExtensionAPI): void {
 					? !typed.foreground
 					: undefined;
 		const background = explicit ?? backgroundDefault;
-		return { ...params, foreground: !background } as T;
+		// pi-trackers#117: the OS foreground moves only when the CALLER asked for it. The session
+		// default (and /chrome background off) may activate the tab so the user can watch, but it
+		// must never raise the window over another app.
+		return { ...params, foreground: !background, focusWindow: typed.background === false || typed.foreground === true } as T;
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -1881,6 +1886,7 @@ Usage rules:
 			groupTitle: Type.Optional(Type.String({ description: "Deprecated for action=new/group; ignored so one Pi session uses one tab group ('Pi Session: <name-or-id>')." })),
 			groupColor: Type.Optional(Type.String({ description: "Tab group color for action=group/new: grey, blue, red, yellow, green, pink, purple, cyan, or orange. Defaults to blue." })),
 			name: Type.Optional(Type.String({ description: "Handle name for action=save: the named-handle registry entry for the resolved tab." })),
+			background: Type.Optional(Type.Boolean({ description: "If true (the default), act without focusing Chrome and without activating a new tab; pass false to bring the window to the front (action=new activate, action=activate focus)." })),
 			sessionKey: Type.Optional(Type.String({ description: "Wire-only passthrough (not part of the public API surface): session owner key tagging save/list registry entries. Injected automatically from the host session when omitted." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),

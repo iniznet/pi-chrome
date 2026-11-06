@@ -185,7 +185,7 @@ Security details: [`SECURITY.md`](./SECURITY.md). Architecture details: [`docs/A
 /chrome revoke
 /chrome history [n|replay <idx>]   # per-session action log (default 10, max 50) + replay
 /chrome background on       # default: don't steal focus
-/chrome background off      # foreground/watch mode
+/chrome background off      # watch mode: activate tabs, still never take the OS foreground
 /chrome background status
 ```
 
