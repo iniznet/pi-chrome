@@ -12,6 +12,15 @@ attached debugger instead of `chrome.tabs.captureVisibleTab`, which needed a foc
 failed with "image readback failed" or hung for 25 s whenever Chrome sat behind another app. The
 scrolling tile fallback is gone; a page the debugger cannot capture reports a clear error.
 
+- **Honest contrast counting.** `chrome_css_audit` resolved a computed colour by parsing the
+  string numerically, so a page whose tokens use `oklch()` — or `color-mix()`, or relative colour
+  syntax — reported failures that a direct measurement refutes: a legible 5.29:1 pair scored
+  1.00:1. Colours now resolve through the engine's own paint pipeline before the WCAG ratio, and
+  a colour that cannot be resolved lands in the new `counts.unresolvedContrast` instead of the
+  failure count. `chrome_a11y_audit` shares that probe, which also fixes its low-contrast rule
+  skipping every candidate (an AX text node has no computed style of its own, so the rule
+  resolved nothing and reported agreement on pages where it had failed to look).
+
 ## 0.16.0 — 2026-08-30
 
 **The full 75-tool DevTools surface** (`tasks/devtools-gap-report.md`):

@@ -7398,6 +7398,85 @@ async function chromeDomSnapshot(params) {
 }
 
 // ---- CSS audit (chrome_css_audit) -------------------------------------------------------
+// ---- Shared colour probe (page-side) ----------------------------------------------------
+// A computed colour keeps its colour space: `color: oklch(0.52 0.014 260)` reads back as that
+// string, so a numeric parse of it scores oklch channels on the 0-255 RGB scale — the source of
+// the false contrast failures. Paint a 1x1 canvas and read the pixel instead: the engine's own
+// pipeline resolves oklch / color-mix / relative syntax to sRGB, and both audits share the result.
+// A value the engine refuses (a page that removed 2D contexts, a throwing readback, garbage)
+// returns null, so a caller reports an unresolved node instead of scoring it as a failure. Alpha
+// is returned so a caller can walk past a translucent ground instead of compositing it wrongly.
+const CSS_CONTRAST_PROBE_SRC = `
+  const piProbe = (() => {
+    let ctx = null;
+    let unusable = false;
+    const cache = new Map();
+    const getCtx = () => {
+      if (ctx || unusable) return ctx;
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = 1;
+        canvas.height = 1;
+        ctx = canvas.getContext('2d', { willReadFrequently: true });
+      } catch (e) { ctx = null; }
+      if (!ctx) unusable = true;
+      return ctx;
+    };
+    const piSrgb = (value) => {
+      const text = String(value == null ? '' : value).trim();
+      if (!text) return null;
+      const hit = cache.get(text);
+      if (hit !== undefined) return hit;
+      let out = null;
+      const probe = getCtx();
+      if (probe) {
+        try {
+          // A rejected assignment leaves fillStyle untouched. The sentinel carries a fractional
+          // alpha so no real computed colour can serialize to the same string.
+          probe.fillStyle = 'rgba(1, 2, 3, 0.0123)';
+          const marker = probe.fillStyle;
+          probe.fillStyle = text;
+          if (probe.fillStyle !== marker) {
+            probe.clearRect(0, 0, 1, 1);
+            probe.fillStyle = text;
+            probe.fillRect(0, 0, 1, 1);
+            const px = probe.getImageData(0, 0, 1, 1).data;
+            out = [px[0], px[1], px[2], px[3] / 255];
+          }
+        } catch (e) {
+          out = null;
+          unusable = true;
+        }
+      }
+      cache.set(text, out);
+      return out;
+    };
+    const piLuminance = (rgb) => {
+      if (!rgb || rgb.length < 3) return null;
+      const ch = [];
+      for (let i = 0; i < 3; i++) {
+        const v = Number(rgb[i]) / 255;
+        if (!Number.isFinite(v)) return null;
+        ch.push(v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+      }
+      return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2];
+    };
+    const piRatio = (fg, bg) => {
+      const a = piLuminance(fg);
+      const b = piLuminance(bg);
+      if (a === null || b === null) return null;
+      return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+    };
+    const piVerdict = (fg, bg, need) => {
+      const ratio = piRatio(fg, bg);
+      if (ratio === null) return { verdict: 'unresolved', ratio: null };
+      return { verdict: ratio < need ? 'low' : 'ok', ratio: ratio };
+    };
+    const piOpaque = (rgb) => !!rgb && rgb[3] >= 0.95;
+    return { piSrgb: piSrgb, piLuminance: piLuminance, piRatio: piRatio, piVerdict: piVerdict, piOpaque: piOpaque };
+  })();
+`;
+
 // css.audit — client-side aggregation over layout/computed-style primitives (in-page scan,
 // bounded element + comparison budgets; zero new CDP domains).
 async function chromeCssAudit(params) {
@@ -7406,11 +7485,12 @@ async function chromeCssAudit(params) {
   await attachDebugger(tab.id);
   const maxElements = Math.min(Math.max(Number(params.maxElements) || CSS_AUDIT_MAX_ELEMENTS, 1), CSS_AUDIT_MAX_ELEMENTS);
   const expr = `(() => {
+    ${CSS_CONTRAST_PROBE_SRC}
     const MAX_EL = ${maxElements};
     const MAX_COMPARE = ${CSS_AUDIT_MAX_COMPARISONS};
     const MAX_CONTRAST = ${CSS_AUDIT_MAX_CONTRAST};
     const issues = [];
-    const counts = { overlap: 0, zeroSize: 0, truncated: 0, lowContrast: 0, hidden: 0, scanned: 0 };
+    const counts = { overlap: 0, zeroSize: 0, truncated: 0, lowContrast: 0, unresolvedContrast: 0, hidden: 0, scanned: 0 };
     const idHint = (el) => { const p = [el.tagName.toLowerCase()]; if (el.id) p.push('#' + el.id); if (typeof el.className === 'string') { const c = el.className.split(/\\s+/).filter(Boolean).slice(0, 2); if (c.length) p.push('.' + c.join('.')); } return p.join(''); };
     const all = Array.from(document.querySelectorAll('body *')).filter((el) => {
       const r = el.getBoundingClientRect();
@@ -7457,42 +7537,45 @@ async function chromeCssAudit(params) {
         truncScanned++;
       }
     }
-    const lum = (c) => { const p = c.match(/[\\d.]+/g); if (!p || p.length < 3) return 0; const v = p.slice(0, 3).map((x) => { const n = Number(x) / 255; return n <= 0.03928 ? n / 12.92 : Math.pow((n + 0.055) / 1.055, 2.4); }); return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]; };
-    let contrastScanned = 0;
+    let contrastChecked = 0;
     for (const el of all) {
-      if (contrastScanned >= MAX_CONTRAST) break;
+      if (contrastChecked >= MAX_CONTRAST) break;
       if (!el.textContent || !el.textContent.trim() || el.children.length > 2) continue;
+      contrastChecked++;
       const cs = getComputedStyle(el);
-      const fg = cs.color;
-      // Resolve the painted ground by walking to the root, not eight levels: a text
-      // node inside a list row sits ~10 parents below the page background, and the
-      // old cap fell through to white, which no palette contains.
-      const opaque = (value) => {
-        const parts = String(value || '').match(/[\d.]+/g);
-        if (!parts || parts.length < 3) return false;
-        const alpha = parts.length > 3 ? Number(parts[3]) : 1;
-        return Number.isFinite(alpha) && alpha >= 0.95;
-      };
-      let bg = cs.backgroundColor;
+      const fgTriple = piProbe.piSrgb(cs.color);
+      // Resolve the painted ground by walking to the root, not a fixed eight levels: a text node
+      // inside a list row sits ~10 parents below the page background, and the cap fell through to
+      // white, which no palette contains. The probe reports alpha, so a translucent row is walked
+      // past rather than composited into a wrong score.
+      let bgCss = cs.backgroundColor;
+      let bgTriple = piProbe.piSrgb(bgCss);
       let walker = el;
       let depth = 0;
-      while (!opaque(bg) && walker.parentElement && depth < 32) {
-        walker = walker.parentElement; bg = getComputedStyle(walker).backgroundColor; depth++;
+      while (!piProbe.piOpaque(bgTriple) && walker.parentElement && depth < 32) {
+        walker = walker.parentElement;
+        bgCss = getComputedStyle(walker).backgroundColor;
+        bgTriple = piProbe.piSrgb(bgCss);
+        depth++;
       }
-      if (!opaque(bg)) {
-        bg = getComputedStyle(document.documentElement).backgroundColor;
+      if (!piProbe.piOpaque(bgTriple)) {
+        bgCss = getComputedStyle(document.documentElement).backgroundColor;
+        bgTriple = piProbe.piSrgb(bgCss);
       }
-      if (!opaque(bg)) bg = 'rgb(255, 255, 255)';
-      const L1 = lum(fg), L2 = lum(bg);
-      const ratio = (Math.max(L1, L2) + 0.05) / (Math.min(L1, L2) + 0.05);
+      if (!piProbe.piOpaque(bgTriple)) {
+        bgTriple = [255, 255, 255, 1];
+        bgCss = 'rgb(255, 255, 255)';
+      }
       const fontSize = parseFloat(cs.fontSize) || 16;
       const weight = Number(cs.fontWeight) || 400;
       const large = fontSize >= 18 || (fontSize >= 14 && weight >= 600);
       const need = large ? 3 : 4.5;
-      if (ratio < need) {
+      const verdict = fgTriple ? piProbe.piVerdict(fgTriple, bgTriple, need) : { verdict: 'unresolved', ratio: null };
+      if (verdict.verdict === 'unresolved') {
+        counts.unresolvedContrast++;
+      } else if (verdict.verdict === 'low') {
         counts.lowContrast++;
-        issues.push({ kind: 'low-contrast', hint: idHint(el), detail: 'contrast ' + ratio.toFixed(2) + ' < ' + need + ' (' + fg + ' on ' + bg + ')' });
-        contrastScanned++;
+        issues.push({ kind: 'low-contrast', hint: idHint(el), detail: 'contrast ' + verdict.ratio.toFixed(2) + ' < ' + need + ' (' + cs.color + ' on ' + bgCss + ')' });
       }
     }
     counts.hidden = all.filter((el) => getComputedStyle(el).visibility === 'hidden').length;
@@ -7508,24 +7591,9 @@ async function chromeCssAudit(params) {
 
 // ---- A11y audit (chrome_a11y_audit) ------------------------------------------------------
 // a11y.audit — Lighthouse-lite report: engine AX-tree structural violations (missing names /
-// alts / input labels) + bounded low-contrast checks (CSS.getBackgroundColors + computed text
-// color via DOM.resolveNode). Capped violations list.
-function colorLuminance(rgbString) {
-  const m = String(rgbString).match(/[\\d.]+/g);
-  if (!m || m.length < 3) return null;
-  const v = m.slice(0, 3).map((x) => {
-    const n = Number(x) / 255;
-    return n <= 0.03928 ? n / 12.92 : Math.pow((n + 0.055) / 1.055, 2.4);
-  });
-  return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
-}
-
-function contrastRatioOf(fgRgb, bgRgb) {
-  const L1 = colorLuminance(fgRgb);
-  const L2 = colorLuminance(bgRgb);
-  if (L1 === null || L2 === null) return null;
-  return (Math.max(L1, L2) + 0.05) / (Math.min(L1, L2) + 0.05);
-}
+// alts / input labels) + bounded low-contrast checks resolved through the shared in-page colour
+// probe (see CSS_CONTRAST_PROBE_SRC). An AX StaticText node is a text node, where getComputedStyle
+// and CSS.getBackgroundColors do not apply, so the probe resolves from the owning element.
 
 async function chromeA11yAudit(params) {
   const tab = await getTabByParams(params);
@@ -7578,29 +7646,41 @@ async function chromeA11yAudit(params) {
     if (!["staticText", "text", "link", "button"].includes(role) || !n.name) continue;
     contrastChecked++;
     try {
-      const described = await cdp(tab.id, "DOM.describeNode", { backendNodeId }).catch(() => null);
-      const nodeId = described && described.node ? described.node.nodeId : null;
-      if (typeof nodeId !== "number") continue;
-      const colors = await cdp(tab.id, "CSS.getBackgroundColors", { nodeId }).catch(() => null);
-      const bgStack = Array.isArray(colors?.backgroundColors) ? colors.backgroundColors : [];
-      const bg = bgStack.length ? bgStack[bgStack.length - 1] : null;
-      let fg = null;
       const resolved = await cdp(tab.id, "DOM.resolveNode", { backendNodeId }).catch(() => null);
       const objectId = resolved && resolved.object ? resolved.object.objectId : null;
-      if (objectId) {
-        const fgRes = await cdp(tab.id, "Runtime.callFunctionOn", {
-          objectId, functionDeclaration: "function(){ try { return getComputedStyle(this).color; } catch (e) { return null; } }", returnByValue: true,
-        }).catch(() => null);
-        fg = fgRes && fgRes.result && typeof fgRes.result.value === "string" ? fgRes.result.value : null;
-        await cdp(tab.id, "Runtime.releaseObject", { objectId }).catch(() => undefined);
+      if (!objectId) continue;
+      const probed = await cdp(tab.id, "Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: `function(){ ${CSS_CONTRAST_PROBE_SRC}
+          const host = this && this.nodeType === 3 ? this.parentElement : this;
+          if (!host || !host.nodeType) return { unresolved: true };
+          const cs = getComputedStyle(host);
+          if (!cs) return { unresolved: true };
+          const fontSize = parseFloat(cs.fontSize) || 16;
+          const weight = Number(cs.fontWeight) || 400;
+          const need = (fontSize >= 18 || (fontSize >= 14 && weight >= 600)) ? 3 : 4.5;
+          const fg = piProbe.piSrgb(cs.color);
+          if (!fg) return { unresolved: true };
+          let bg = piProbe.piSrgb(cs.backgroundColor);
+          let walker = host;
+          let depth = 0;
+          while (!piProbe.piOpaque(bg) && walker.parentElement && depth < 32) { walker = walker.parentElement; bg = piProbe.piSrgb(getComputedStyle(walker).backgroundColor); depth++; }
+          if (!piProbe.piOpaque(bg)) bg = piProbe.piSrgb(getComputedStyle(document.documentElement).backgroundColor);
+          if (!piProbe.piOpaque(bg)) bg = [255, 255, 255, 1];
+          const verdict = piProbe.piVerdict(fg, bg, need);
+          return { verdict: verdict.verdict, ratio: verdict.ratio, need: need, fg: cs.color };
+        }`,
+        returnByValue: true,
+      }).catch(() => null);
+      await cdp(tab.id, "Runtime.releaseObject", { objectId }).catch(() => undefined);
+      const got = probed && probed.result ? probed.result.value : null;
+      // An unresolved colour is skipped, never counted: a page that removes 2D contexts must not
+      // produce contrast violations.
+      if (got && got.verdict === "low") {
+        counts.lowContrast++;
+        violations.push({ role, name: String(n.name).slice(0, 80), issue: "low-contrast", backendNodeId, reason: `text contrast ${Number(got.ratio).toFixed(2)} < ${got.need} (${String(got.fg)})` });
       }
-      if (fg && bg && (fg.includes("rgba") ? !fg.endsWith(", 0)") : true)) {
-        const ratio = contrastRatioOf(fg, bg);
-        if (ratio !== null && ratio < 4.5) {
-          counts.lowContrast++;
-          violations.push({ role, name: String(n.name).slice(0, 80), issue: "low-contrast", backendNodeId, reason: `text contrast ${ratio.toFixed(2)} < 4.5 (${fg} on ${bg})` });
-        }
-      }
+
     } catch {}
   }
   const result = {
