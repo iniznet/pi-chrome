@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Colour-space contrast fixture (pi-trackers#116)</title>
+<!--
+  Live probe for the shared colour resolver. Expected after the fix, at any viewport:
+    chrome_css_audit   counts.lowContrast === 1   counts.unresolvedContrast === 0
+    chrome_a11y_audit  counts.lowContrast === 1
+  Row 1 is a real 5.29:1 oklch pair (measured rgb(100,105,113) on rgb(251,250,250)); the
+  numeric-parse defect reported it as 1.00:1. Row 2 passes at 4.54:1. Row 3 is a genuine
+  2.32:1 failure and must stay reported. Navigate, then run both audits.
+-->
+<body style="margin:0;font:16px/1.4 system-ui">
+<div id="ok" style="background:oklch(0.985 0.002 260);color:oklch(0.52 0.014 260);padding:24px">Row 1: oklch muted on oklch paper — 5.29:1, expected pass</div>
+<div id="pass" style="background:#ffffff;color:#767676;padding:24px">Row 2: rgb(118,118,118) on white — 4.54:1, expected pass</div>
+<div id="fail" style="background:#ffffff;color:#aaaaaa;padding:24px">Row 3: rgb(170,170,170) on white — 2.32:1, expected failure</div>
+</body>
