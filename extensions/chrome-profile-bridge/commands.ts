@@ -1443,7 +1443,7 @@ export function formatCssAudit(result: Record<string, unknown>): string {
 	const issues = Array.isArray(result.issues) ? (result.issues as Array<Record<string, unknown>>) : [];
 	const lines = [
 		`CSS audit (${Number(counts.scanned) || 0} elements scanned, ${issues.length} issues${result.capped ? ", capped" : ""}):`,
-		`  overlap=${Number(counts.overlap) || 0} zero-size=${Number(counts.zeroSize) || 0} truncated=${Number(counts.truncated) || 0} low-contrast=${Number(counts.lowContrast) || 0} hidden=${Number(counts.hidden) || 0}`,
+		`  overlap=${Number(counts.overlap) || 0} zero-size=${Number(counts.zeroSize) || 0} truncated=${Number(counts.truncated) || 0} low-contrast=${Number(counts.lowContrast) || 0} unresolved=${Number(counts.unresolvedContrast) || 0} hidden=${Number(counts.hidden) || 0}`,
 	];
 	for (const i of issues.slice(0, 25)) {
 		lines.push(`  [${String(i.kind ?? "?")}] ${compactLine(String(i.hint ?? ""), 60)} — ${compactLine(String(i.detail ?? ""), 90)}`);
